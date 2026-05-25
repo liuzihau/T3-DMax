@@ -301,7 +301,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
 
         # ---- Think model: full LLaDA-2.0-mini (MoE intact) -----------------------
         # We optionally drop the last N transformer layers when running ablation A1.5.
-        self.think_model = LLaDA2MoeModel(config)
+        self.model = LLaDA2MoeModel(config)
         if config.prune_think_last_n_layer > 0:
             self._prune_think_last_n_layer(config.prune_think_last_n_layer)
             # (For A1.5, the user will warm-start `talk_model.layers[0]` with the removed
@@ -312,7 +312,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
 
         # ---- Talk model -------------------------------------------------------
         # Share the rotary embedding instance with think to guarantee identical RoPE.
-        self.talk_model = TalkModel(config, rotary_emb=self.think_model.rotary_emb)
+        self.talk_model = TalkModel(config, rotary_emb=self.model.rotary_emb)
 
         # ---- LM head (trainable, initialised from think's word embeddings) -----
         # LLaDA-2.0-mini ties its lm_head to word_embeddings. We always make a separate
@@ -340,16 +340,16 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         """
         if n <= 0:
             return
-        layers = self.think_model.layers
+        layers = self.model.layers
         new_len = len(layers) - n
         assert new_len >= 1, f"cannot prune {n} layers from {len(layers)}"
-        self.think_model.layers = nn.ModuleList(list(layers[:new_len]))
+        self.model.layers = nn.ModuleList(list(layers[:new_len]))
         # Update config bookkeeping so downstream code sees the new depth.
         self.config.num_hidden_layers = new_len
-        self.think_model.config.num_hidden_layers = new_len
+        self.model.config.num_hidden_layers = new_len
 
     def _apply_train_flags(self) -> None:
-        for p in self.think_model.parameters():
+        for p in self.model.parameters():
             p.requires_grad = self.config.train_think
         for p in self.talk_model.parameters():
             p.requires_grad = self.config.train_talk
@@ -359,10 +359,10 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
     # -------------------------------------------------------------------- forward
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.think_model.word_embeddings
+        return self.model.word_embeddings
 
     def set_input_embeddings(self, value: nn.Module) -> None:
-        self.think_model.word_embeddings = value
+        self.model.word_embeddings = value
 
     def forward(
         self,
@@ -380,7 +380,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         # 1. Think -- run full LLaDA-2.0-mini, surface all hidden states for the fuser.
-        think_out = self.think_model(
+        think_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -397,7 +397,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
 
         # 3. Talk model. Shares word embeddings with think (no separate embed table).
         if inputs_embeds is None:
-            talk_embeds = self.think_model.word_embeddings(input_ids)
+            talk_embeds = self.model.word_embeddings(input_ids)
         else:
             talk_embeds = inputs_embeds
 
@@ -429,7 +429,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
     ) -> torch.Tensor:
         """Forward through think + anchor fuser only. Used by the talk-only OPUT rollout
         (brief sec 8.3) and by efficient inference (think once per block)."""
-        think_out = self.think_model(
+        think_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -448,7 +448,7 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         position_ids: torch.LongTensor,
     ) -> torch.Tensor:
         """Forward through talk + LM head only, with a pre-computed anchor. Returns logits."""
-        talk_embeds = self.think_model.word_embeddings(input_ids)
+        talk_embeds = self.model.word_embeddings(input_ids)
         talk_hidden = self.talk_model(
             inputs_embeds=talk_embeds,
             anchor=anchor,
