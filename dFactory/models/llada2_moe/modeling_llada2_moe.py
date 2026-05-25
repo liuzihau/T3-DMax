@@ -337,7 +337,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        if self.config.model_type == "llada2_moe_veomni":
+        # T3-D MODIFIED: was strict equality with "llada2_moe_veomni"; switched to a
+        # suffix match so any VeOmni-registered config (e.g. "think_talk_llada2_veomni")
+        # also gets the fused-experts layout that matches DMax's merged-MoE checkpoints.
+        # Eager (per-expert) layout still applies to the standalone "llada2_moe" model_type.
+        if self.config.model_type.endswith("_veomni"):
             self._setup_fuse_moe_experts()
         else:
             self._setup_experts()

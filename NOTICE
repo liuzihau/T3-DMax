@@ -18,8 +18,13 @@ The following directories and files contain code derived from DMax (Apache-2.0):
     - argument dataclasses (LLaDA2ModelArguments, LLaDA2DataArguments,
       LLaDA2TrainingArguments) and main training loop scaffolding
     - dataset loading, FSDP2 setup, optimiser/scheduler/checkpoint plumbing
-  dFactory/configs/sft/t3_llada2_mini_bd_oput.yaml
+  dFactory/configs/sft/t3_llada2_mini_bd_oput_*.yaml
     - YAML structure and field names
+  dFactory/models/llada2_moe/modeling_llada2_moe.py  (modified in place)
+    - LLaDA2MoeSparseMoeBlock.__init__ branch on model_type: changed from strict
+      equality with "llada2_moe_veomni" to a suffix match so that derived configs
+      such as "think_talk_llada2_veomni" also pick up the fused-experts layout.
+      Marked with a "# T3-D MODIFIED:" comment at the modification site.
 
 The following files contain code vendored from Think-Then-Talk (internal):
   dFactory/models/think_talk_llada2/modeling_think_talk_llada2.py
