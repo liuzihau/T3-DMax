@@ -177,13 +177,17 @@ def _tiny_config_and_model():
     config = Config(
         vocab_size=512,
         hidden_size=64,
-        intermediate_size=128,
+        intermediate_size=128,            # dense MLP (used by layer 0 since first_k_dense_replace=1)
+        moe_intermediate_size=64,         # MoE expert MLP (used by layers 1..3)
         num_hidden_layers=4,
         num_attention_heads=4,
         num_key_value_heads=4,
         num_experts=4,
         num_experts_per_tok=2,
+        num_shared_experts=1,             # matches the real LLaDA-2.0-mini structure
         first_k_dense_replace=1,
+        n_group=1,                        # tiny config: 1 expert group instead of 8
+        topk_group=1,
         rms_norm_eps=1e-5,
         rope_theta=10000.0,
         pad_token_id=0,
