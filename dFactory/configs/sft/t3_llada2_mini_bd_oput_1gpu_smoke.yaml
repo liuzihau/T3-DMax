@@ -74,11 +74,22 @@ train:
   dyn_bsz_margin: 0
   dyn_bsz_buffer_size: 200
 
-  # Optimiser (matches DMax)
+  # Optimiser -- SMOKE-SPECIFIC: bumped LR ~50x above DMax's 2.0e-6
+  #
+  # Why: DMax's 2e-6 is appropriate for FINE-TUNING an already-pretrained 16B model.
+  # Our talk model + anchor gate are randomly initialised (trained from scratch); a
+  # from-scratch transformer needs lr in the 1e-4 to 1e-3 range. The fine-tune LR
+  # leaves talk barely moving over 500 steps -- loss observed flat at log(V).
+  #
+  # This higher LR will likely destabilise the pretrained LM head and embeddings
+  # in any longer run; that's fine here, we're validating pipeline + learning
+  # capability, not producing a usable checkpoint. The real 1gpu/2gpu runs should
+  # use differential LR (high for talk + alpha + LM head, much lower for everything
+  # else) -- separate workstream once smoke validates the basics.
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 2.0e-6
+  lr: 1.0e-4
   lr_warmup_ratio: 0.03
   lr_decay_style: cosine
   lr_decay_ratio: 1.0
