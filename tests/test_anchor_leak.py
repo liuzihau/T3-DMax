@@ -167,7 +167,12 @@ def _try_import_model():
 
 
 def _tiny_config_and_model():
-    """Build a tiny ThinkTalkLLaDA2 model on CPU for end-to-end leak tests."""
+    """Build a tiny ThinkTalkLLaDA2 model on CPU for end-to-end leak tests.
+
+    Note: pad_token_id defaults to 126081 in LLaDA-2.0-mini's real config, but with
+    vocab_size=512 here that would blow up `nn.Embedding(padding_idx=...)`. Override
+    to a tiny in-range value -- the actual pad id doesn't matter for these tests.
+    """
     Config, Model = _try_import_model()
     config = Config(
         vocab_size=512,
@@ -181,6 +186,7 @@ def _tiny_config_and_model():
         first_k_dense_replace=1,
         rms_norm_eps=1e-5,
         rope_theta=10000.0,
+        pad_token_id=0,
         talk_num_layers=2,
         anchor_fuser_type="last_only",
         anchor_layers="last",
