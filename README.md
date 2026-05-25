@@ -47,12 +47,29 @@ python scripts/moe_convertor.py \
 # 3. Run anchor-leak verification (mandatory before training; brief §8.4)
 pytest tests/test_anchor_leak.py
 
-# 4. Launch milestone-1 training
+# 4. Launch training -- pick the config matching your GPU count
+
+# Single H200 (141GB) -- freezes the think backbone (brief ablation A3)
 PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
 sh train.sh \
   tasks/train_t3_dmax_bd_oput.py \
-  configs/sft/t3_llada2_mini_bd_oput.yaml
+  configs/sft/t3_llada2_mini_bd_oput_1gpu.yaml
+
+# 2+ H200 -- full fine-tuning, FSDP2 sharded (strict A1 baseline)
+# Edit train.sh's NPROC_PER_NODE or rely on `nvidia-smi --list-gpus | wc -l`.
+PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
+sh train.sh \
+  tasks/train_t3_dmax_bd_oput.py \
+  configs/sft/t3_llada2_mini_bd_oput_2gpu.yaml
 ```
+
+| YAML | Distributed | Init | Think trained | Trainable params | Notes |
+|---|---|---|---|---|---|
+| `..._1gpu.yaml` | DDP wrap, no-op | `cuda` | **no** (frozen) | ~422M (talk + LM head) | Fits 141GB H200. Tests ablation A3. |
+| `..._2gpu.yaml` | FSDP2, full shard | `meta` | yes | ~16B (full LLaDA-2.0-mini + talk) | Strict A1 baseline. Needs 2+ H200 (more is better). |
+
+Both yamls use the same data, optimizer, mask ratio, and OPUT rollout. The only knobs
+that differ are the ones forced by distributed strategy + memory budget.
 
 ## Acknowledgements
 

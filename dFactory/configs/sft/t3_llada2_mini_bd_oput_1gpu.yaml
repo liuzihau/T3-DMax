@@ -1,0 +1,110 @@
+# Copyright 2026 University of Sydney
+# Licensed under the Apache License, Version 2.0.
+#
+# T3-D, single-GPU variant (brief ablation A3).
+#
+# What's different from the 2gpu yaml:
+#   - data_parallel_mode: ddp (FSDP needs world_size>1 to shard)
+#   - init_device: cuda (meta init requires fsdp_enabled, unreachable on 1 GPU)
+#   - enable_full_shard: false (no sharding with 1 GPU)
+#   - broadcast_model_weights_from_rank0: false (no other rank)
+#   - config_path: think_talk_llada2_mini_frozen_think (train_think=false; only ~422M
+#     trainable params -- talk + LM head -- so AdamW state fits in 141GB H200)
+#
+# Structure mirrors `dFactory/configs/sft/llada2_mini_bd_oput.yaml` from DMax (Apache-2.0,
+# Copyright 2026 National University of Singapore).
+
+model:
+  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think
+  model_path: ../LLaDA2.0-mini-moe-merge
+  tokenizer_path: ../LLaDA2.0-mini-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+  # T3-D architecture knobs (consumed via config.json, listed here for visibility only;
+  # VeOmni argparse currently drops them -- the model_config dir is the source of truth)
+  talk_num_layers: 2
+  talk_hidden_size: -1
+  talk_num_attention_heads: -1
+  talk_num_key_value_heads: -1
+  talk_intermediate_size: -1
+  anchor_fuser_type: last_only
+  anchor_layers: "last"
+  anchor_conditioning: gated_residual
+  anchor_gate_init: -2.0
+  prune_think_last_n_layer: 0
+  train_think: false                    # frozen for single-GPU memory budget
+  train_talk: true
+  train_lm_head: true
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./t3_llada2_mini_bd_oput_1gpu_outputs
+
+  # Distributed -- single GPU, DDP wrap is a no-op
+  data_parallel_mode: ddp
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8                  # grad_accum = 8 to match DMax's per-step batch
+  micro_batch_size: 1
+  num_train_epochs: 2
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+
+  # Optimiser (matches DMax)
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 2.0e-6
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Memory -- single-GPU specific
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: false              # no FSDP on 1 GPU
+  enable_fsdp_offload: false            # also requires FSDP
+  enable_activation_offload: false
+  init_device: cuda                     # meta requires fsdp_enabled (unreachable on 1 GPU)
+  broadcast_model_weights_from_rank0: false
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+  # Checkpointing (matches DMax)
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+
+  # Block diffusion (matches DMax)
+  block_diffusion_mode: true
+  block_size: 32                        # K=32 from the start (brief decision 3)
+  same_token_labels: true
+
+  # T3-D: OPUT rollout
+  t3_rollout_mode: dmax_oput
+  t3_rollout_target: talk_only          # think runs once on masked input; talk does rollout
+  t3_rollout_replace: all_masked
+  t3_train_iterations: 1
+  mask_token_id: 156895
+
+  # Logging
+  use_wandb: false
+  log_steps: 1
