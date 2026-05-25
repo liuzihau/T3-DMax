@@ -63,11 +63,17 @@ sh train.sh \
   configs/sft/t3_llada2_mini_bd_oput_2gpu.yaml
 ```
 
-| YAML | Distributed | Init | Think trained | Trainable params | Notes |
-|---|---|---|---|---|---|
-| `..._1gpu_smoke.yaml` | DDP wrap | `cuda` | no | ~422M | ~1 hr validation run; `max_steps=500`. Don't keep the checkpoint. |
-| `..._1gpu.yaml` | DDP wrap, no-op | `cuda` | **no** (frozen) | ~422M (talk + LM head) | Fits 141GB H200. Tests ablation A3. ETA ~30 days for 2 epochs. |
-| `..._2gpu.yaml` | FSDP2, full shard | `meta` | yes | ~16B (full LLaDA-2.0-mini + talk) | Strict A1 baseline. Needs 2+ H200 (more is better). |
+| YAML | Distributed | Init | Trainable | model_config | ETA | Notes |
+|---|---|---|---|---|---|---|
+| `..._1gpu_smoke.yaml` | DDP | `cuda` | talk + LM head | `..._frozen_think` | ~10 min | `max_steps=500`, `lr=1e-4`. Pipeline validation only — don't keep the checkpoint. |
+| `..._1gpu.yaml` | DDP, no-op | `cuda` | **talk only** | `..._talk_only` | ~4.4 days | Strategy A: think + LM head frozen, talk trains at `lr=1e-4`. Tests whether talk alone can match a frozen LLaDA-2.0-mini LM head. ~200M trainable params. |
+| `..._2gpu.yaml` | FSDP2, full shard | `meta` | full (~16B) | `..._mini` | TBD | Strict A1 baseline. Needs 2+ H200. |
+
+`model_config` references the directory under `dFactory/configs/model_configs/`:
+
+- `think_talk_llada2_mini/` — `train_think=true`, `train_talk=true`, `train_lm_head=true` (full FT, used by 2gpu yaml).
+- `think_talk_llada2_mini_frozen_think/` — `train_think=false`, `train_talk=true`, `train_lm_head=true` (talk + LM head trained; used by the smoke yaml for pipeline validation).
+- `think_talk_llada2_mini_talk_only/` — `train_think=false`, `train_talk=true`, `train_lm_head=false` (talk only; the Strategy A real run on a single GPU).
 
 All three yamls use the same data, optimizer, mask ratio, and OPUT rollout. The only
 knobs that differ are the ones forced by distributed strategy + memory budget.

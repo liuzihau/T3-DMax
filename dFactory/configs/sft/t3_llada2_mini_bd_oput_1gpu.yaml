@@ -1,28 +1,38 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# T3-D, single-GPU variant (brief ablation A3).
+# T3-D, single-GPU variant -- Strategy A real run.
+#
+# Trains only the 2-layer talk model + anchor gate; think backbone and LM head are
+# both frozen. Tests whether talk alone can learn to emit hidden states the frozen
+# LLaDA-2.0-mini LM head can decode. Smoke validated talk+LMhead-trainable at
+# lr=1e-4 descends from 11.97 -> ~9 over 250 steps; this variant freezes LM head
+# to remove the "is LM head fine-tuning doing the work?" confound.
 #
 # What's different from the 2gpu yaml:
 #   - data_parallel_mode: ddp (FSDP needs world_size>1 to shard)
 #   - init_device: cuda (meta init requires fsdp_enabled, unreachable on 1 GPU)
 #   - enable_full_shard: false (no sharding with 1 GPU)
-#   - broadcast_model_weights_from_rank0: false (no other rank)
-#   - config_path: think_talk_llada2_mini_frozen_think (train_think=false; only ~422M
-#     trainable params -- talk + LM head -- so AdamW state fits in 141GB H200)
+#   - enable_mixed_precision: false (fused MoE kernel requires bf16/fp16 weights)
+#   - config_path: think_talk_llada2_mini_talk_only (think + LM head frozen; only
+#     ~200M talk params + 1 alpha scalar train -- AdamW state fits trivially)
+#   - lr: 1e-4 (smoke-validated; 50x DMax's 2e-6 fine-tune LR because talk is
+#     trained from scratch, not fine-tuned)
+#   - save_steps: 15000 (~4-5 hour gaps; resume protection for the ~4-day run)
+#   - use_wandb: true (4-day unattended run; you want metrics off-server)
 #
 # Structure mirrors `dFactory/configs/sft/llada2_mini_bd_oput.yaml` from DMax (Apache-2.0,
 # Copyright 2026 National University of Singapore).
 
 model:
-  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think
+  config_path: ./configs/model_configs/think_talk_llada2_mini_talk_only
   model_path: ../LLaDA2.0-mini-moe-merge
   tokenizer_path: ../LLaDA2.0-mini-moe-merge
   attn_implementation: sdpa
   moe_implementation: fused
 
-  # T3-D architecture knobs (consumed via config.json, listed here for visibility only;
-  # VeOmni argparse currently drops them -- the model_config dir is the source of truth)
+  # T3-D architecture knobs (consumed via config.json; listed here for visibility only --
+  # VeOmni argparse drops them, the model_config dir is the source of truth)
   talk_num_layers: 2
   talk_hidden_size: -1
   talk_num_attention_heads: -1
@@ -33,9 +43,9 @@ model:
   anchor_conditioning: gated_residual
   anchor_gate_init: -2.0
   prune_think_last_n_layer: 0
-  train_think: false                    # frozen for single-GPU memory budget
+  train_think: false
   train_talk: true
-  train_lm_head: true
+  train_lm_head: false
 
 data:
   train_path: ./my_data/postprocess_train.jsonl
@@ -49,7 +59,7 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./t3_llada2_mini_bd_oput_1gpu_outputs
+  output_dir: ./outputs/t3d_1gpu_a3_talk_only_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -65,11 +75,11 @@ train:
   dyn_bsz_margin: 0
   dyn_bsz_buffer_size: 200
 
-  # Optimiser (matches DMax)
+  # Optimiser -- LR bumped 50x from DMax's fine-tune setting; see file header
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 2.0e-6
+  lr: 1.0e-4
   lr_warmup_ratio: 0.03
   lr_decay_style: cosine
   lr_decay_ratio: 1.0
@@ -77,13 +87,7 @@ train:
   max_grad_norm: 1.0
 
   # Memory -- single-GPU specific
-  enable_mixed_precision: false         # DDP doesn't auto-cast at forward time; VeOmni's
-                                        # fused MoE kernel asserts bf16/fp16. Run pure bf16.
-                                        # Trade: AdamW state is bf16, less numerically
-                                        # stable than fp32 master, but acceptable for the
-                                        # frozen-think A3 ablation. Multi-GPU FSDP2 yaml
-                                        # leaves enable_mixed_precision=true; FSDP handles
-                                        # the bf16 forward cast via its precision policy.
+  enable_mixed_precision: false         # DDP path stays in bf16; fused MoE asserts bf16/fp16
   enable_gradient_checkpointing: true
   enable_full_shard: false              # no FSDP on 1 GPU
   enable_fsdp_offload: false            # also requires FSDP
@@ -93,9 +97,10 @@ train:
   enable_full_determinism: false
   empty_cache_steps: 500
 
-  # Checkpointing (matches DMax)
+  # Checkpointing -- ~4-5h between intra-epoch saves on the 4-day run
   ckpt_manager: dcp
   load_checkpoint_path: ""
+  save_steps: 15000
   save_epochs: 1
   save_hf_weights: true
 
@@ -111,6 +116,8 @@ train:
   t3_train_iterations: 1
   mask_token_id: 156895
 
-  # Logging
-  use_wandb: false
+  # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
+  use_wandb: true
+  wandb_project: T3-DMax
+  wandb_name: t3d_1gpu_a3_talk_only_lr1e4
   log_steps: 1
