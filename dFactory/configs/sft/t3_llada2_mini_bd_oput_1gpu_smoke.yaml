@@ -86,7 +86,9 @@ train:
   max_grad_norm: 1.0
 
   # Memory -- single-GPU specific
-  enable_mixed_precision: true
+  enable_mixed_precision: false         # FSDP-only; DDP path leaves fp32 model
+                                        # weights at forward, but VeOmni's fused MoE
+                                        # kernel asserts bf16/fp16. Run pure bf16 here.
   enable_gradient_checkpointing: true
   enable_full_shard: false
   enable_fsdp_offload: false

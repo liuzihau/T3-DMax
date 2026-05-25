@@ -77,7 +77,13 @@ train:
   max_grad_norm: 1.0
 
   # Memory -- single-GPU specific
-  enable_mixed_precision: true
+  enable_mixed_precision: false         # DDP doesn't auto-cast at forward time; VeOmni's
+                                        # fused MoE kernel asserts bf16/fp16. Run pure bf16.
+                                        # Trade: AdamW state is bf16, less numerically
+                                        # stable than fp32 master, but acceptable for the
+                                        # frozen-think A3 ablation. Multi-GPU FSDP2 yaml
+                                        # leaves enable_mixed_precision=true; FSDP handles
+                                        # the bf16 forward cast via its precision policy.
   enable_gradient_checkpointing: true
   enable_full_shard: false              # no FSDP on 1 GPU
   enable_fsdp_offload: false            # also requires FSDP
