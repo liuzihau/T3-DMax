@@ -456,3 +456,11 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
             position_ids=position_ids,
         )
         return self.lm_head(talk_hidden)
+
+
+# VeOmni's ModelRegistry walks submodules of a registered package (not the package's
+# __init__.py) looking for a module-level `ModelClass` attribute. DMax's modeling_llada2_moe.py
+# does the same thing (line ~1575). Without this line, `register_modeling_path("models.think_talk_llada2")`
+# silently registers nothing -> the loader falls back to HF AutoModel -> HF rejects the
+# unknown model_type. See VeOmni/veomni/models/registry.py:57-78.
+ModelClass = ThinkTalkLLaDA2ForCausalLM
