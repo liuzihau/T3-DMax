@@ -73,8 +73,8 @@ train:
   enable_full_shard: true
   enable_fsdp_offload: false
   enable_activation_offload: false
-  init_device: meta
-  broadcast_model_weights_from_rank0: true
+  init_device: cuda
+  broadcast_model_weights_from_rank0: false
   enable_full_determinism: false
   empty_cache_steps: 500
 
