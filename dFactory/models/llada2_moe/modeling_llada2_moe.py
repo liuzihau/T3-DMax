@@ -396,7 +396,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states):
         # TODO (zhiguang): make a flag here for selecting different forward in different type
-        if self.config.model_type == "llada2_moe_veomni":
+        # T3-D MODIFIED: suffix match instead of strict equality, mirroring the
+        # __init__ branch above. Without this, derived configs like
+        # "think_talk_llada2_veomni" call _forward (eager path) on a fused
+        # LLaDA2MoeExperts module -- which has no len(), no __iter__, no __getitem__.
+        if self.config.model_type.endswith("_veomni"):
             return self._fuse_moe_forward(hidden_states)
         else:
             return self._forward(hidden_states)
