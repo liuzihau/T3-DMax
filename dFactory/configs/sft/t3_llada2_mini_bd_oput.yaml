@@ -8,8 +8,8 @@
 
 model:
   config_path: ./configs/model_configs/think_talk_llada2_mini   # T3-D: see model_configs dir
-  model_path: </path/to/LLaDA2.0-mini-moe-merge>                # use merged MoE format
-  tokenizer_path: </path/to/LLaDA2.0-mini-moe-merge>
+  model_path: ../LLaDA2.0-mini-moe-merge                # use merged MoE format
+  tokenizer_path: ../LLaDA2.0-mini-moe-merge
   attn_implementation: sdpa
   moe_implementation: fused
 
@@ -71,7 +71,7 @@ train:
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
-  enable_fsdp_offload: true
+  enable_fsdp_offload: false
   enable_activation_offload: false
   init_device: meta
   broadcast_model_weights_from_rank0: true
