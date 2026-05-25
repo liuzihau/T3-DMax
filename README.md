@@ -65,11 +65,42 @@ sh train.sh \
 
 | YAML | Distributed | Init | Think trained | Trainable params | Notes |
 |---|---|---|---|---|---|
-| `..._1gpu.yaml` | DDP wrap, no-op | `cuda` | **no** (frozen) | ~422M (talk + LM head) | Fits 141GB H200. Tests ablation A3. |
+| `..._1gpu_smoke.yaml` | DDP wrap | `cuda` | no | ~422M | ~1 hr validation run; `max_steps=500`. Don't keep the checkpoint. |
+| `..._1gpu.yaml` | DDP wrap, no-op | `cuda` | **no** (frozen) | ~422M (talk + LM head) | Fits 141GB H200. Tests ablation A3. ETA ~30 days for 2 epochs. |
 | `..._2gpu.yaml` | FSDP2, full shard | `meta` | yes | ~16B (full LLaDA-2.0-mini + talk) | Strict A1 baseline. Needs 2+ H200 (more is better). |
 
-Both yamls use the same data, optimizer, mask ratio, and OPUT rollout. The only knobs
-that differ are the ones forced by distributed strategy + memory budget.
+All three yamls use the same data, optimizer, mask ratio, and OPUT rollout. The only
+knobs that differ are the ones forced by distributed strategy + memory budget.
+
+## Smoke test (recommended before committing to a real run)
+
+```bash
+# From the dFactory dir, with the conda env active and PYTHONPATH set:
+cd dFactory
+PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
+sh train.sh \
+  tasks/train_t3_dmax_bd_oput.py \
+  configs/sft/t3_llada2_mini_bd_oput_1gpu_smoke.yaml \
+  2>&1 | tee smoke_log.txt
+
+# After the run finishes (or you Ctrl-C past step 200), validate:
+python ../tools/check_smoke.py smoke_log.txt
+```
+
+`tools/check_smoke.py` reports PASS if:
+
+- At least 100 steps were logged (no early crash).
+- First-50-step loss mean is at log(vocab) ≈ 11.97 (sane initialisation).
+- Last-50-step loss mean is below 11.0 (talk model is actually learning).
+- Loss descends overall (final-50 mean < first-50 mean).
+- No NaN/inf in loss or grad_norm.
+- The mid-run checkpoint save line appears.
+
+If PASS: the pipeline is end-to-end correct and you can either commit to the long
+1gpu run, or request multi-GPU and switch to `..._2gpu.yaml`.
+
+If FAIL: paste the report and the smoke log; the failure mode usually points at one
+specific layer of the stack (data, model init, optimizer, checkpoint).
 
 ## Acknowledgements
 
