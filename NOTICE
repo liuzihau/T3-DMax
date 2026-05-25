@@ -1,0 +1,31 @@
+T3-DMax (T3-D)
+Copyright 2026 University of Sydney
+
+This product includes software developed at NUS:
+  DMax: Aggressive Parallel Decoding for dLLMs
+  https://github.com/czg1225/DMax
+  Copyright 2026 National University of Singapore
+  Licensed under the Apache License, Version 2.0
+
+This product includes software vendored from an internal project:
+  Think-Then-Talk
+  University of Sydney
+  Copyright 2026 University of Sydney
+
+The following directories and files contain code derived from DMax (Apache-2.0):
+  dFactory/tasks/train_t3_dmax_bd_oput.py
+    - block_diffusion_mask attention construction
+    - argument dataclasses (LLaDA2ModelArguments, LLaDA2DataArguments,
+      LLaDA2TrainingArguments) and main training loop scaffolding
+    - dataset loading, FSDP2 setup, optimiser/scheduler/checkpoint plumbing
+  dFactory/configs/sft/t3_llada2_mini_bd_oput.yaml
+    - YAML structure and field names
+
+The following files contain code vendored from Think-Then-Talk (internal):
+  dFactory/models/think_talk_llada2/modeling_think_talk_llada2.py
+    - TalkModel block construction patterns (gated residual injection, fuse_representation
+      hook, anchor RPS state update)
+    - prune_last_n_blocks helper (used by ablation A1.5)
+
+Where DMax or Think-Then-Talk code has been modified, the change is marked with an
+"# T3-D MODIFIED:" or "# T3-D ADDED:" comment so the diff is auditable.

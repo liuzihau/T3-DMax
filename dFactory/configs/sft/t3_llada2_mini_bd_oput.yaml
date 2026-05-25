@@ -1,0 +1,101 @@
+# Copyright 2026 University of Sydney
+# Licensed under the Apache License, Version 2.0.
+#
+# T3-D milestone-1 config (brief sec 10).
+# Structure mirrors `dFactory/configs/sft/llada2_mini_bd_oput.yaml` from DMax (Apache-2.0,
+# Copyright 2026 National University of Singapore).
+# T3-specific fields are grouped at the bottom of model: and train: with a `# T3-D:` comment.
+
+model:
+  config_path: ./configs/model_configs/think_talk_llada2_mini   # T3-D: see model_configs dir
+  model_path: </path/to/LLaDA2.0-mini-moe-merge>                # use merged MoE format
+  tokenizer_path: </path/to/LLaDA2.0-mini-moe-merge>
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+  # T3-D: Think-Then-Talk architecture
+  talk_num_layers: 2
+  talk_hidden_size: -1                  # -1 -> match think.hidden_size
+  talk_num_attention_heads: -1          # -1 -> match think
+  talk_num_key_value_heads: -1          # -1 -> match think
+  talk_intermediate_size: -1            # -1 -> match think (dense MLP)
+  anchor_fuser_type: last_only          # last_only | last_mid | concat_linear | gated | cross_attention
+  anchor_layers: "last"                 # ignored when anchor_fuser_type=last_only
+  anchor_conditioning: gated_residual   # gated_residual | cross_attention | prefix_token
+  anchor_gate_init: -2.0                # sigmoid(-2.0) ≈ 0.12; small initial gate
+  prune_think_last_n_layer: 0           # 0 = full think; set to 1 for ablation A1.5
+  train_think: true
+  train_talk: true
+  train_lm_head: true
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./t3_llada2_mini_bd_oput_outputs
+
+  # Distributed (matches DMax)
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 2
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+
+  # Optimiser (matches DMax)
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 2.0e-6
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Memory (matches DMax)
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: true
+  enable_activation_offload: false
+  init_device: meta
+  broadcast_model_weights_from_rank0: true
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+  # Checkpointing (matches DMax)
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+
+  # Block diffusion (matches DMax)
+  block_diffusion_mode: true
+  block_size: 32                        # T3-D: K=32 from the start (brief decision 3)
+  same_token_labels: true
+
+  # T3-D: OPUT rollout
+  t3_rollout_mode: dmax_oput            # dmax_oput | none
+  t3_rollout_target: talk_only          # talk_only (default) | think_and_talk (ablation)
+  t3_rollout_replace: all_masked        # all_masked (matches DMax) | confidence
+  t3_train_iterations: 1                # 1 for M1; >1 reserved for ablation A4
+  mask_token_id: 156895                 # LLaDA-2.0-mini's [MASK] token
+
+  # Logging
+  use_wandb: false                      # set wandb_project + wandb_name to enable
+  log_steps: 1
