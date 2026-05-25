@@ -43,7 +43,7 @@ train:
   output_dir: ./t3_llada2_mini_bd_oput_outputs
 
   # Distributed (matches DMax)
-  data_parallel_mode: fsdp2
+  data_parallel_mode: ddp
   tensor_parallel_size: 1
   ulysses_parallel_size: 1
   expert_parallel_size: 1
@@ -70,7 +70,7 @@ train:
   # Memory (matches DMax)
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
-  enable_full_shard: true
+  enable_full_shard: false
   enable_fsdp_offload: false
   enable_activation_offload: false
   init_device: cuda
