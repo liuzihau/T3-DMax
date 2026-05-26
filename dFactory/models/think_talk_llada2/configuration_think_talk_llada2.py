@@ -50,7 +50,13 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         anchor_layers: str = "last",           # "last" | comma-separated indices for non-last_only types
         # === Conditioning mechanism (brief sec 6.4) ===
         anchor_conditioning: str = "gated_residual",  # gated_residual | cross_attention | prefix_token
-        anchor_gate_init: float = -2.0,        # sigmoid(-2.0) ≈ 0.12; small initial gate
+        anchor_gate_learnable: bool = True,    # True: gate=sigmoid(alpha), alpha is nn.Parameter
+                                                #   initialised from anchor_gate_init below
+                                                # False: gate is fixed at anchor_gate_value, no
+                                                #   sigmoid, no learnable alpha. Use for diagnosing
+                                                #   training dynamics without the gate as a variable.
+        anchor_gate_init: float = -2.0,         # sigmoid(-2.0) ≈ 0.12; only used when learnable
+        anchor_gate_value: float = 0.2,         # fixed gate value; only used when NOT learnable
         # === Think-side ablations ===
         prune_think_last_n_layer: int = 0,     # >0 enables ablation A1.5 (warm-start talk)
         # === Training flags surfaced into config so checkpoints round-trip ===
@@ -70,7 +76,9 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         self.anchor_fuser_type = str(anchor_fuser_type)
         self.anchor_layers = str(anchor_layers)
         self.anchor_conditioning = str(anchor_conditioning)
+        self.anchor_gate_learnable = bool(anchor_gate_learnable)
         self.anchor_gate_init = float(anchor_gate_init)
+        self.anchor_gate_value = float(anchor_gate_value)
 
         self.prune_think_last_n_layer = int(prune_think_last_n_layer)
         self.train_think = bool(train_think)

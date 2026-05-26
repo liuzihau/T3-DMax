@@ -64,7 +64,9 @@
     "anchor_fuser_type": "last_only",
     "anchor_layers": "last",
     "anchor_conditioning": "gated_residual",
+    "anchor_gate_learnable": false,
     "anchor_gate_init": -2.0,
+    "anchor_gate_value": 0.2,
 
     "prune_think_last_n_layer": 0,
     "train_think": false,

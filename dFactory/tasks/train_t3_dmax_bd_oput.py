@@ -175,6 +175,43 @@ def block_diffusion_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
     return block_diagonal | offset_block_causal | block_causal
 
 
+# T3-D ADDED: per-step diagnostic metrics. Reads scalars off the model + optimiser to
+# diagnose training pathologies (gate stuck, hidden states exploding, one param group
+# drifting much faster than another). All ops are .item() on scalars or .norm() on
+# already-existing param grads, so cost is negligible.
+@torch.no_grad()
+def _t3d_diagnostic_metrics(model, optimizer):
+    metrics = {}
+
+    # Resolve the underlying model (unwrap DDP/FSDP if needed).
+    inner = getattr(model, "module", model)
+
+    # Gate value at talk layer 0.
+    try:
+        anchor_cond = inner.talk_model.layers[0].anchor_conditioning
+        if anchor_cond is not None:
+            metrics["t3/gate"] = float(anchor_cond.gate_value)
+            if anchor_cond.learnable and anchor_cond.alpha is not None:
+                metrics["t3/alpha_raw"] = float(anchor_cond.alpha.item())
+                if anchor_cond.alpha.grad is not None:
+                    metrics["t3/alpha_grad"] = float(anchor_cond.alpha.grad.norm().item())
+    except (AttributeError, IndexError):
+        pass
+
+    # Per-group grad norms -- useful when optimiser was split (Strategy C).
+    try:
+        for i, group in enumerate(optimizer.param_groups):
+            grads = [p.grad for p in group["params"] if p.grad is not None]
+            if grads:
+                norm = torch.stack([g.detach().norm() for g in grads]).norm().item()
+                metrics[f"t3/grad_norm_group{i}"] = norm
+                metrics[f"t3/lr_group{i}"] = float(group["lr"])
+    except Exception:
+        pass
+
+    return metrics
+
+
 def main():
     dist.init_process_group(backend=get_nccl_backend())
     args = parse_args(Arguments)
@@ -277,6 +314,17 @@ def main():
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
+
+    # T3-D ADDED: depth-scaled init for the talk transformer. VeOmni's load_model_weights
+    # (already run above) uses uniform std=initializer_range for unmatched-key params,
+    # which is wrong for from-scratch transformers (output projections must be scaled
+    # 1/sqrt(2*(layer+1)) to keep residual variance from growing with depth). Must be
+    # called BEFORE build_parallelize_model wraps the model in DDP/FSDP.
+    if hasattr(model, "init_talk_layers_depth_scaled"):
+        model.init_talk_layers_depth_scaled()
+        logger.info_rank0(
+            "[T3-D] applied depth-scaled init to talk layers (Megatron/GPT-NeoX recipe)."
+        )
 
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     model = build_parallelize_model(
@@ -624,6 +672,12 @@ def main():
                     "training/grad_norm": grad_norm,
                     "training/lr": lr,
                 })
+                # T3-D ADDED: diagnostic logs to help spot training pathologies (gate
+                # stuck closed, talk hidden norm exploding, lm_head drifting too fast).
+                # All cheap to compute -- one .item() per step.
+                t3_metrics = _t3d_diagnostic_metrics(model, optimizer)
+                if t3_metrics:
+                    train_metrics.update(t3_metrics)
                 wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

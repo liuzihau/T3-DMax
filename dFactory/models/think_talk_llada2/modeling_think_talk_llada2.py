@@ -47,6 +47,7 @@ gating cost is dominated by the routed FFN — true with `num_experts_per_tok=8`
 `moe_intermediate_size=512`).
 """
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -129,11 +130,18 @@ class AnchorFuser(nn.Module):
 class GatedResidualConditioning(nn.Module):
     """Adds anchor into talk hidden states at the very start of layer 0.
 
-        talk_hidden = talk_hidden + sigmoid(alpha) * RMSNorm(anchor)
+        talk_hidden = talk_hidden + gate * RMSNorm(anchor)
 
-    Where `alpha` is a scalar learnable parameter, initialised so sigmoid(alpha) is small
-    (default sigmoid(-2.0) ≈ 0.12). This keeps the freshly initialised talk model close to
-    its embedding-only behaviour at start of training; the gate opens as needed.
+    Two modes for `gate`:
+
+    - **Learnable (default)**: `gate = sigmoid(alpha)` where alpha is an `nn.Parameter`
+      initialised from `config.anchor_gate_init` (a sigmoid input — set to -2.0 for
+      gate ≈ 0.12 at init). The gate opens (alpha grows) as the optimiser finds it
+      useful.
+
+    - **Fixed**: `gate = config.anchor_gate_value` (a scalar buffer, not trainable).
+      Use this to remove the gate as a variable when diagnosing other issues — talk
+      always sees this fraction of the anchor, no co-adaptation between gate and talk.
 
     Pattern vendored from Think-Then-Talk's RPS residual injection. We simplify: no
     rps_mlp_in/out projection, no learnable eta — just the scalar gate.
@@ -144,11 +152,28 @@ class GatedResidualConditioning(nn.Module):
         self.anchor_norm = LLaDA2MoeRMSNorm(
             config.resolved_talk_hidden_size, eps=config.rms_norm_eps,
         )
-        self.alpha = nn.Parameter(torch.tensor(float(config.anchor_gate_init)))
+        self.learnable = bool(getattr(config, "anchor_gate_learnable", True))
+        if self.learnable:
+            self.alpha = nn.Parameter(torch.tensor(float(config.anchor_gate_init)))
+            self.register_buffer("fixed_gate", torch.tensor(0.0), persistent=False)
+        else:
+            # Fixed-gate mode: register_buffer so the value travels with the module on
+            # .to() / .cuda() but isn't picked up by the optimiser.
+            self.alpha = None
+            value = float(getattr(config, "anchor_gate_value", 0.2))
+            self.register_buffer("fixed_gate", torch.tensor(value), persistent=False)
 
     def forward(self, talk_hidden: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.alpha)
+        gate = torch.sigmoid(self.alpha) if self.learnable else self.fixed_gate
         return talk_hidden + gate * self.anchor_norm(anchor)
+
+    @property
+    def gate_value(self) -> float:
+        """For logging: returns the current scalar gate magnitude (post-sigmoid if learnable)."""
+        if self.learnable:
+            with torch.no_grad():
+                return torch.sigmoid(self.alpha).item()
+        return float(self.fixed_gate.item())
 
 
 # ============================================================================
@@ -355,6 +380,50 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
             p.requires_grad = self.config.train_talk
         for p in self.lm_head.parameters():
             p.requires_grad = self.config.train_lm_head
+
+    @torch.no_grad()
+    def init_talk_layers_depth_scaled(self) -> None:
+        """GPT-NeoX / Megatron-style depth-scaled init for talk transformer layers.
+
+        Vendored recipe from Think-Then-Talk's `manual_init_talk_model`
+        (peft_project/T3/Think-Then-Talk/model/modeling_t3.py:L41-L78). Without this,
+        from-scratch talk training with uniform std=0.02 init causes the residual stream
+        variance to grow with depth, blocking learning -- observed empirically as a
+        plateau at loss ~= log(vocab) regardless of LR.
+
+        For each talk decoder layer at index i:
+          - Output projections (attention.dense, mlp.down_proj):
+                std = initializer_range / sqrt(2 * (i + 1))   (truncated normal)
+          - Other projections (attention.query_key_value, mlp.gate_proj, mlp.up_proj):
+                std = initializer_range                       (truncated normal)
+          - All Linear biases -> zero.
+
+        Norms and embedding-like params are not touched (they keep their constructor
+        defaults of ones / Kaiming).
+
+        Should be called once, AFTER VeOmni's `load_model_weights` has run -- otherwise
+        VeOmni would overwrite with its uniform-std init. Safe to call multiple times.
+        """
+        init_std = float(getattr(self.config, "initializer_range", 0.02))
+
+        for layer_idx, block in enumerate(self.talk_model.layers):
+            scaled_std = init_std / math.sqrt(2.0 * (layer_idx + 1))
+            for name, module in block.named_modules():
+                if isinstance(module, nn.Linear):
+                    if name.endswith("dense") or name.endswith("down_proj"):
+                        # Output projections -- depth-scaled.
+                        nn.init.trunc_normal_(
+                            module.weight, mean=0.0, std=scaled_std,
+                            a=-3 * scaled_std, b=3 * scaled_std,
+                        )
+                    else:
+                        # All other projections -- regular init.
+                        nn.init.trunc_normal_(
+                            module.weight, mean=0.0, std=init_std,
+                            a=-3 * init_std, b=3 * init_std,
+                        )
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
     # -------------------------------------------------------------------- forward
 
