@@ -134,6 +134,15 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
         default=156895,
         metadata={"help": "LLaDA-2.0-mini's [MASK] token id."},
     )
+    # T3-D ADDED: differential LR ratio for LM head (Strategy C). 1.0 -> same LR as `lr`.
+    # Typical value 0.02-0.05 puts LM head at fine-tune scale while talk learns at scratch
+    # scale. Only takes effect when train_lm_head=true (otherwise LM head is frozen).
+    lr_lm_head_ratio: float = field(
+        default=1.0,
+        metadata={"help": "Multiplier applied to `lr` for the lm_head param group. "
+                          "1.0 = single-group optimizer (no split). 0.02-0.05 = differential "
+                          "LR (Strategy C) keeping LM head near its DMax fine-tune LR."},
+    )
 
 
 @dataclass
@@ -296,6 +305,43 @@ def main():
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
         optimizer.register_step_pre_hook(optimizer_pre_hook)
+
+    # T3-D ADDED: Strategy C -- differential LR. If lr_lm_head_ratio != 1.0, split the
+    # optimizer's single param group into two: talk + alpha + anchor at args.train.lr,
+    # lm_head at args.train.lr * lr_lm_head_ratio. The LambdaLR scheduler built below
+    # multiplies its [0,1] step factor against each group's initial_lr, so both groups
+    # warmup/decay on the same shape but with different peaks.
+    if args.train.lr_lm_head_ratio != 1.0 and args.train.t3_rollout_mode != "none":
+        lmhead_params = [
+            p for n, p in model.named_parameters()
+            if n.startswith("lm_head") and p.requires_grad
+        ]
+        lmhead_param_ids = {id(p) for p in lmhead_params}
+        if not lmhead_params:
+            logger.info_rank0(
+                "[T3-D differential LR] lr_lm_head_ratio set but no trainable lm_head params "
+                "found (train_lm_head likely false). Skipping split."
+            )
+        else:
+            # Move LM head params out of group 0, into a new group with lower LR.
+            optimizer.param_groups[0]["params"] = [
+                p for p in optimizer.param_groups[0]["params"]
+                if id(p) not in lmhead_param_ids
+            ]
+            optimizer.param_groups[0]["initial_lr"] = args.train.lr   # explicit for LambdaLR base_lrs
+
+            lr_lmhead = args.train.lr * args.train.lr_lm_head_ratio
+            optimizer.add_param_group({
+                "params": lmhead_params,
+                "lr": lr_lmhead,
+                "initial_lr": lr_lmhead,
+            })
+            logger.info_rank0(
+                f"[T3-D differential LR] talk+alpha+anchor: lr={args.train.lr:.2e}, "
+                f"lm_head: lr={lr_lmhead:.2e} (ratio={args.train.lr_lm_head_ratio}). "
+                f"Split: {sum(p.numel() for p in optimizer.param_groups[0]['params']):,} "
+                f"non-lmhead params + {sum(p.numel() for p in lmhead_params):,} lm_head params."
+            )
 
     lr_scheduler = build_lr_scheduler(
         optimizer,

@@ -1,13 +1,17 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# T3-D, single-GPU variant -- Strategy A real run.
+# T3-D, single-GPU variant -- Strategy D (post-A failure).
 #
-# Trains only the 2-layer talk model + anchor gate; think backbone and LM head are
-# both frozen. Tests whether talk alone can learn to emit hidden states the frozen
-# LLaDA-2.0-mini LM head can decode. Smoke validated talk+LMhead-trainable at
-# lr=1e-4 descends from 11.97 -> ~9 over 250 steps; this variant freezes LM head
-# to remove the "is LM head fine-tuning doing the work?" confound.
+# Trains talk model + anchor gate + LM head; think backbone frozen.
+# Mirrors the smoke setup exactly -- smoke validated this descends from 11.97
+# to ~9 in 250 steps. Strategy A (LM head also frozen) was attempted and
+# stalled at loss ~11.4 after 15k steps; reverted here.
+#
+# Risk in this configuration: lr=1e-4 over 349k steps may drift the LM head
+# from its LLaDA-pretrained values. We accept this risk for the milestone-1
+# run; if the eventual GSM8K eval is degraded vs DMax (~90% target), the next
+# experiment is Strategy C (differential LR with LM head at a lower rate).
 #
 # What's different from the 2gpu yaml:
 #   - data_parallel_mode: ddp (FSDP needs world_size>1 to shard)
@@ -25,7 +29,7 @@
 # Copyright 2026 National University of Singapore).
 
 model:
-  config_path: ./configs/model_configs/think_talk_llada2_mini_talk_only
+  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think
   model_path: ../LLaDA2.0-mini-moe-merge
   tokenizer_path: ../LLaDA2.0-mini-moe-merge
   attn_implementation: sdpa
@@ -45,7 +49,7 @@ model:
   prune_think_last_n_layer: 0
   train_think: false
   train_talk: true
-  train_lm_head: false
+  train_lm_head: true
 
 data:
   train_path: ./my_data/postprocess_train.jsonl
@@ -59,7 +63,7 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./outputs/t3d_1gpu_a3_talk_only_lr1e4
+  output_dir: ./outputs/t3d_1gpu_d_lmhead_train_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -119,5 +123,5 @@ train:
   # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
   use_wandb: true
   wandb_project: T3-DMax
-  wandb_name: t3d_1gpu_a3_talk_only_lr1e4
+  wandb_name: t3d_1gpu_d_lmhead_train_lr1e4
   log_steps: 1
