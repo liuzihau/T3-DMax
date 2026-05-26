@@ -175,6 +175,52 @@ def block_diffusion_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
     return block_diagonal | offset_block_causal | block_causal
 
 
+# T3-D ADDED: 3L attention mask for the concat_segment anchor-injection mode.
+#
+# Sequence layout: [noisy(0..n-1), anchor(n..2n-1), clean(2n..3n-1)]. The anchor stream
+# is *attentionally identical* to noisy -- same block constraints, same access to prior
+# clean blocks. Implementation: remap each position to its "effective" position within
+# its conceptual region (noisy_or_anchor vs clean), then apply the same M_BD / M_OBC /
+# M_BC submasks as the 2L case.
+#
+# Verified mask cells (q region -> k region):
+#   noisy  -> noisy  : M_BD                 (same block)
+#   noisy  -> anchor : M_BD                 (same block)
+#   noisy  -> clean  : M_OBC                (prior blocks only)
+#   anchor -> noisy  : M_BD                 (same block)
+#   anchor -> anchor : M_BD                 (same block)
+#   anchor -> clean  : M_OBC                (prior blocks only)
+#   clean  -> noisy  : blocked
+#   clean  -> anchor : blocked
+#   clean  -> clean  : M_BC                 (block-causal among clean)
+#
+# Crucially, anchor queries cannot see clean keys in their own or future blocks ->
+# anchor[i] never leaks label info for block of i.
+def block_diffusion_mask_3L(q_idx, kv_idx, block_size, n):
+    # "Is this position in the clean region?" -- clean starts at 2n.
+    x0_flag_q  = (q_idx  >= 2 * n)
+    x0_flag_kv = (kv_idx >= 2 * n)
+
+    # Effective intra-region position: noisy keeps its index, anchor maps to its
+    # noisy-equivalent (idx - n), clean maps to (idx - 2n). Anchor and noisy then
+    # share the same block index for the block-membership check below.
+    eff_q  = torch.where(
+        q_idx  < n, q_idx,
+        torch.where(q_idx  < 2 * n, q_idx  - n, q_idx  - 2 * n),
+    )
+    eff_kv = torch.where(
+        kv_idx < n, kv_idx,
+        torch.where(kv_idx < 2 * n, kv_idx - n, kv_idx - 2 * n),
+    )
+    block_q  = eff_q  // block_size
+    block_kv = eff_kv // block_size
+
+    block_diagonal      = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+    offset_block_causal = (block_q >  block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 0)
+    block_causal        = (block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1)
+    return block_diagonal | offset_block_causal | block_causal
+
+
 # T3-D ADDED: per-step diagnostic metrics. Reads scalars off the model + optimiser to
 # diagnose training pathologies (gate stuck, hidden states exploding, one param group
 # drifting much faster than another). All ops are .item() on scalars or .norm() on
@@ -470,6 +516,33 @@ def main():
         )
         block_diffusion_attn_mask_prototype.masked_fill_(block_diffusion_attn_mask_flag.logical_not(), float("-inf"))
 
+        # T3-D ADDED: 3L mask + position_ids for the concat_segment talk pathway.
+        # Built once at startup, reused per micro-batch. None-valued when model is in
+        # gated_residual mode (cheap memory savings, also signals to .forward() that
+        # the concat_segment path is not in use).
+        use_concat_segment = getattr(model_config, "anchor_injection_mode", "gated_residual") == "concat_segment"
+        if use_concat_segment:
+            bd_attn_full_len_3L = args.data.max_seq_len * 3
+            block_diffusion_attn_mask_flag_3L = block_diffusion_mask_3L(
+                q_idx=torch.arange(bd_attn_full_len_3L)[:, None],
+                kv_idx=torch.arange(bd_attn_full_len_3L)[None, :],
+                block_size=block_size,
+                n=args.data.max_seq_len,
+            ).unsqueeze(0).unsqueeze(0)
+            block_diffusion_attn_mask_prototype_3L = torch.zeros_like(
+                block_diffusion_attn_mask_flag_3L,
+                dtype=torch.float32 if args.train.enable_mixed_precision else torch.bfloat16,
+            )
+            block_diffusion_attn_mask_prototype_3L.masked_fill_(
+                block_diffusion_attn_mask_flag_3L.logical_not(), float("-inf"),
+            )
+            logger.info_rank0(
+                f"[T3-D concat_segment] built 3L attention mask "
+                f"({bd_attn_full_len_3L}x{bd_attn_full_len_3L})."
+            )
+        else:
+            block_diffusion_attn_mask_prototype_3L = None
+
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit,
@@ -533,6 +606,21 @@ def main():
                     micro_batch["input_ids"] = full_input_ids
                     micro_batch["position_ids"] = position_ids
                     micro_batch["attention_mask"] = block_diffusion_attn_mask_prototype.expand(batch_size, -1, -1, -1)
+
+                    # T3-D ADDED: attach 3L mask + position_ids for the concat_segment talk pathway.
+                    # In that mode the model.forward will assemble [noisy, anchor, clean] in talk
+                    # and consume these 3L tensors. In gated_residual mode these stay None.
+                    if block_diffusion_attn_mask_prototype_3L is not None:
+                        micro_batch["attention_mask_3L"] = (
+                            block_diffusion_attn_mask_prototype_3L.expand(batch_size, -1, -1, -1)
+                        )
+                        # 3L position_ids: noisy positions [0..L-1], then anchor positions
+                        # [0..L-1] (sharing intra-block offsets with noisy), then clean
+                        # [0..L-1]. All three streams use the same intra-block positions;
+                        # segment_embed inside the model distinguishes them.
+                        micro_batch["position_ids_3L"] = torch.cat(
+                            [noisy_position_ids, noisy_position_ids, clean_position_ids], dim=0,
+                        ).unsqueeze(0).expand(batch_size, -1).clone()
                 else:
                     micro_batch["attention_mask"] = None
 
@@ -581,6 +669,10 @@ def main():
                             anchor=anchor_cached,
                             attention_mask=micro_batch["attention_mask"],
                             position_ids=micro_batch["position_ids"],
+                            # T3-D ADDED: 3L tensors are present in concat_segment mode,
+                            # None in gated_residual mode. run_talk picks the right path.
+                            attention_mask_3L=micro_batch.get("attention_mask_3L"),
+                            position_ids_3L=micro_batch.get("position_ids_3L"),
                         )
                         rollout_tokens = rollout_logits.argmax(dim=-1)
                         active_mask = (micro_batch["input_ids"][:, :noisy_len] == args.train.mask_token_id)
@@ -607,6 +699,8 @@ def main():
                             anchor=anchor_cached.detach(),
                             attention_mask=micro_batch["attention_mask"],
                             position_ids=micro_batch["position_ids"],
+                            attention_mask_3L=micro_batch.get("attention_mask_3L"),
+                            position_ids_3L=micro_batch.get("position_ids_3L"),
                         )
                     else:
                         logits = model(

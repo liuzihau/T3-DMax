@@ -269,34 +269,69 @@ class TalkModel(nn.Module):
         self.config = config
         self.rotary_emb = rotary_emb  # shared with think; no copy
 
-        anchor_conditioning = GatedResidualConditioning(config)
-        self.layers = nn.ModuleList(
-            [
-                TalkDecoderLayer(
-                    config,
-                    layer_idx=i,
-                    anchor_conditioning=anchor_conditioning if i == 0 else None,
-                )
-                for i in range(config.talk_num_layers)
-            ]
-        )
+        # T3-D injection modes:
+        #   anchor_injection_mode="gated_residual":
+        #     Anchor is added per-position into talk's residual stream.
+        #     inject_layers="first" -> only layer 0 conditioning module; "all" -> every layer.
+        #   anchor_injection_mode="concat_segment":
+        #     Anchor is concatenated into the input sequence as separate tokens.
+        #     No GatedResidualConditioning modules are instantiated; talk attends to anchor
+        #     tokens directly via self-attention. The 3L sequence assembly happens in the
+        #     outer ThinkTalkLLaDA2ForCausalLM.forward; TalkModel just consumes hidden_states.
+        self.injection_mode = config.anchor_injection_mode
+        self.inject_all = (config.anchor_inject_layers == "all")
+
+        if self.injection_mode == "gated_residual":
+            self.layers = nn.ModuleList(
+                [
+                    TalkDecoderLayer(
+                        config,
+                        layer_idx=i,
+                        anchor_conditioning=(
+                            GatedResidualConditioning(config)
+                            if (i == 0 or self.inject_all)
+                            else None
+                        ),
+                    )
+                    for i in range(config.talk_num_layers)
+                ]
+            )
+        else:  # concat_segment
+            # No anchor_conditioning modules at all -- anchor enters the sequence as tokens.
+            self.layers = nn.ModuleList(
+                [
+                    TalkDecoderLayer(config, layer_idx=i, anchor_conditioning=None)
+                    for i in range(config.talk_num_layers)
+                ]
+            )
+
         self.norm = LLaDA2MoeRMSNorm(config.resolved_talk_hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        anchor: torch.Tensor,
+        anchor: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.LongTensor,
     ) -> torch.Tensor:
-        # Build position embeddings (cos, sin) once and pass into every layer.
+        """In gated_residual mode: inputs_embeds is [B, 2L, D]; anchor [B, 2L, D] is mixed
+        into the residual at the configured layers.
+        In concat_segment mode: inputs_embeds is already [B, 3L, D] with segment embed added;
+        anchor is None (information is in the sequence tokens themselves).
+        """
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
         for i, layer in enumerate(self.layers):
+            # anchor is only consumed when the layer actually has an anchor_conditioning module.
+            layer_anchor = (
+                anchor
+                if (self.injection_mode == "gated_residual" and (i == 0 or self.inject_all))
+                else None
+            )
             hidden_states = layer(
                 hidden_states=hidden_states,
-                anchor=anchor if i == 0 else None,
+                anchor=layer_anchor,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
@@ -348,6 +383,16 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
             config.resolved_talk_hidden_size, config.vocab_size, bias=False,
         )
 
+        # ---- T3-D ADDED: segment embedding (concat_segment mode only) ---------
+        # 3 classes: 0=noisy stream, 1=anchor stream, 2=clean stream. Added to the talk
+        # input alongside the token / anchor embeddings. Distinguishes the three streams
+        # that share the same intra-block position ids.
+        self.is_concat_segment = (config.anchor_injection_mode == "concat_segment")
+        if self.is_concat_segment:
+            self.segment_embed = nn.Embedding(3, config.resolved_talk_hidden_size)
+        else:
+            self.segment_embed = None
+
         # ---- Freeze / unfreeze ------------------------------------------------
         self._apply_train_flags()
 
@@ -380,6 +425,10 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
             p.requires_grad = self.config.train_talk
         for p in self.lm_head.parameters():
             p.requires_grad = self.config.train_lm_head
+        if self.segment_embed is not None:
+            # Segment embed is part of the talk pathway; gate it on train_talk.
+            for p in self.segment_embed.parameters():
+                p.requires_grad = self.config.train_talk
 
     @torch.no_grad()
     def init_talk_layers_depth_scaled(self) -> None:
@@ -446,9 +495,14 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        # T3-D ADDED: extra masks/positions for the concat_segment 3L talk pathway.
+        # Training script builds these once at startup and passes via micro_batch.
+        attention_mask_3L: Optional[torch.Tensor] = None,
+        position_ids_3L: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         # 1. Think -- run full LLaDA-2.0-mini, surface all hidden states for the fuser.
+        #    Think always processes the 2L sequence; the 2L attention_mask is right.
         think_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -461,23 +515,39 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
             output_router_logits=False,
             return_dict=True,
         )
-        # 2. Anchor fuser (last_only by default).
+        # 2. Anchor fuser (last_only by default). Shape [B, 2L, D].
         anchor = self.anchor_fuser(think_out.hidden_states)
 
-        # 3. Talk model. Shares word embeddings with think (no separate embed table).
-        if inputs_embeds is None:
-            talk_embeds = self.model.word_embeddings(input_ids)
+        # 3. Talk model -- branch on injection mode.
+        if self.is_concat_segment:
+            # 3a. Build the 3L talk input: [embed(noisy), anchor_for_noisy, embed(clean)]
+            #     with segment embedding added.
+            assert attention_mask_3L is not None and position_ids_3L is not None, (
+                "concat_segment mode requires attention_mask_3L and position_ids_3L kwargs"
+            )
+            talk_input = self._assemble_talk_input_3L(input_ids, anchor)
+            talk_hidden = self.talk_model(
+                inputs_embeds=talk_input,
+                anchor=None,  # info is in the sequence tokens themselves
+                attention_mask=attention_mask_3L,
+                position_ids=position_ids_3L,
+            )
         else:
-            talk_embeds = inputs_embeds
+            # 3b. Gated-residual mode: anchor mixed into talk's residual stream per layer.
+            if inputs_embeds is None:
+                talk_embeds = self.model.word_embeddings(input_ids)
+            else:
+                talk_embeds = inputs_embeds
+            talk_hidden = self.talk_model(
+                inputs_embeds=talk_embeds,
+                anchor=anchor,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
 
-        talk_hidden = self.talk_model(
-            inputs_embeds=talk_embeds,
-            anchor=anchor,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
-
-        # 4. LM head
+        # 4. LM head over whatever sequence length talk produced.
+        #    In concat_segment mode talk_hidden is [B, 3L, D]; logits[:, :L] is still the
+        #    noisy slice the training script wants.
         logits = self.lm_head(talk_hidden)
 
         return CausalLMOutputWithPast(
@@ -489,6 +559,40 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
 
     # -------------------------------------------------------------------- helpers
 
+    def _assemble_talk_input_3L(
+        self,
+        input_ids: torch.LongTensor,
+        anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build talk's 3L input from the 2L input_ids and 2L anchor.
+
+        Layout: [embed(noisy), anchor_for_noisy, embed(clean)] + segment_embed.
+        Returns: [B, 3L, D]
+        """
+        assert self.segment_embed is not None, "segment_embed must be initialised"
+        assert input_ids is not None, "concat_segment mode requires input_ids"
+        B, two_L = input_ids.shape
+        assert two_L % 2 == 0, f"input_ids length {two_L} must be even (2L)"
+        L = two_L // 2
+
+        noisy_ids = input_ids[:, :L]
+        clean_ids = input_ids[:, L:]
+
+        embed_noisy = self.model.word_embeddings(noisy_ids)  # [B, L, D]
+        embed_clean = self.model.word_embeddings(clean_ids)  # [B, L, D]
+        anchor_for_noisy = anchor[:, :L, :]                   # [B, L, D]
+
+        talk_input = torch.cat([embed_noisy, anchor_for_noisy, embed_clean], dim=1)  # [B, 3L, D]
+
+        device = input_ids.device
+        segment_ids = torch.cat([
+            torch.zeros(L, dtype=torch.long, device=device),                # 0 = noisy
+            torch.ones(L, dtype=torch.long, device=device),                 # 1 = anchor
+            torch.full((L,), 2, dtype=torch.long, device=device),           # 2 = clean
+        ])
+        talk_input = talk_input + self.segment_embed(segment_ids)[None]     # [B, 3L, D]
+        return talk_input
+
     @torch.no_grad()
     def run_think_and_anchor(
         self,
@@ -496,8 +600,13 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.LongTensor,
     ) -> torch.Tensor:
-        """Forward through think + anchor fuser only. Used by the talk-only OPUT rollout
-        (brief sec 8.3) and by efficient inference (think once per block)."""
+        """Forward through think + anchor fuser only. Always operates on the 2L sequence
+        regardless of injection mode. Used by the talk-only OPUT rollout (brief sec 8.3)
+        and by efficient inference (think once per block).
+
+        Returns: anchor of shape [B, 2L, D]. In concat_segment mode the caller will slice
+        anchor[:, :L] inside the talk pathway.
+        """
         think_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -515,15 +624,34 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         anchor: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.LongTensor,
+        attention_mask_3L: Optional[torch.Tensor] = None,
+        position_ids_3L: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        """Forward through talk + LM head only, with a pre-computed anchor. Returns logits."""
-        talk_embeds = self.model.word_embeddings(input_ids)
-        talk_hidden = self.talk_model(
-            inputs_embeds=talk_embeds,
-            anchor=anchor,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
+        """Forward through talk + LM head only, with a pre-computed anchor. Returns logits.
+
+        In gated_residual mode: uses attention_mask + position_ids (2L).
+        In concat_segment mode: uses attention_mask_3L + position_ids_3L (3L). The 3L
+        mask/positions are constructed once at training-script startup and passed here.
+        """
+        if self.is_concat_segment:
+            assert attention_mask_3L is not None and position_ids_3L is not None, (
+                "concat_segment mode requires attention_mask_3L and position_ids_3L"
+            )
+            talk_input = self._assemble_talk_input_3L(input_ids, anchor)
+            talk_hidden = self.talk_model(
+                inputs_embeds=talk_input,
+                anchor=None,
+                attention_mask=attention_mask_3L,
+                position_ids=position_ids_3L,
+            )
+        else:
+            talk_embeds = self.model.word_embeddings(input_ids)
+            talk_hidden = self.talk_model(
+                inputs_embeds=talk_embeds,
+                anchor=anchor,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
         return self.lm_head(talk_hidden)
 
 

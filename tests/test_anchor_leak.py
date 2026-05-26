@@ -124,6 +124,135 @@ def test_noisy_can_see_prior_clean_blocks(seq_len, block_size):
         )
 
 
+def _block_diffusion_mask_3L_from_training_script():
+    """Imports the 3L mask function from the T3-D training script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.normpath(os.path.join(here, "..", "dFactory", "tasks", "train_t3_dmax_bd_oput.py"))
+    spec = importlib.util.spec_from_file_location("train_t3_dmax_bd_oput", script)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return module.block_diffusion_mask_3L
+    except (ImportError, ModuleNotFoundError):
+        # Fallback: reimplement inline. Keep in sync with the training script source.
+        def block_diffusion_mask_3L(q_idx, kv_idx, block_size, n):
+            x0_flag_q  = (q_idx  >= 2 * n)
+            x0_flag_kv = (kv_idx >= 2 * n)
+            eff_q  = torch.where(q_idx  < n, q_idx,  torch.where(q_idx  < 2*n, q_idx  - n, q_idx  - 2*n))
+            eff_kv = torch.where(kv_idx < n, kv_idx, torch.where(kv_idx < 2*n, kv_idx - n, kv_idx - 2*n))
+            block_q  = eff_q  // block_size
+            block_kv = eff_kv // block_size
+            block_diagonal      = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+            offset_block_causal = (block_q >  block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 0)
+            block_causal        = (block_q >= block_kv) & (x0_flag_kv == 1) & (x0_flag_q == 1)
+            return block_diagonal | offset_block_causal | block_causal
+        return block_diffusion_mask_3L
+
+
+# ----------------------------------------------------------------------------
+# Test 1b: 3L mask checks for concat_segment mode.
+# Layout: [noisy(0..n-1), anchor(n..2n-1), clean(2n..3n-1)].
+# ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_3L_noisy_cannot_see_own_or_future_clean_blocks(seq_len, block_size):
+    """In the 3L mask, noisy queries (region 1) must NOT attend to clean keys (region 3)
+    at the same or future block. They CAN attend to clean keys in prior blocks (M_OBC)."""
+    fn = _block_diffusion_mask_3L_from_training_script()
+    full_len = 3 * seq_len
+    mask = fn(
+        q_idx=torch.arange(full_len)[:, None],
+        kv_idx=torch.arange(full_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    # Noisy region: [0, n). Clean region: [2n, 3n). Anchor: [n, 2n).
+    noisy_q_idx = torch.arange(seq_len)[:, None]            # [seq_len, 1]
+    clean_kv_idx = torch.arange(2 * seq_len, 3 * seq_len)[None, :]  # [1, seq_len]
+    noisy_q_block = noisy_q_idx // block_size
+    clean_kv_block = (clean_kv_idx - 2 * seq_len) // block_size
+
+    forbidden = clean_kv_block >= noisy_q_block  # same-block or future
+    leak_quadrant = mask[:seq_len, 2 * seq_len:3 * seq_len]
+    bad_cells = leak_quadrant & forbidden
+    assert not bad_cells.any(), (
+        f"Anchor leak in 3L mask: noisy can see clean in own/future blocks at "
+        f"{bad_cells.nonzero().tolist()[:5]}"
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_3L_anchor_cannot_see_own_or_future_clean_blocks(seq_len, block_size):
+    """In the 3L mask, anchor queries (region 2) must NOT attend to clean keys (region 3)
+    at the same or future block. This is the new leak risk introduced by the 3L layout."""
+    fn = _block_diffusion_mask_3L_from_training_script()
+    full_len = 3 * seq_len
+    mask = fn(
+        q_idx=torch.arange(full_len)[:, None],
+        kv_idx=torch.arange(full_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    # Anchor query offset = (idx - n); clean key offset = (idx - 2n). Block from offset.
+    anchor_q_offset = (torch.arange(seq_len, 2 * seq_len) - seq_len)[:, None]
+    clean_kv_offset = (torch.arange(2 * seq_len, 3 * seq_len) - 2 * seq_len)[None, :]
+    anchor_q_block = anchor_q_offset // block_size
+    clean_kv_block = clean_kv_offset // block_size
+    forbidden = clean_kv_block >= anchor_q_block
+    leak_quadrant = mask[seq_len:2 * seq_len, 2 * seq_len:3 * seq_len]
+    bad_cells = leak_quadrant & forbidden
+    assert not bad_cells.any(), (
+        f"Anchor leak in 3L mask: anchor query can see clean in own/future blocks at "
+        f"{bad_cells.nonzero().tolist()[:5]}"
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_3L_clean_cannot_see_noisy_or_anchor(seq_len, block_size):
+    """In the 3L mask, clean queries (region 3) must NOT attend to noisy/anchor keys
+    (regions 1, 2). Clean is the strict context-only stream."""
+    fn = _block_diffusion_mask_3L_from_training_script()
+    full_len = 3 * seq_len
+    mask = fn(
+        q_idx=torch.arange(full_len)[:, None],
+        kv_idx=torch.arange(full_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    clean_to_noisy = mask[2 * seq_len:3 * seq_len, :seq_len]
+    clean_to_anchor = mask[2 * seq_len:3 * seq_len, seq_len:2 * seq_len]
+    assert not clean_to_noisy.any(), "Clean queries can attend to noisy keys (should be blocked)"
+    assert not clean_to_anchor.any(), "Clean queries can attend to anchor keys (should be blocked)"
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_3L_noisy_and_anchor_are_attentionally_symmetric(seq_len, block_size):
+    """Anchor stream should behave identically to noisy stream for attention purposes:
+    (1,2) = (1,1) = M_BD, (2,1) = (1,1), (2,2) = (1,1), (2,3) = (1,3) = M_OBC."""
+    fn = _block_diffusion_mask_3L_from_training_script()
+    full_len = 3 * seq_len
+    mask = fn(
+        q_idx=torch.arange(full_len)[:, None],
+        kv_idx=torch.arange(full_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    noisy_noisy = mask[:seq_len, :seq_len]
+    anchor_noisy = mask[seq_len:2 * seq_len, :seq_len]
+    noisy_anchor = mask[:seq_len, seq_len:2 * seq_len]
+    anchor_anchor = mask[seq_len:2 * seq_len, seq_len:2 * seq_len]
+
+    # All four quadrants should equal M_BD (block-diagonal within the shared intra-block space).
+    assert torch.equal(noisy_noisy, anchor_noisy), "anchor q -> noisy k should equal noisy -> noisy"
+    assert torch.equal(noisy_noisy, noisy_anchor), "noisy q -> anchor k should equal noisy -> noisy"
+    assert torch.equal(noisy_noisy, anchor_anchor), "anchor q -> anchor k should equal noisy -> noisy"
+
+    # Both noisy and anchor queries should see clean prior blocks the same way (M_OBC).
+    noisy_clean = mask[:seq_len, 2 * seq_len:3 * seq_len]
+    anchor_clean = mask[seq_len:2 * seq_len, 2 * seq_len:3 * seq_len]
+    assert torch.equal(noisy_clean, anchor_clean), "anchor q -> clean k should equal noisy -> clean"
+
+
 def test_noisy_self_attention_is_block_diagonal():
     """Sanity: within the noisy half, attention is block-diagonal (each noisy position
     can attend to other noisy positions in the same block, and nothing outside)."""

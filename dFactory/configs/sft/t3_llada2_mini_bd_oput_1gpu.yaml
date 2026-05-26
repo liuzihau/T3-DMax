@@ -1,27 +1,29 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# T3-D, single-GPU variant -- restart after D's 13.5k-step plateau.
+# T3-D, single-GPU variant -- v4 (tata-style concat_segment anchor injection).
 #
-# The previous D run stalled at loss ~11.0 from step ~7k onward, never recovering
-# even after the LR finished warming up at step ~10.5k. Root causes diagnosed:
-#   (1) lr_warmup_ratio: 0.03 with train_steps ~ 350k gives 10.5k warmup steps.
-#       At low LR for that long, the model settles into a stuck minimum.
-#   (2) Talk transformer used uniform std=0.02 init on every Linear, which makes
-#       the residual stream variance grow with depth and blocks from-scratch
-#       transformer training. Think-Then-Talk hit the same wall in their original
-#       project; they fixed it with GPT-NeoX-style depth-scaled init.
-#   (3) The learnable anchor gate may have settled at a poor sigmoid(alpha) value
-#       during the long warmup, with no way to escape afterwards.
+# v2 (anchor at layer 0 only via gated residual) and v3 (gated residual at every
+# layer) both plateaued at loss ~8 with depth-scaled init + short warmup. Diagnosis:
+# residual mixing destructively combines anchor with talk's evolving hidden state.
+# Once mixed, talk cannot recover the pure anchor information.
 #
-# Changes this run vs prior D:
-#   - lr_warmup_ratio: 0.03 -> 0.005 (~1750 warmup steps; reaches peak LR in ~30 min)
-#   - model_config has anchor_gate_learnable=false, anchor_gate_value=0.2 -- gate is
-#     a fixed scalar 0.2 (not learnable, not sigmoid). Removes the gate as a variable.
-#   - Training script now calls model.init_talk_layers_depth_scaled() after VeOmni's
-#     weight load -- talk attention.dense and mlp.down_proj get
-#     std = initializer_range / sqrt(2 * (layer_idx + 1)).
-#   - Wandb logs t3/gate, t3/alpha_*, per-group grad norms (when split).
+# v4 change: anchor enters the sequence as SEPARATE tokens, not via residual.
+# Talk processes [noisy(L), anchor(L), clean(L)] = 3L tokens. A 3-class segment
+# embedding distinguishes the streams; they share intra-block position ids.
+# Talk's self-attention dynamically routes between streams. Anchor never gets
+# residual-mixed.
+#
+# The 3L attention mask treats anchor as a duplicate of noisy: same-block
+# attention within streams, prior-clean-blocks accessible to both noisy and
+# anchor, no path from clean to noisy/anchor. Brief sec ~A8 ablation variant.
+#
+# Everything else identical to v2:
+#   - lr_warmup_ratio: 0.005 (~1750 warmup steps)
+#   - fixed gate 0.2 at each injection point
+#   - depth-scaled talk init
+#   - think + LM head trainable, lr=1e-4
+#   - bf16, DDP, single H200
 #
 # What's different from the 2gpu yaml:
 #   - data_parallel_mode: ddp (FSDP needs world_size>1 to shard)
@@ -39,7 +41,7 @@
 # Copyright 2026 National University of Singapore).
 
 model:
-  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think
+  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think_concat_segment
   model_path: ../LLaDA2.0-mini-moe-merge
   tokenizer_path: ../LLaDA2.0-mini-moe-merge
   attn_implementation: sdpa
@@ -73,7 +75,7 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./outputs/t3d_1gpu_v2_shortwarmup_fixedgate_dsinit_lr1e4
+  output_dir: ./outputs/t3d_1gpu_v4_concat_segment_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -135,5 +137,5 @@ train:
   # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
   use_wandb: true
   wandb_project: T3-DMax
-  wandb_name: t3d_1gpu_v2_shortwarmup_fixedgate_dsinit_lr1e4
+  wandb_name: t3d_1gpu_v4_concat_segment_lr1e4
   log_steps: 1

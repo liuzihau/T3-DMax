@@ -50,6 +50,21 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         anchor_layers: str = "last",           # "last" | comma-separated indices for non-last_only types
         # === Conditioning mechanism (brief sec 6.4) ===
         anchor_conditioning: str = "gated_residual",  # gated_residual | cross_attention | prefix_token
+        anchor_injection_mode: str = "gated_residual",  # gated_residual | concat_segment
+                                                #   "gated_residual": anchor added per-position into
+                                                #     talk's residual stream via sigmoid(alpha) or
+                                                #     fixed_gate. Talk sequence stays 2L.
+                                                #   "concat_segment" (tata-style): anchor is inserted
+                                                #     as a SEPARATE stream of L tokens in talk's
+                                                #     sequence, distinguished by a segment embedding.
+                                                #     Talk sequence becomes 3L = [noisy, anchor, clean].
+                                                #     Talk's attention dynamically routes to anchor/
+                                                #     noisy/clean tokens. No gated_residual modules
+                                                #     are instantiated in this mode.
+        anchor_inject_layers: str = "first",   # only consulted when anchor_injection_mode=gated_residual
+                                                # "first" -> anchor injected only at talk layer 0
+                                                # "all"   -> every talk layer gets its own
+                                                #            GatedResidualConditioning module
         anchor_gate_learnable: bool = True,    # True: gate=sigmoid(alpha), alpha is nn.Parameter
                                                 #   initialised from anchor_gate_init below
                                                 # False: gate is fixed at anchor_gate_value, no
@@ -76,6 +91,8 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         self.anchor_fuser_type = str(anchor_fuser_type)
         self.anchor_layers = str(anchor_layers)
         self.anchor_conditioning = str(anchor_conditioning)
+        self.anchor_injection_mode = str(anchor_injection_mode)
+        self.anchor_inject_layers = str(anchor_inject_layers)
         self.anchor_gate_learnable = bool(anchor_gate_learnable)
         self.anchor_gate_init = float(anchor_gate_init)
         self.anchor_gate_value = float(anchor_gate_value)
@@ -166,6 +183,12 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
 
         if self.anchor_conditioning not in ("gated_residual", "cross_attention", "prefix_token"):
             raise ValueError(f"unknown anchor_conditioning: {self.anchor_conditioning}")
+
+        if self.anchor_inject_layers not in ("first", "all"):
+            raise ValueError(f"unknown anchor_inject_layers: {self.anchor_inject_layers}")
+
+        if self.anchor_injection_mode not in ("gated_residual", "concat_segment"):
+            raise ValueError(f"unknown anchor_injection_mode: {self.anchor_injection_mode}")
 
         # In milestone 1 we require talk to match think hidden size (no projector).
         if self.talk_hidden_size != -1 and self.talk_hidden_size != self.hidden_size:
