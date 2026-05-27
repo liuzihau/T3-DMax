@@ -258,6 +258,12 @@ def main():
 
         loss_sum = 0.0
         position_count = 0
+        # T3-D ADDED: split CE into mask-region (input was [MASK]) and clean-region
+        # (input was the original token). The clean-region CE is the passthrough check.
+        loss_mask_region_sum = 0.0
+        mask_region_count = 0
+        loss_clean_region_sum = 0.0
+        clean_region_count = 0
         skipped = 0
         t0 = time.time()
         for k, idx in enumerate(val_indices):
@@ -273,6 +279,7 @@ def main():
 
             full_ids = torch.cat([noisy_input_ids, clean_input_ids], dim=0).unsqueeze(0).to(device)
             labels_dev = labels.unsqueeze(0).to(device)
+            noisy_ids_dev = noisy_input_ids.unsqueeze(0).to(device)
 
             kwargs = {
                 "input_ids": full_ids,
@@ -291,44 +298,77 @@ def main():
             logits = out.logits
             noisy_logits = logits[:, :L].contiguous()
 
-            loss = F.cross_entropy(
+            # Per-position CE (0 at ignore_index positions). reduction='none' returns
+            # one value per position; we then split + sum by region.
+            per_pos_loss = F.cross_entropy(
                 noisy_logits.view(-1, noisy_logits.shape[-1]),
                 labels_dev.view(-1),
-                reduction="sum",
+                reduction="none",
                 ignore_index=-100,
-            )
-            valid = int((labels_dev != -100).sum().item())
-            loss_sum += float(loss.item())
-            position_count += valid
+            )  # [L]
+
+            valid_pos = (labels_dev != -100).view(-1)                # [L]
+            noisy_ids_flat = noisy_ids_dev.view(-1)                   # [L]
+            mask_region = (noisy_ids_flat == args.mask_token_id) & valid_pos
+            clean_region = (noisy_ids_flat != args.mask_token_id) & valid_pos
+
+            # Aggregate
+            loss_sum += float(per_pos_loss.sum().item())
+            position_count += int(valid_pos.sum().item())
+            loss_mask_region_sum += float(per_pos_loss[mask_region].sum().item())
+            mask_region_count += int(mask_region.sum().item())
+            loss_clean_region_sum += float(per_pos_loss[clean_region].sum().item())
+            clean_region_count += int(clean_region.sum().item())
 
             if (k + 1) % 50 == 0:
                 elapsed = time.time() - t0
                 rate = (k + 1) / max(elapsed, 1e-6)
                 eta = (len(val_indices) - (k + 1)) / max(rate, 1e-6)
+                running_overall = loss_sum / max(position_count, 1)
+                running_mask = loss_mask_region_sum / max(mask_region_count, 1)
+                running_clean = loss_clean_region_sum / max(clean_region_count, 1)
                 print(f"  sigma={sigma:.2f}  [{k+1}/{len(val_indices)}]  "
-                      f"running_CE={loss_sum / max(position_count, 1):.4f}  "
+                      f"CE all={running_overall:.4f} mask={running_mask:.4f} "
+                      f"clean={running_clean:.4f}  "
                       f"{rate:.1f} ex/s  ETA {eta:.0f}s")
 
         mean_ce = loss_sum / max(position_count, 1)
+        mean_ce_mask = loss_mask_region_sum / max(mask_region_count, 1)
+        mean_ce_clean = loss_clean_region_sum / max(clean_region_count, 1)
         results[sigma] = {
             "mean_ce": mean_ce,
+            "mean_ce_mask_region": mean_ce_mask,
+            "mean_ce_clean_region": mean_ce_clean,
             "n_samples": len(val_indices) - skipped,
             "n_positions": position_count,
+            "n_mask_positions": mask_region_count,
+            "n_clean_positions": clean_region_count,
             "skipped": skipped,
         }
-        print(f"[eval_ce_val] sigma={sigma:.2f}  mean_CE={mean_ce:.4f}  "
-              f"(over {position_count} positions, {len(val_indices)-skipped} samples, "
-              f"{skipped} skipped)")
+        print(f"[eval_ce_val] sigma={sigma:.2f}  "
+              f"CE all={mean_ce:.4f}  mask={mean_ce_mask:.4f}  clean={mean_ce_clean:.4f}  "
+              f"(positions: all={position_count} mask={mask_region_count} "
+              f"clean={clean_region_count}; samples={len(val_indices)-skipped}, "
+              f"skipped={skipped})")
 
     # ---- Report -----------------------------------------------------------------
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 84)
     print(f"Model: {args.model_path}  (type={args.model_type})")
     print(f"Val: tail {args.val_tail} of shuffle seed={args.seed} from {args.val_path}")
-    print("=" * 60)
-    print(f"{'sigma':>8}  {'mean_CE':>10}  {'n_samples':>10}  {'n_positions':>12}")
+    print("=" * 84)
+    print(f"{'sigma':>8}  {'overall':>10}  {'mask_only':>10}  {'clean_only':>10}  "
+          f"{'n_mask':>8}  {'n_clean':>8}  {'n_pos':>8}")
     for sigma in sigmas:
         r = results[sigma]
-        print(f"{sigma:>8.2f}  {r['mean_ce']:>10.4f}  {r['n_samples']:>10d}  {r['n_positions']:>12d}")
+        print(
+            f"{sigma:>8.2f}  "
+            f"{r['mean_ce']:>10.4f}  "
+            f"{r['mean_ce_mask_region']:>10.4f}  "
+            f"{r['mean_ce_clean_region']:>10.4f}  "
+            f"{r['n_mask_positions']:>8d}  "
+            f"{r['n_clean_positions']:>8d}  "
+            f"{r['n_positions']:>8d}"
+        )
 
     if args.output_json:
         payload = {
