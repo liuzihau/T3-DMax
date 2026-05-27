@@ -20,6 +20,7 @@
 # Every modification vs. the original DMax file is annotated with a `# T3-D ...:` comment.
 
 import json
+import multiprocessing as mp
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -221,6 +222,40 @@ def block_diffusion_mask_3L(q_idx, kv_idx, block_size, n):
     return block_diagonal | offset_block_causal | block_causal
 
 
+# T3-D ADDED: masks for the hybrid_xattn talk pathway.
+#
+# In hybrid_xattn mode, talk's sequence is just the L noisy tokens (no clean, no anchor
+# inline). Two attention patterns:
+#
+# 1. Talk self-attn  (over L noisy):
+#       noisy[i] in block b can self-attend to noisy[j] iff j is in the same block.
+#       This is the M_BD (block-diagonal) restriction from the 2L mask, applied to L.
+#
+# 2. Talk cross-attn (Q from noisy[L], KV from anchor[:, :2L, :]):
+#       KV columns 0..L-1 are anchor at noisy positions: always visible (already obey the
+#           block-diff constraints from think's own forward).
+#       KV columns L..2L-1 are anchor at clean positions: M_OBC restriction --
+#           noisy_q in block b can see anchor_clean in block c iff c < b (strict, prior).
+#
+# Both functions return bool tensors (True = allowed). Caller converts to additive masks.
+def talk_self_attn_mask_L(q_idx, kv_idx, block_size):
+    block_q  = q_idx  // block_size
+    block_kv = kv_idx // block_size
+    return block_q == block_kv
+
+
+def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
+    """q_idx: L noisy positions. kv_idx: 2L anchor positions [noisy_half(0..n-1), clean_half(n..2n-1)]."""
+    kv_is_clean = (kv_idx >= n)
+    kv_eff_pos = torch.where(kv_is_clean, kv_idx - n, kv_idx)
+    q_block  = q_idx // block_size
+    kv_block = kv_eff_pos // block_size
+
+    noisy_kv_always_ok = ~kv_is_clean
+    clean_kv_prior_block = kv_is_clean & (q_block > kv_block)
+    return noisy_kv_always_ok | clean_kv_prior_block
+
+
 # T3-D ADDED: per-step diagnostic metrics. Reads scalars off the model + optimiser to
 # diagnose training pathologies (gate stuck, hidden states exploding, one param group
 # drifting much faster than another). All ops are .item() on scalars or .norm() on
@@ -290,6 +325,19 @@ def main():
     # -------- Data (unchanged from DMax) --------------------------------------
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
+
+    # T3-D ADDED: shared progress value for the step-based mask ramp. Workers read this
+    # value (read-only, lock-free) to compute their per-sample sigma. The main process
+    # updates `noise_progress.value` each training step. When the noise_range is a single
+    # point (low == high), the ramp is a no-op and progress is not used.
+    use_noise_ramp = args.data.noise_range_low != args.data.noise_range_high
+    noise_progress = mp.Value("d", 0.0) if use_noise_ramp else None
+    if use_noise_ramp:
+        logger.info_rank0(
+            f"[T3-D noise ramp] sigma linearly ramps from {args.data.noise_range_low} to "
+            f"{args.data.noise_range_high} over the full training schedule."
+        )
+
     if args.data.data_type == "conversation":
         if not tokenizer.chat_template:
             raise ValueError("No chat template found in the tokenizer.")
@@ -300,6 +348,7 @@ def main():
             text_keys=args.data.text_keys,
             noise_range=(args.data.noise_range_low, args.data.noise_range_high),
             mask_token_id=args.train.mask_token_id,  # T3-D MODIFIED: configurable.
+            progress_state=noise_progress,  # T3-D ADDED: step-based ramp (None disables it).
         )
     elif args.data.data_type == "tokenid":
         transform = partial(
@@ -520,7 +569,11 @@ def main():
         # Built once at startup, reused per micro-batch. None-valued when model is in
         # gated_residual mode (cheap memory savings, also signals to .forward() that
         # the concat_segment path is not in use).
-        use_concat_segment = getattr(model_config, "anchor_injection_mode", "gated_residual") == "concat_segment"
+        injection_mode = getattr(model_config, "anchor_injection_mode", "gated_residual")
+        use_concat_segment = injection_mode == "concat_segment"
+        use_hybrid_xattn = injection_mode == "hybrid_xattn"
+        mask_dtype = torch.float32 if args.train.enable_mixed_precision else torch.bfloat16
+
         if use_concat_segment:
             bd_attn_full_len_3L = args.data.max_seq_len * 3
             block_diffusion_attn_mask_flag_3L = block_diffusion_mask_3L(
@@ -531,7 +584,7 @@ def main():
             ).unsqueeze(0).unsqueeze(0)
             block_diffusion_attn_mask_prototype_3L = torch.zeros_like(
                 block_diffusion_attn_mask_flag_3L,
-                dtype=torch.float32 if args.train.enable_mixed_precision else torch.bfloat16,
+                dtype=mask_dtype,
             )
             block_diffusion_attn_mask_prototype_3L.masked_fill_(
                 block_diffusion_attn_mask_flag_3L.logical_not(), float("-inf"),
@@ -542,6 +595,36 @@ def main():
             )
         else:
             block_diffusion_attn_mask_prototype_3L = None
+
+        # T3-D ADDED: L self-attn mask + L-by-2L cross-attn mask for the hybrid_xattn pathway.
+        if use_hybrid_xattn:
+            L_full = args.data.max_seq_len
+            # Talk self-attn (L x L): block-diagonal among noisy positions only.
+            self_attn_flag_L = talk_self_attn_mask_L(
+                q_idx=torch.arange(L_full)[:, None],
+                kv_idx=torch.arange(L_full)[None, :],
+                block_size=block_size,
+            ).unsqueeze(0).unsqueeze(0)
+            talk_self_attn_mask_prototype_L = torch.zeros_like(self_attn_flag_L, dtype=mask_dtype)
+            talk_self_attn_mask_prototype_L.masked_fill_(self_attn_flag_L.logical_not(), float("-inf"))
+
+            # Talk cross-attn (L x 2L): noisy Q -> anchor[noisy half all, clean half block-causal].
+            cross_attn_flag = talk_cross_attn_mask(
+                q_idx=torch.arange(L_full)[:, None],
+                kv_idx=torch.arange(2 * L_full)[None, :],
+                block_size=block_size,
+                n=L_full,
+            ).unsqueeze(0).unsqueeze(0)
+            talk_cross_attn_mask_prototype = torch.zeros_like(cross_attn_flag, dtype=mask_dtype)
+            talk_cross_attn_mask_prototype.masked_fill_(cross_attn_flag.logical_not(), float("-inf"))
+
+            logger.info_rank0(
+                f"[T3-D hybrid_xattn] built talk self-attn mask ({L_full}x{L_full}) and "
+                f"cross-attn mask ({L_full}x{2 * L_full})."
+            )
+        else:
+            talk_self_attn_mask_prototype_L = None
+            talk_cross_attn_mask_prototype = None
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -576,6 +659,12 @@ def main():
         data_iterator = iter(train_dataloader)
         for _ in range(start_step, args.train.train_steps):
             global_step += 1
+
+            # T3-D ADDED: advance the shared noise-progress value for the step-based mask
+            # ramp. Workers read this lock-free; some staleness due to prefetch is fine.
+            if noise_progress is not None:
+                total_steps = max(args.train.train_steps * args.train.num_train_epochs, 1)
+                noise_progress.value = min(global_step / total_steps, 1.0)
 
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -620,6 +709,26 @@ def main():
                         # segment_embed inside the model distinguishes them.
                         micro_batch["position_ids_3L"] = torch.cat(
                             [noisy_position_ids, noisy_position_ids, clean_position_ids], dim=0,
+                        ).unsqueeze(0).expand(batch_size, -1).clone()
+
+                    # T3-D ADDED: attach L self-attn mask + L-by-2L cross-attn mask for
+                    # the hybrid_xattn pathway. In that mode talk processes only L noisy
+                    # tokens; cross-attn carries the anchor (full 2L) as K/V.
+                    if talk_self_attn_mask_prototype_L is not None:
+                        micro_batch["attention_mask_L"] = (
+                            talk_self_attn_mask_prototype_L.expand(batch_size, -1, -1, -1)
+                        )
+                        micro_batch["position_ids_L"] = (
+                            noisy_position_ids.unsqueeze(0).expand(batch_size, -1).clone()
+                        )
+                        micro_batch["cross_attention_mask"] = (
+                            talk_cross_attn_mask_prototype.expand(batch_size, -1, -1, -1)
+                        )
+                        # KV positions for cross-attn: noisy half [0..L-1] then clean half
+                        # [0..L-1] (DMax parallel-position convention -- same as the 2L
+                        # position_ids used by think on the doubled sequence).
+                        micro_batch["cross_position_ids"] = torch.cat(
+                            [noisy_position_ids, clean_position_ids], dim=0,
                         ).unsqueeze(0).expand(batch_size, -1).clone()
                 else:
                     micro_batch["attention_mask"] = None
@@ -669,10 +778,14 @@ def main():
                             anchor=anchor_cached,
                             attention_mask=micro_batch["attention_mask"],
                             position_ids=micro_batch["position_ids"],
-                            # T3-D ADDED: 3L tensors are present in concat_segment mode,
-                            # None in gated_residual mode. run_talk picks the right path.
+                            # T3-D ADDED: per-mode extra tensors. run_talk picks the right path
+                            # by inspecting self.is_concat_segment / self.is_hybrid_xattn.
                             attention_mask_3L=micro_batch.get("attention_mask_3L"),
                             position_ids_3L=micro_batch.get("position_ids_3L"),
+                            attention_mask_L=micro_batch.get("attention_mask_L"),
+                            position_ids_L=micro_batch.get("position_ids_L"),
+                            cross_attention_mask=micro_batch.get("cross_attention_mask"),
+                            cross_position_ids=micro_batch.get("cross_position_ids"),
                         )
                         rollout_tokens = rollout_logits.argmax(dim=-1)
                         active_mask = (micro_batch["input_ids"][:, :noisy_len] == args.train.mask_token_id)
@@ -701,6 +814,10 @@ def main():
                             position_ids=micro_batch["position_ids"],
                             attention_mask_3L=micro_batch.get("attention_mask_3L"),
                             position_ids_3L=micro_batch.get("position_ids_3L"),
+                            attention_mask_L=micro_batch.get("attention_mask_L"),
+                            position_ids_L=micro_batch.get("position_ids_L"),
+                            cross_attention_mask=micro_batch.get("cross_attention_mask"),
+                            cross_position_ids=micro_batch.get("cross_position_ids"),
                         )
                     else:
                         logits = model(
@@ -772,6 +889,14 @@ def main():
                 t3_metrics = _t3d_diagnostic_metrics(model, optimizer)
                 if t3_metrics:
                     train_metrics.update(t3_metrics)
+                if noise_progress is not None:
+                    progress = float(noise_progress.value)
+                    sigma = (
+                        args.data.noise_range_low
+                        + (args.data.noise_range_high - args.data.noise_range_low) * progress
+                    )
+                    train_metrics["t3/noise_ramp_progress"] = progress
+                    train_metrics["t3/noise_ramp_sigma"] = sigma
                 wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

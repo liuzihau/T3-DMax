@@ -50,7 +50,7 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         anchor_layers: str = "last",           # "last" | comma-separated indices for non-last_only types
         # === Conditioning mechanism (brief sec 6.4) ===
         anchor_conditioning: str = "gated_residual",  # gated_residual | cross_attention | prefix_token
-        anchor_injection_mode: str = "gated_residual",  # gated_residual | concat_segment
+        anchor_injection_mode: str = "gated_residual",  # gated_residual | concat_segment | hybrid_xattn
                                                 #   "gated_residual": anchor added per-position into
                                                 #     talk's residual stream via sigmoid(alpha) or
                                                 #     fixed_gate. Talk sequence stays 2L.
@@ -61,6 +61,12 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
                                                 #     Talk's attention dynamically routes to anchor/
                                                 #     noisy/clean tokens. No gated_residual modules
                                                 #     are instantiated in this mode.
+                                                #   "hybrid_xattn": layer-0 gated residual (v2-style)
+                                                #     PLUS per-layer cross-attention where talk's
+                                                #     noisy Q queries the full think anchor [B, 2L, D]
+                                                #     as K/V. Talk sequence is L (noisy only); the
+                                                #     clean half reaches talk only through cross-attn
+                                                #     with a block-causal mask on the clean-half K/V.
         anchor_inject_layers: str = "first",   # only consulted when anchor_injection_mode=gated_residual
                                                 # "first" -> anchor injected only at talk layer 0
                                                 # "all"   -> every talk layer gets its own
@@ -187,7 +193,7 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         if self.anchor_inject_layers not in ("first", "all"):
             raise ValueError(f"unknown anchor_inject_layers: {self.anchor_inject_layers}")
 
-        if self.anchor_injection_mode not in ("gated_residual", "concat_segment"):
+        if self.anchor_injection_mode not in ("gated_residual", "concat_segment", "hybrid_xattn"):
             raise ValueError(f"unknown anchor_injection_mode: {self.anchor_injection_mode}")
 
         # In milestone 1 we require talk to match think hidden size (no projector).

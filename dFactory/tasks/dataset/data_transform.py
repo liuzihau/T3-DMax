@@ -11,6 +11,10 @@ def process_mdm_sft_example(
     noise_range: Tuple[float, float] = (0.3, 0.8),
     mask_token_id: int = 156895,
     source_name: Optional[str] = None,
+    # T3-D ADDED: optional step-based mask ramp. When set, sigma ramps linearly from
+    # noise_range[0] (at progress=0) to noise_range[1] (at progress=1). Without it,
+    # sigma is uniform-sampled in [noise_range[0], noise_range[1]] per sample (DMax default).
+    progress_state: Optional[Any] = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     if isinstance(text_keys, str):
         messages = example[text_keys]
@@ -33,10 +37,11 @@ def process_mdm_sft_example(
     maskable_mask = torch.arange(max_seq_len) >= prompt_length
     
     noisy_input_ids = sft_noise_transition(
-        input_ids.clone(), 
-        noise_range=noise_range, 
-        maskable_mask=maskable_mask, 
-        mask_token_id=mask_token_id
+        input_ids.clone(),
+        noise_range=noise_range,
+        maskable_mask=maskable_mask,
+        mask_token_id=mask_token_id,
+        progress_state=progress_state,
     )
 
     loss_mask = noisy_input_ids == mask_token_id
@@ -127,22 +132,41 @@ def process_mdm_tokenized_example(
 
 
 
-def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id):
+def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id, progress_state=None):
     """
     Performs a noise transition by masking tokens.
 
     Args:
         x_0 (torch.Tensor): The input sequence (batch_size, seq_len).
-        noise_range (tuple): A tuple (min, max) for the noise range, from which the masking ratio sigma is sampled.
-        maskable_mask (torch.Tensor): A boolean mask indicating which positions are allowed to be masked (batch_size, seq_len).
+        noise_range (tuple): A tuple (min, max) for the noise range, from which the masking
+            ratio sigma is sampled (per-sample uniform) OR used as the ramp endpoints
+            (when progress_state is provided).
+        maskable_mask (torch.Tensor): A boolean mask indicating which positions are allowed
+            to be masked (batch_size, seq_len).
         mask_token_id (int): The ID of the mask token.
+        progress_state (Optional[multiprocessing.Value or float]): If provided, the masking
+            ratio is computed deterministically as
+                sigma = noise_range[0] + (noise_range[1] - noise_range[0]) * progress
+            where `progress` is read from progress_state (`.value` if Value, else float).
+            The training script writes the current step/total_steps fraction here so each
+            worker sees a smoothly-ramped sigma. Without it, behaviour is unchanged
+            (per-sample uniform sampling).
 
     Returns:
         torch.Tensor: The sequence after masking.
     """
-
-    t_tensor = torch.rand(1) * (noise_range[1] - noise_range[0]) + noise_range[0]
-    sigma = t_tensor.item()
+    if progress_state is not None:
+        # Lock-free read; mp.Value.value is a single double, atomic enough for our smooth
+        # ramp. Workers may see a slightly stale value (prefetch latency), which is fine.
+        if hasattr(progress_state, "value"):
+            progress = float(progress_state.value)
+        else:
+            progress = float(progress_state)
+        progress = max(0.0, min(1.0, progress))
+        sigma = noise_range[0] + (noise_range[1] - noise_range[0]) * progress
+    else:
+        t_tensor = torch.rand(1) * (noise_range[1] - noise_range[0]) + noise_range[0]
+        sigma = t_tensor.item()
     # move_chance = 1 - (-sigma).exp()
     move_chance = sigma
     move_indices = (torch.rand(*x_0.shape) < move_chance) & maskable_mask

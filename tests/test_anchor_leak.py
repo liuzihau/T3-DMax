@@ -275,6 +275,120 @@ def test_noisy_self_attention_is_block_diagonal():
 
 
 # ----------------------------------------------------------------------------
+# Test 1c: hybrid_xattn mask checks.
+# Talk's self-attn is L x L (noisy positions only); talk's cross-attn is L x 2L
+# (Q from noisy; KV from anchor at [noisy_positions, clean_positions]).
+# ----------------------------------------------------------------------------
+
+def _hybrid_xattn_masks_from_training_script():
+    """Imports the hybrid_xattn mask functions from the T3-D training script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.normpath(os.path.join(here, "..", "dFactory", "tasks", "train_t3_dmax_bd_oput.py"))
+    spec = importlib.util.spec_from_file_location("train_t3_dmax_bd_oput", script)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return module.talk_self_attn_mask_L, module.talk_cross_attn_mask
+    except (ImportError, ModuleNotFoundError):
+        # Fallback: reimplement inline. Keep in sync with the training script source.
+        def talk_self_attn_mask_L(q_idx, kv_idx, block_size):
+            return (q_idx // block_size) == (kv_idx // block_size)
+
+        def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
+            kv_is_clean = (kv_idx >= n)
+            kv_eff_pos = torch.where(kv_is_clean, kv_idx - n, kv_idx)
+            q_block = q_idx // block_size
+            kv_block = kv_eff_pos // block_size
+            noisy_kv_always_ok = ~kv_is_clean
+            clean_kv_prior_block = kv_is_clean & (q_block > kv_block)
+            return noisy_kv_always_ok | clean_kv_prior_block
+
+        return talk_self_attn_mask_L, talk_cross_attn_mask
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32), (256, 32)])
+def test_xattn_talk_self_attn_is_block_diagonal(seq_len, block_size):
+    """In hybrid_xattn mode, talk's L self-attn over noisy positions must be block-diagonal."""
+    self_fn, _ = _hybrid_xattn_masks_from_training_script()
+    mask = self_fn(
+        q_idx=torch.arange(seq_len)[:, None],
+        kv_idx=torch.arange(seq_len)[None, :],
+        block_size=block_size,
+    )
+    q_block = torch.arange(seq_len)[:, None] // block_size
+    kv_block = torch.arange(seq_len)[None, :] // block_size
+    expected = (q_block == kv_block)
+    assert torch.equal(mask, expected), (
+        f"Hybrid_xattn talk self-attn mask is not block-diagonal (seq_len={seq_len}, "
+        f"block_size={block_size})."
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32), (256, 32)])
+def test_xattn_cross_can_see_all_of_anchor_noisy_half(seq_len, block_size):
+    """In hybrid_xattn cross-attn, noisy[i] must see anchor's noisy-half[j] for any (i, j).
+    Reason: anchor at noisy positions was produced by think under the same block-diff
+    constraints that prevent leakage; it carries no clean-future info."""
+    _, cross_fn = _hybrid_xattn_masks_from_training_script()
+    mask = cross_fn(
+        q_idx=torch.arange(seq_len)[:, None],
+        kv_idx=torch.arange(2 * seq_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    noisy_half = mask[:, :seq_len]
+    assert noisy_half.all(), (
+        f"Hybrid_xattn cross-attn blocks some anchor noisy-half cells "
+        f"(seq_len={seq_len}, block_size={block_size}). All should be visible."
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32), (256, 32)])
+def test_xattn_cross_cannot_see_own_or_future_anchor_clean_blocks(seq_len, block_size):
+    """In hybrid_xattn cross-attn, noisy[b] must NOT see anchor's clean-half[c >= b].
+    Same anchor leak risk as 2L M_OBC, applied to the cross-attn K/V's right half."""
+    _, cross_fn = _hybrid_xattn_masks_from_training_script()
+    mask = cross_fn(
+        q_idx=torch.arange(seq_len)[:, None],
+        kv_idx=torch.arange(2 * seq_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    clean_half = mask[:, seq_len:]  # [L, L]
+    q_block = (torch.arange(seq_len) // block_size)[:, None]
+    kv_clean_block = (torch.arange(seq_len) // block_size)[None, :]
+    forbidden = kv_clean_block >= q_block
+    bad_cells = clean_half & forbidden
+    assert not bad_cells.any(), (
+        f"Anchor leak in hybrid_xattn cross-attn: noisy[b] can see anchor_clean in own/"
+        f"future blocks at {bad_cells.nonzero().tolist()[:5]} "
+        f"(seq_len={seq_len}, block_size={block_size})."
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_xattn_cross_can_see_prior_anchor_clean_blocks(seq_len, block_size):
+    """Positive sanity for hybrid_xattn: noisy[b] CAN see anchor_clean[c < b]
+    (those are already-decoded prior context; not visible would block all anchor info)."""
+    _, cross_fn = _hybrid_xattn_masks_from_training_script()
+    mask = cross_fn(
+        q_idx=torch.arange(seq_len)[:, None],
+        kv_idx=torch.arange(2 * seq_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    clean_half = mask[:, seq_len:]  # [L, L]
+    # For any q in block b>=1, kv at position 0 (block 0) should be visible.
+    if seq_len >= 2 * block_size:
+        for q_pos in range(block_size, seq_len):
+            assert clean_half[q_pos, 0], (
+                f"Hybrid_xattn cross-attn blocks anchor_clean[0] (block 0) from "
+                f"noisy q={q_pos} (block {q_pos // block_size}). Should be visible "
+                f"(prior block)."
+            )
+
+
+# ----------------------------------------------------------------------------
 # Test 2: end-to-end model invariance. Requires the model + LLaDA2 deps to be importable.
 # This is the strongest check -- it actually runs the think backbone and verifies hidden
 # states on the noisy half are unchanged when the clean half is perturbed.

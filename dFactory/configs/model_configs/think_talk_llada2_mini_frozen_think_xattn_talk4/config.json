@@ -8,7 +8,7 @@
     },
     "model_type": "think_talk_llada2_veomni",
 
-    "_doc": "v5: anchor + clean both come from think's last-layer hidden state (no re-embed for clean). Talk processes [embed(noisy), think_hidden_noisy, think_hidden_clean] = 3L tokens with a 2-class segment embedding (0=token, 1=hidden). v4 used 3-class with embed(clean); v5 unifies the two context streams since they're both think-derived.",
+    "_doc": "v6: hybrid_xattn anchor injection + 4-layer talk. Talk sequence is L (noisy only). Layer 0 receives anchor via gated residual (v2-style, fixed gate 0.2); EVERY talk layer also runs a cross-attention block from its noisy Q stream to the full think anchor [B, 2L, H] as K/V. The clean half reaches talk only through cross-attn with a block-causal mask. Pairs with t3_llada2_mini_bd_oput_1gpu.yaml's noise_range=(0.25, 0.75) step-based ramp.",
 
     "num_hidden_layers": 20,
     "hidden_size": 2048,
@@ -55,7 +55,7 @@
     "use_sliding_window": false,
     "attention_dropout": 0.0,
 
-    "talk_num_layers": 2,
+    "talk_num_layers": 4,
     "talk_hidden_size": -1,
     "talk_num_attention_heads": -1,
     "talk_num_key_value_heads": -1,
@@ -64,7 +64,7 @@
     "anchor_fuser_type": "last_only",
     "anchor_layers": "last",
     "anchor_conditioning": "gated_residual",
-    "anchor_injection_mode": "concat_segment",
+    "anchor_injection_mode": "hybrid_xattn",
     "anchor_inject_layers": "first",
     "anchor_gate_learnable": false,
     "anchor_gate_init": -2.0,
