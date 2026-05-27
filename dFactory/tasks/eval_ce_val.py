@@ -90,21 +90,56 @@ def parse_args():
 
 
 def load_model(args):
-    """Load the model based on --model_type."""
+    """Load the model based on --model_type.
+
+    DMax's modeling code dispatches between fused-MoE (stacked expert tensors) and
+    eager-MoE (per-expert Linears) on `config.model_type.endswith("_veomni")`. The
+    `LLaDA2.0-mini-moe-merge` checkpoint stores fused tensors but its on-disk
+    config.json says `model_type: llada2_moe` (no suffix), which would route to
+    eager and leave every expert weight unloaded. Force the fused dispatch by
+    overriding model_type before instantiation.
+    """
     print(f"[eval_ce_val] Loading {args.model_type} from {args.model_path} ...")
+
     if args.model_type == "llada":
+        from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
         from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM
+
+        config = LLaDA2MoeConfig.from_pretrained(args.model_path)
+        if not config.model_type.endswith("_veomni"):
+            print(
+                f"[eval_ce_val] Overriding config.model_type "
+                f"{config.model_type!r} -> {config.model_type + '_veomni'!r} "
+                f"to force fused-MoE dispatch (checkpoint is in fused format)."
+            )
+            config.model_type = config.model_type + "_veomni"
+        # Also surface moe_implementation in case the modeling reads it directly.
+        if getattr(config, "moe_implementation", None) != "fused":
+            config.moe_implementation = "fused"
         model = LLaDA2MoeModelLM.from_pretrained(
             args.model_path,
+            config=config,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
     elif args.model_type == "t3d":
+        from models.think_talk_llada2.configuration_think_talk_llada2 import (
+            ThinkTalkLLaDA2Config,
+        )
         from models.think_talk_llada2.modeling_think_talk_llada2 import (
             ThinkTalkLLaDA2ForCausalLM,
         )
+
+        config = ThinkTalkLLaDA2Config.from_pretrained(args.model_path)
+        # Our T3-D config.json already has model_type=think_talk_llada2_veomni, but
+        # be defensive.
+        if not config.model_type.endswith("_veomni"):
+            config.model_type = config.model_type + "_veomni"
+        if getattr(config, "moe_implementation", None) != "fused":
+            config.moe_implementation = "fused"
         model = ThinkTalkLLaDA2ForCausalLM.from_pretrained(
             args.model_path,
+            config=config,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
