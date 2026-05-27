@@ -8,7 +8,7 @@
     },
     "model_type": "think_talk_llada2_veomni",
 
-    "_doc": "v6: hybrid_xattn anchor injection + 4-layer talk. Talk sequence is L (noisy only). Layer 0 receives anchor via gated residual (v2-style, fixed gate 0.2); EVERY talk layer also runs a cross-attention block from its noisy Q stream to the full think anchor [B, 2L, H] as K/V. The clean half reaches talk only through cross-attn with a block-causal mask. Pairs with t3_llada2_mini_bd_oput_1gpu.yaml's noise_range=(0.25, 0.75) step-based ramp.",
+    "_doc": "v6c: hybrid_xattn anchor injection + 4-layer talk + FROZEN lm_head. Talk sequence is L (noisy only). Layer 0 receives anchor via gated residual (v2-style, fixed gate 0.2); EVERY talk layer also runs a cross-attention block from its noisy Q stream to the full think anchor [B, 2L, H] as K/V. The clean half reaches talk only through cross-attn with a block-causal mask. v6c freezes lm_head at LLaDA's tied word_embeddings to prevent the lm_head-drift failure mode observed in v6b (cosine sim to LLaDA dropped to 0.01 by step 15000, talk hidden states never learned to be LLaDA-compatible). Pairs with t3_llada2_mini_bd_oput_1gpu.yaml's noise_range=(0.25, 1.0) ramp and rollout_ratio_low/high ramp.",
 
     "num_hidden_layers": 20,
     "hidden_size": 2048,
@@ -73,5 +73,5 @@
     "prune_think_last_n_layer": 0,
     "train_think": false,
     "train_talk": true,
-    "train_lm_head": true
+    "train_lm_head": false
 }
