@@ -144,6 +144,25 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
                           "1.0 = single-group optimizer (no split). 0.02-0.05 = differential "
                           "LR (Strategy C) keeping LM head near its DMax fine-tune LR."},
     )
+    # T3-D ADDED: rollout-flag ratio ramp. When low != high, each micro_batch's flag is
+    # resampled as Bernoulli(threshold) where threshold ramps linearly across training.
+    # Default 0.5/0.5 preserves the dataset's 50/50 flag distribution untouched.
+    #
+    # Setting low=0.25, high=0.75 trains mostly on the easier mask path early (75% of
+    # batches), then shifts to the harder rollout path late (75% of batches). This is a
+    # curriculum: early gradients come from the standard masked distribution that LLaDA
+    # was originally trained on; late gradients come from the OPUT distribution that
+    # inference will use. Complements the noise-range ramp.
+    t3_rollout_ratio_low: float = field(
+        default=0.5,
+        metadata={"help": "Probability that a micro_batch follows the rollout path at "
+                          "training start. Each step: flag := (rand() < threshold)."},
+    )
+    t3_rollout_ratio_high: float = field(
+        default=0.5,
+        metadata={"help": "Probability that a micro_batch follows the rollout path at "
+                          "training end. Linearly ramped from t3_rollout_ratio_low."},
+    )
 
 
 @dataclass
@@ -645,6 +664,19 @@ def main():
             f"train_iterations={args.train.t3_train_iterations}"
         )
 
+    # T3-D ADDED: rollout-flag ratio ramp. When low != high, each micro_batch's flag is
+    # resampled to Bernoulli(threshold) with threshold ramping linearly across training.
+    # When low == high, the dataset's flag value is used unchanged (DMax-default behaviour).
+    use_rollout_ramp = (
+        args.train.t3_rollout_ratio_low != args.train.t3_rollout_ratio_high
+    )
+    if use_rollout_ramp:
+        logger.info_rank0(
+            f"[T3-D rollout ramp] flag-True probability linearly ramps from "
+            f"{args.train.t3_rollout_ratio_low} to {args.train.t3_rollout_ratio_high} "
+            f"over the full training schedule."
+        )
+
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -662,9 +694,23 @@ def main():
 
             # T3-D ADDED: advance the shared noise-progress value for the step-based mask
             # ramp. Workers read this lock-free; some staleness due to prefetch is fine.
+            total_steps = max(args.train.train_steps * args.train.num_train_epochs, 1)
+            step_progress = min(global_step / total_steps, 1.0)
             if noise_progress is not None:
-                total_steps = max(args.train.train_steps * args.train.num_train_epochs, 1)
-                noise_progress.value = min(global_step / total_steps, 1.0)
+                noise_progress.value = step_progress
+
+            # T3-D ADDED: compute this step's rollout-flag threshold (used to override the
+            # dataset's per-micro_batch flag value when the ramp is active).
+            if use_rollout_ramp:
+                rollout_threshold = (
+                    args.train.t3_rollout_ratio_low
+                    + (
+                        args.train.t3_rollout_ratio_high
+                        - args.train.t3_rollout_ratio_low
+                    ) * step_progress
+                )
+            else:
+                rollout_threshold = None
 
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -676,6 +722,16 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
+            # T3-D ADDED: split loss logging by OPUT flag.
+            #   flag=False -> "mask path"   : input is the standard masked sequence.
+            #   flag=True  -> "rollout path": input has talk's argmax in place of [MASK]s.
+            # The rollout path is structurally harder (talk's argmax is mostly wrong early),
+            # so loss_rollout_path > loss_mask_path is expected at start. As talk improves
+            # the gap should shrink -- a useful signal independent of the noise ramp.
+            loss_mask_path_sum = 0.0
+            loss_mask_path_n = 0
+            loss_rollout_path_sum = 0.0
+            loss_rollout_path_n = 0
             synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
@@ -740,6 +796,13 @@ def main():
 
                 labels = micro_batch.pop("labels", None)
                 flag = micro_batch.pop("flag", None)  # T3-D MODIFIED: pop flag here (was kept in dict in DMax).
+                # T3-D ADDED: cache the per-micro-batch flag for the split-loss bookkeeping below.
+                # When the rollout-ratio ramp is active, override the dataset's flag with a
+                # fresh Bernoulli draw at this step's ramped threshold.
+                if rollout_threshold is not None:
+                    flag_bool = torch.rand(1).item() < rollout_threshold
+                else:
+                    flag_bool = bool(flag.item()) if flag is not None else False
                 noisy_len = noisy_input_ids.shape[1] if args.train.block_diffusion_mode else micro_batch["input_ids"].shape[1]
 
                 # =====================================================================
@@ -763,7 +826,8 @@ def main():
                 # =====================================================================
 
                 anchor_cached = None
-                if args.train.t3_rollout_mode == "dmax_oput" and flag is not None and bool(flag.item()) is True:
+                # T3-D MODIFIED: gate the rollout on the (possibly ramp-overridden) flag_bool.
+                if args.train.t3_rollout_mode == "dmax_oput" and flag_bool is True:
                     model.eval()
                     with torch.no_grad():
                         # 1. Think forward on the masked input -> anchor.
@@ -850,7 +914,19 @@ def main():
                 with model_bwd_context:
                     loss.backward()
 
-                total_loss += loss.item()
+                loss_item = loss.item()
+                total_loss += loss_item
+                # T3-D ADDED: per-flag bookkeeping. `loss` is pre-scaled by 1/len(micro_batches)
+                # for gradient accumulation. Multiply back so each per-flag entry is on the
+                # same scale as a single micro_batch loss (matches the units of training/loss
+                # when there's exactly one micro_batch in the step).
+                unscaled_micro_loss = loss_item * len(micro_batches)
+                if flag_bool:
+                    loss_rollout_path_sum += unscaled_micro_loss
+                    loss_rollout_path_n += 1
+                else:
+                    loss_mask_path_sum += unscaled_micro_loss
+                    loss_mask_path_n += 1
                 del micro_batch
 
             # ---- Optimiser step (unchanged from DMax) ----------------------------
@@ -897,6 +973,25 @@ def main():
                     )
                     train_metrics["t3/noise_ramp_progress"] = progress
                     train_metrics["t3/noise_ramp_sigma"] = sigma
+                # T3-D ADDED: per-flag loss split (mask path vs rollout path).
+                # Only logged when this step actually contained micro_batches of that flag
+                # (each global step typically contains both, since flag is randomised
+                # per-sample, but we guard against the all-one-flag edge case).
+                if loss_mask_path_n > 0:
+                    train_metrics["training/loss_mask_path"] = (
+                        loss_mask_path_sum / loss_mask_path_n
+                    )
+                if loss_rollout_path_n > 0:
+                    train_metrics["training/loss_rollout_path"] = (
+                        loss_rollout_path_sum / loss_rollout_path_n
+                    )
+                total_micro_n = loss_mask_path_n + loss_rollout_path_n
+                if total_micro_n > 0:
+                    train_metrics["t3/rollout_flag_rate"] = (
+                        loss_rollout_path_n / total_micro_n
+                    )
+                if rollout_threshold is not None:
+                    train_metrics["t3/rollout_ratio_target"] = rollout_threshold
                 wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

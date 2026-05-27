@@ -29,6 +29,10 @@
 #   3. Step-based mask ratio ramp: sigma in [0.25, 0.75], linearly ramped over total
 #      training steps. Train sees easier (lightly-masked) cases early, hardens to
 #      heavy masking near the end.
+#   4. Step-based rollout-flag ratio ramp: P(flag=True) ramps 0.25 -> 0.75 in lockstep
+#      with (3). Early training is mostly mask-path (DMax's original L_mask distribution
+#      which LLaDA was trained on); late training is mostly rollout-path (matches what
+#      inference will do). The two ramps form a coordinated curriculum.
 #
 # Expected outcomes:
 #   - Loss < 6 by ~step 30k: capacity + ramped noise + hybrid injection unlocked it.
@@ -69,11 +73,11 @@ data:
   max_seq_len: 2048
   text_keys: messages
   noise_range_low: 0.25
-  noise_range_high: 0.75
+  noise_range_high: 1.00
   num_workers: 16
 
 train:
-  output_dir: ./outputs/t3d_1gpu_v6_xattn_talk4_ramp25-75_lr1e4
+  output_dir: ./outputs/t3d_1gpu_v6b_xattn_talk4_noiseramp_rolloutramp_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -131,9 +135,16 @@ train:
   t3_rollout_replace: all_masked
   t3_train_iterations: 1
   mask_token_id: 156895
+  # T3-D ADDED: rollout-flag ratio ramp. Each micro_batch's flag is resampled as
+  # Bernoulli(threshold) with threshold ramping 0.25 -> 0.75 over training. Pairs with the
+  # noise-range ramp (0.25 -> 0.75) so both task difficulty and OPUT distribution share
+  # the same curriculum: start easy (low sigma, mostly mask path), end hard (high sigma,
+  # mostly rollout path matching inference).
+  t3_rollout_ratio_low: 0.25
+  t3_rollout_ratio_high: 1.00
 
   # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
   use_wandb: true
   wandb_project: T3-DMax
-  wandb_name: t3d_1gpu_v6_xattn_talk4_ramp25-75_lr1e4
+  wandb_name: t3d_1gpu_v6b_xattn_talk4_noiseramp_rolloutramp_lr1e4
   log_steps: 1
