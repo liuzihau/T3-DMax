@@ -1288,6 +1288,10 @@ def main():
                         train_metrics[f"training/loss_iter_{i}"] = (
                             loss_per_iter_sum[i] / loss_per_iter_n[i]
                         )
+                # Log per-step training metrics. (This line was previously displaced into
+                # the val block by an earlier edit, which meant train metrics only made it
+                # to wandb on val steps -- fixed back to every step.)
+                wandb.log(train_metrics, step=global_step)
 
             # T3-D ADDED: inline validation. Runs every t3_val_every steps on the
             # deterministic tail-N held-out subset, computing CE at fixed sigmas.
@@ -1310,7 +1314,6 @@ def main():
                 logger.info_rank0(f"[T3-D val] step {global_step}: {_val_metrics}")
                 if args.train.use_wandb and args.train.global_rank == 0:
                     wandb.log(_val_metrics, step=global_step)
-                wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
