@@ -299,9 +299,11 @@ def _hybrid_xattn_masks_from_training_script():
             kv_eff_pos = torch.where(kv_is_clean, kv_idx - n, kv_idx)
             q_block = q_idx // block_size
             kv_block = kv_eff_pos // block_size
-            noisy_kv_always_ok = ~kv_is_clean
-            clean_kv_prior_block = kv_is_clean & (q_block > kv_block)
-            return noisy_kv_always_ok | clean_kv_prior_block
+            # anchor_noisy at block c: visible iff c <= b (NOT all-visible; the old
+            # "all-visible" version leaked clean[b] via think's M_OBC at c > b).
+            noisy_kv_ok = (~kv_is_clean) & (kv_block <= q_block)
+            clean_kv_ok = kv_is_clean & (kv_block < q_block)
+            return noisy_kv_ok | clean_kv_ok
 
         return talk_self_attn_mask_L, talk_cross_attn_mask
 
@@ -325,10 +327,11 @@ def test_xattn_talk_self_attn_is_block_diagonal(seq_len, block_size):
 
 
 @pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32), (256, 32)])
-def test_xattn_cross_can_see_all_of_anchor_noisy_half(seq_len, block_size):
-    """In hybrid_xattn cross-attn, noisy[i] must see anchor's noisy-half[j] for any (i, j).
-    Reason: anchor at noisy positions was produced by think under the same block-diff
-    constraints that prevent leakage; it carries no clean-future info."""
+def test_xattn_cross_anchor_noisy_half_obeys_block_obc(seq_len, block_size):
+    """Hybrid_xattn cross-attn: noisy_q at block b can attend to anchor_noisy at block
+    c iff c <= b. The naive "all of anchor_noisy is visible" was wrong: anchor_noisy[c]
+    for c > b was produced by think reading clean[< c] (M_OBC), which includes clean[b]
+    -- exactly the label talk's noisy_q at block b is supposed to predict. Forbid it."""
     _, cross_fn = _hybrid_xattn_masks_from_training_script()
     mask = cross_fn(
         q_idx=torch.arange(seq_len)[:, None],
@@ -336,10 +339,37 @@ def test_xattn_cross_can_see_all_of_anchor_noisy_half(seq_len, block_size):
         block_size=block_size,
         n=seq_len,
     )
-    noisy_half = mask[:, :seq_len]
-    assert noisy_half.all(), (
-        f"Hybrid_xattn cross-attn blocks some anchor noisy-half cells "
-        f"(seq_len={seq_len}, block_size={block_size}). All should be visible."
+    noisy_half = mask[:, :seq_len]                                       # [L, L]
+    q_block  = (torch.arange(seq_len) // block_size)[:, None]            # [L, 1]
+    kv_block = (torch.arange(seq_len) // block_size)[None, :]            # [1, L]
+    expected = (kv_block <= q_block)                                     # same-block OK
+    assert torch.equal(noisy_half, expected), (
+        f"Hybrid_xattn cross-attn anchor_noisy half is not c<=b restricted "
+        f"(seq_len={seq_len}, block_size={block_size}). First disagreement at "
+        f"{(noisy_half != expected).nonzero().tolist()[:5]}."
+    )
+
+
+@pytest.mark.parametrize("seq_len,block_size", [(32, 8), (64, 16), (128, 32)])
+def test_xattn_cross_cannot_see_anchor_noisy_in_future_blocks(seq_len, block_size):
+    """Explicit leak check: for noisy_q at block b, anchor_noisy at block c > b MUST
+    be forbidden, since anchor_noisy[c>b] encodes clean[b] via think's M_OBC."""
+    _, cross_fn = _hybrid_xattn_masks_from_training_script()
+    mask = cross_fn(
+        q_idx=torch.arange(seq_len)[:, None],
+        kv_idx=torch.arange(2 * seq_len)[None, :],
+        block_size=block_size,
+        n=seq_len,
+    )
+    noisy_half = mask[:, :seq_len]                                       # [L, L]
+    q_block  = (torch.arange(seq_len) // block_size)[:, None]
+    kv_block = (torch.arange(seq_len) // block_size)[None, :]
+    forbidden = (kv_block > q_block)
+    leaks = noisy_half & forbidden
+    assert not leaks.any(), (
+        f"LEAK: noisy_q at block b can attend to anchor_noisy at block c>b at "
+        f"{leaks.nonzero().tolist()[:5]} (seq_len={seq_len}, block_size={block_size}). "
+        f"This is the path through which clean[b] flows into the prediction at block b."
     )
 
 

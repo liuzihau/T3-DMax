@@ -278,10 +278,21 @@ def block_diffusion_mask_3L(q_idx, kv_idx, block_size, n):
 #       This is the M_BD (block-diagonal) restriction from the 2L mask, applied to L.
 #
 # 2. Talk cross-attn (Q from noisy[L], KV from anchor[:, :2L, :]):
-#       KV columns 0..L-1 are anchor at noisy positions: always visible (already obey the
-#           block-diff constraints from think's own forward).
-#       KV columns L..2L-1 are anchor at clean positions: M_OBC restriction --
-#           noisy_q in block b can see anchor_clean in block c iff c < b (strict, prior).
+#       The naive thought was "anchor_noisy at any block is safe, anchor_clean only at
+#       prior blocks." But this leaks: anchor_noisy[block c] is think's hidden state at
+#       block c's noisy positions, and think's attention there sees clean[blocks < c]
+#       (M_OBC). So for c > b, anchor_noisy[block c] ENCODES clean[block b] -- exactly
+#       the label talk's noisy_q at block b is trying to predict. The (frozen) lm_head
+#       can then decode that signal directly back to the right token, and training-time
+#       CE collapses to ~0 in a couple thousand steps with no real learning.
+#
+#       Correct restriction:
+#         anchor_noisy[block c]: visible to noisy_q at block b iff c <= b.
+#                                (anchor_noisy[c=b] only saw clean[< b] via think's M_OBC,
+#                                 so does not include clean[b]. Safe. c > b leaks.)
+#         anchor_clean[block c]: visible iff c < b.
+#                                (anchor_clean[c=b] saw clean[<= b] via think's M_BC,
+#                                 which DOES include clean[b]. Must exclude.)
 #
 # Both functions return bool tensors (True = allowed). Caller converts to additive masks.
 def talk_self_attn_mask_L(q_idx, kv_idx, block_size):
@@ -297,9 +308,11 @@ def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
     q_block  = q_idx // block_size
     kv_block = kv_eff_pos // block_size
 
-    noisy_kv_always_ok = ~kv_is_clean
-    clean_kv_prior_block = kv_is_clean & (q_block > kv_block)
-    return noisy_kv_always_ok | clean_kv_prior_block
+    # anchor_noisy[c]: safe iff c <= b. (Same-block OK; c > b leaks via think's M_OBC.)
+    noisy_kv_ok = (~kv_is_clean) & (kv_block <= q_block)
+    # anchor_clean[c]: safe iff c < b. (Strict prior, think's M_BC at clean[c] saw clean[<=c].)
+    clean_kv_ok = kv_is_clean & (kv_block < q_block)
+    return noisy_kv_ok | clean_kv_ok
 
 
 # T3-D ADDED: between-iteration reveal helpers (A4 multi-iter training).
