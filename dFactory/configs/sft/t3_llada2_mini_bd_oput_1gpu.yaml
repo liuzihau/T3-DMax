@@ -1,28 +1,31 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# T3-D, single-GPU variant -- v6c (hybrid anchor injection + FROZEN lm_head).
+# T3-D, single-GPU variant -- v6d (hybrid xattn + FROZEN lm_head + ZERO-INIT DELTA HEAD).
 #
 # Background:
-#   v2 (gated residual at layer 0, talk=2L, fixed gate 0.2) plateaued at loss ~8.2.
-#   v4/v5 (concat_segment, talk=3L) plateaued at ~9 -- worse.
-#   v6 (hybrid_xattn, 4 talk layers, ramped noise + rollout). At step 15000 the
-#      training loss was ~4.5, BUT a weight diagnostic revealed:
-#        * Cross-attn output projections still at depth-scaled init (ratios 1.02-1.21x).
-#        * lm_head drifted to cosine-similarity 0.01 with LLaDA's tied word_embeddings.
-#      Conclusion: trainable lm_head absorbed the gradient by drifting orthogonal to
-#      LLaDA's vocab mapping, learning a flat-output prior. Talk never had to learn
-#      to use the anchor because lm_head was already absorbing the loss.
+#   v2 plateaued at loss ~8.2; v4/v5 worse; v6b had lm_head drift catastrophe (cosine
+#   0.01 to LLaDA at step 15000, talk never learned to use anchor).
+#   v6c froze lm_head to fix that, but then loss couldn't move at all -- with random-
+#   init talk hidden states going through a frozen lm_head, the output was uniform
+#   logits regardless of input, so there was no gradient signal pointing talk anywhere.
 #
-# v6c design:
-#   Same hybrid_xattn architecture as v6, but lm_head is now FROZEN at LLaDA's tied
-#   word_embeddings. To minimise loss, talk's hidden states MUST decode (via LLaDA's
-#   unchanged lm_head) to the correct tokens, which requires them to live in LLaDA's
-#   embedding subspace -- which in turn forces talk to extract information from the
-#   anchor (think's hidden states, which are already in that subspace). The cross-attn
-#   pathway becomes the most efficient route; gradient flow should activate it.
+# v6d design (tata-style):
+#   Adds a ZERO-INIT DELTA HEAD on top of v6c. After talk's transformer + final norm,
+#   talk_hidden is wrapped through a Linear whose weight AND bias are zero-initialised:
+#       delta_h      = delta_head(talk_hidden)          # = 0 EXACTLY at step 0
+#       final_hidden = anchor[:, :L] + delta_h           # = anchor EXACTLY at step 0
+#       logits       = lm_head(final_hidden)             # = LLaDA's logits at step 0
+#   Since lm_head is frozen at LLaDA's tied word_embeddings, the step-0 output is
+#   logit-equivalent to LLaDA exactly. Training learns the delta to improve over
+#   LLaDA's strong baseline. Cannot do worse than LLaDA on any input it has seen.
 #
-# Architecture summary (unchanged from v6):
+#   Borrowed from peft_project/tata/delta_model/models/heads.py (the DeltaHead class).
+#   The simple-skip variant we initially planned (talk_hidden + anchor without the
+#   zero-init projection) would start at ~LLaDA + noise rather than exactly LLaDA;
+#   that noise on the logits perturbs softmax outputs at step 0 enough to matter.
+#
+# Architecture summary:
 #   1. Talk depth: 4 layers.
 #   2. Hybrid anchor injection (anchor_injection_mode="hybrid_xattn"):
 #        - Talk sequence is L (noisy positions only).
@@ -30,14 +33,15 @@
 #        - Every talk layer: cross-attn (Q from talk, KV from full 2L anchor).
 #   3. Step-based mask-ratio ramp: sigma in [0.25, 1.00], linear over training.
 #   4. Step-based rollout-flag ratio ramp: P(flag=True) in [0.25, 1.00], linear.
-#   5. NEW IN v6c: train_lm_head=false (frozen at LLaDA tied weights).
+#   5. train_lm_head=false (frozen at LLaDA tied weights).
+#   6. NEW IN v6d: add_anchor_skip_residual=true (late skip from anchor to lm_head input).
 #
-# Expected curve (different from v6):
-#   - First ~5k steps: loss may be HIGHER than v6 (no lm_head shortcut available).
-#     Could start at ~10-11.
-#   - ~10-20k: cross-attn weights start moving (ratio > 2x init in diagnostic).
-#   - ~50k+: if architecture is sound, loss drops below v6's plateau.
-#   - End of training: eval mask_CE should approach LLaDA's per-sigma values.
+# Expected curve (very different from v6c):
+#   - Step 0: loss should be CLOSE TO LLaDA's CE at training sigma -- so ~3-5, not 12.
+#     If it's still 11-12 at step 0, the skip didn't fire correctly (check config.json).
+#   - First ~5k steps: loss should descend quickly as talk learns to nudge the
+#     anchor signal in useful directions.
+#   - ~50k+: loss should be well below v6's eventual plateau if the architecture works.
 #
 # Everything else identical to v6:
 #   - lr 1e-4, lr_warmup_ratio 0.005, depth-scaled talk init, bf16 DDP single H200.
@@ -77,7 +81,7 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./outputs/t3d_1gpu_v6c_xattn_talk4_FROZEN_lmhead_lr1e4
+  output_dir: ./outputs/t3d_1gpu_v6d_xattn_talk4_FROZEN_lmhead_anchorSKIP_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -146,5 +150,5 @@ train:
   # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
   use_wandb: true
   wandb_project: T3-DMax
-  wandb_name: t3d_1gpu_v6c_xattn_talk4_FROZEN_lmhead_lr1e4
+  wandb_name: t3d_1gpu_v6d_xattn_talk4_FROZEN_lmhead_anchorSKIP_lr1e4
   log_steps: 1

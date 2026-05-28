@@ -78,6 +78,28 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
                                                 #   training dynamics without the gate as a variable.
         anchor_gate_init: float = -2.0,         # sigmoid(-2.0) ≈ 0.12; only used when learnable
         anchor_gate_value: float = 0.2,         # fixed gate value; only used when NOT learnable
+        add_anchor_skip_residual: bool = False, # If True, AFTER the talk transformer's
+                                                # final norm, add anchor[:, :L, :] to the
+                                                # hidden before lm_head (SIMPLE SKIP):
+                                                #   final_hidden = talk_hidden + anchor[:, :L]
+                                                # Step 0 has talk_hidden ≠ 0 (depth-scaled init
+                                                # noise), so output ≈ LLaDA + noise -- close
+                                                # but not exact. Prefer use_anchor_delta_head
+                                                # below for the tata-style exact version.
+        use_anchor_delta_head: bool = False,    # If True, wrap talk_hidden through a
+                                                # zero-init Linear projection before adding
+                                                # to anchor (tata-style):
+                                                #   delta_h = delta_head(talk_hidden)
+                                                #   final = anchor[:, :L] + delta_h
+                                                # With weight + bias zero-initialised, step 0
+                                                # gives delta_h = 0 EXACTLY, so final = anchor
+                                                # EXACTLY, and logits = lm_head(anchor) =
+                                                # LLaDA's logits bit-identically. Training
+                                                # learns the delta on top of LLaDA's strong
+                                                # baseline. Pattern from
+                                                # peft_project/tata/delta_model/models/heads.py.
+                                                # Supersedes add_anchor_skip_residual when both
+                                                # are True. Only meaningful in hybrid_xattn.
         # === Think-side ablations ===
         prune_think_last_n_layer: int = 0,     # >0 enables ablation A1.5 (warm-start talk)
         # === Training flags surfaced into config so checkpoints round-trip ===
@@ -102,6 +124,8 @@ class ThinkTalkLLaDA2Config(LLaDA2MoeConfig):
         self.anchor_gate_learnable = bool(anchor_gate_learnable)
         self.anchor_gate_init = float(anchor_gate_init)
         self.anchor_gate_value = float(anchor_gate_value)
+        self.add_anchor_skip_residual = bool(add_anchor_skip_residual)
+        self.use_anchor_delta_head = bool(use_anchor_delta_head)
 
         self.prune_think_last_n_layer = int(prune_think_last_n_layer)
         self.train_think = bool(train_think)

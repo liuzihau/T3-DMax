@@ -611,6 +611,23 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         # only); anchor flows in via gated residual at layer 0 AND per-layer cross-attn.
         self.is_hybrid_xattn = (config.anchor_injection_mode == "hybrid_xattn")
 
+        # T3-D ADDED: zero-init delta head (tata-style). When enabled, a Linear with
+        # both weight and bias zero-initialised wraps talk_hidden before the anchor skip:
+        #     delta_h = delta_head(talk_hidden)        # = 0 at step 0
+        #     final   = anchor[:, :L] + delta_h        # = anchor at step 0
+        #     logits  = lm_head(final)                  # = LLaDA's logits at step 0 (frozen lm_head)
+        # Training learns delta_head's weights to produce useful corrections on top
+        # of LLaDA's strong baseline. Pattern: tata/delta_model/models/heads.py.
+        if self.is_hybrid_xattn and getattr(config, "use_anchor_delta_head", False):
+            self.delta_head = nn.Linear(
+                config.resolved_talk_hidden_size,
+                config.resolved_talk_hidden_size,
+            )
+            nn.init.zeros_(self.delta_head.weight)
+            nn.init.zeros_(self.delta_head.bias)
+        else:
+            self.delta_head = None
+
         # ---- Freeze / unfreeze ------------------------------------------------
         self._apply_train_flags()
 
@@ -646,6 +663,10 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         if self.segment_embed is not None:
             # Segment embed is part of the talk pathway; gate it on train_talk.
             for p in self.segment_embed.parameters():
+                p.requires_grad = self.config.train_talk
+        if self.delta_head is not None:
+            # Zero-init delta head is part of the talk pathway; gate on train_talk.
+            for p in self.delta_head.parameters():
                 p.requires_grad = self.config.train_talk
 
     @torch.no_grad()
@@ -691,6 +712,14 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
                         )
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+
+        # T3-D ADDED: re-zero the delta_head after VeOmni's load_model_weights step,
+        # which initialises unmatched-key params with truncated_normal(std=init_std).
+        # Zero-init is load-bearing: it's what guarantees step-0 model output is
+        # logit-equivalent to LLaDA exactly.
+        if self.delta_head is not None:
+            nn.init.zeros_(self.delta_head.weight)
+            nn.init.zeros_(self.delta_head.bias)
 
     # -------------------------------------------------------------------- forward
 
@@ -783,6 +812,17 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
                 cross_attention_mask=cross_attention_mask,
                 cross_position_ids=cross_position_ids,
             )
+            # T3-D ADDED: residual learning from anchor (tata-style).
+            # Two modes (see configuration_think_talk_llada2.py for full docstring):
+            #   use_anchor_delta_head=True  -> wrap talk_hidden through zero-init Linear,
+            #                                  final = anchor + delta_head(talk_hidden);
+            #                                  at step 0, delta = 0 EXACTLY -> logits exactly LLaDA.
+            #   add_anchor_skip_residual=True -> simple skip, final = anchor + talk_hidden;
+            #                                    at step 0, output ≈ LLaDA + small noise.
+            if self.delta_head is not None:
+                talk_hidden = anchor_noisy + self.delta_head(talk_hidden)
+            elif getattr(self.config, "add_anchor_skip_residual", False):
+                talk_hidden = talk_hidden + anchor_noisy
         else:
             # 3b. Gated-residual mode: anchor mixed into talk's residual stream per layer.
             if inputs_embeds is None:
@@ -937,6 +977,11 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
                 cross_attention_mask=cross_attention_mask,
                 cross_position_ids=cross_position_ids,
             )
+            # T3-D ADDED: anchor delta or simple skip (see ForCausalLM.forward for full doc).
+            if self.delta_head is not None:
+                talk_hidden = anchor_noisy + self.delta_head(talk_hidden)
+            elif getattr(self.config, "add_anchor_skip_residual", False):
+                talk_hidden = talk_hidden + anchor_noisy
         else:
             talk_embeds = self.model.word_embeddings(input_ids)
             talk_hidden = self.talk_model(

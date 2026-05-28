@@ -8,7 +8,7 @@
     },
     "model_type": "think_talk_llada2_veomni",
 
-    "_doc": "v6c: hybrid_xattn anchor injection + 4-layer talk + FROZEN lm_head. Talk sequence is L (noisy only). Layer 0 receives anchor via gated residual (v2-style, fixed gate 0.2); EVERY talk layer also runs a cross-attention block from its noisy Q stream to the full think anchor [B, 2L, H] as K/V. The clean half reaches talk only through cross-attn with a block-causal mask. v6c freezes lm_head at LLaDA's tied word_embeddings to prevent the lm_head-drift failure mode observed in v6b (cosine sim to LLaDA dropped to 0.01 by step 15000, talk hidden states never learned to be LLaDA-compatible). Pairs with t3_llada2_mini_bd_oput_1gpu.yaml's noise_range=(0.25, 1.0) ramp and rollout_ratio_low/high ramp.",
+    "_doc": "v6d: hybrid_xattn + 4-layer talk + FROZEN lm_head + ZERO-INIT DELTA HEAD (tata-style). Talk sequence is L (noisy only). Layer 0 receives anchor via gated residual (v2-style, fixed gate 0.2); EVERY talk layer also runs a cross-attention block to the full think anchor [B, 2L, H]. AFTER talk's final norm, talk_hidden is wrapped through a zero-init Linear (weight=0, bias=0): delta_h = delta_head(talk_hidden); final_hidden = anchor[:, :L] + delta_h; logits = lm_head(final_hidden). At step 0, delta_h=0 EXACTLY -> final_hidden=anchor -> logits = lm_head(anchor) = LLaDA's logits bit-identically (lm_head is frozen at LLaDA's tied word_embeddings). Training learns the delta on top of LLaDA's strong baseline. Pattern from peft_project/tata/delta_model/models/heads.py.",
 
     "num_hidden_layers": 20,
     "hidden_size": 2048,
@@ -69,6 +69,8 @@
     "anchor_gate_learnable": false,
     "anchor_gate_init": -2.0,
     "anchor_gate_value": 0.2,
+    "add_anchor_skip_residual": false,
+    "use_anchor_delta_head": true,
 
     "prune_think_last_n_layer": 0,
     "train_think": false,
