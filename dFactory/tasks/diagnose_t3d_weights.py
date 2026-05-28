@@ -130,6 +130,47 @@ def main():
             print(f"  WARNING: neither {alpha_key!r} nor anchor_norm weight found. "
                   f"Layer-0 anchor injection module may not have been built.")
 
+    # ---- (3a) delta_head weight stats (zero-init learning signal check) ------
+    # delta_head is initialised to weight=0, bias=0 (tata-style). If it stays at zero
+    # across training, the talk pathway is contributing nothing to logits, so every
+    # iteration of the multi-iter loop produces identical output.
+    print("\n" + "=" * 78)
+    print("  (3a) delta_head weight stats (must move from zero for talk to do work)")
+    print("=" * 78)
+    if "delta_head.weight" in t3d_state:
+        w = t3d_state["delta_head.weight"].float()
+        b = t3d_state.get("delta_head.bias")
+        b_norm = float(b.float().norm().item()) if b is not None else float("nan")
+        b_std = float(b.float().std().item()) if b is not None else float("nan")
+        print(f"  weight  std={w.std().item():.6e}  norm={w.norm().item():.4f}  "
+              f"abs_max={w.abs().max().item():.6e}  shape={tuple(w.shape)}")
+        print(f"  bias    std={b_std:.6e}  norm={b_norm:.4f}")
+        delta_head_alive = w.std().item() > 1e-5
+        print(f"  Reading: std > 1e-5 means delta_head has moved from zero-init "
+              f"(currently {'ALIVE' if delta_head_alive else 'STUCK NEAR ZERO'}).")
+    else:
+        print("  delta_head.weight not in state_dict (model was not built with the "
+              "zero-init delta head; skipping).")
+        delta_head_alive = None
+
+    # ---- (3b) talk_model.norm.weight (the gradient-strangling suspect) -------
+    print("\n" + "=" * 78)
+    print("  (3b) talk_model RMSNorm weights (should be ~1.0; if ~0.02, init bug)")
+    print("=" * 78)
+    if "talk_model.norm.weight" in t3d_state:
+        norm_w = t3d_state["talk_model.norm.weight"].float()
+        print(f"  talk_model.norm  mean={norm_w.mean().item():.4f}  "
+              f"std={norm_w.std().item():.4f}  abs_min={norm_w.abs().min().item():.4e}")
+        looks_init_bug = abs(norm_w.mean().item()) < 0.1
+        print(f"  Reading: mean close to 1.0 = healthy; close to 0.0 = init bug "
+              f"({'INIT BUG' if looks_init_bug else 'OK'}).")
+    # Spot-check one per-layer input norm too.
+    layer0_input_norm_key = "talk_model.layers.0.input_layernorm.weight"
+    if layer0_input_norm_key in t3d_state:
+        nw = t3d_state[layer0_input_norm_key].float()
+        print(f"  layers.0.input_layernorm  mean={nw.mean().item():.4f}  "
+              f"std={nw.std().item():.4f}")
+
     # ---- (3) lm_head drift from LLaDA tied weight -----------------------------
     print("\n" + "=" * 78)
     print("  (3) lm_head drift from LLaDA tied weight")
@@ -185,6 +226,21 @@ def main():
     print("\n" + "=" * 78)
     print("  Verdict")
     print("=" * 78)
+
+    # delta_head dominates the diagnosis when present: if it's dead, multi-iter
+    # losses across iters will be identical regardless of cross-attn/lm_head state.
+    if delta_head_alive is False:
+        print(
+            "  [DELTA HEAD STUCK]: delta_head.weight has not moved meaningfully from "
+            "zero-init. The talk pathway contributes ~0 to final_hidden, so logits = "
+            "lm_head(anchor) at every iteration. This is why iter losses are identical. "
+            "Likely cause: talk_model RMSNorm.weight got truncated_normal init from "
+            "VeOmni (~0.02 magnitude instead of 1.0), strangling the gradient flowing "
+            "into delta_head. Fix: re-init RMSNorm weights to ones inside "
+            "init_talk_layers_depth_scaled() and restart."
+        )
+        print("=" * 78)
+        return
 
     if lm_drift is None:
         print("  (could not compute lm_head drift; check reference path)")

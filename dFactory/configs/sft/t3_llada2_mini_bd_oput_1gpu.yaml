@@ -48,8 +48,8 @@
 #        - Talk sequence is L (noisy positions only).
 #        - Layer 0: gated residual injection (fixed gate 0.2).
 #        - Every talk layer: cross-attn (Q from talk, KV from full 2L anchor).
-#   3. Step-based mask-ratio ramp: sigma in [0.25, 1.00], linear over training.
-#   4. Step-based rollout-flag ratio ramp: P(flag=True) in [0.25, 1.00], linear.
+#   3. Step-based mask-ratio ramp: sigma in [0.65, 0.95], linear over training.
+#   4. Step-based rollout-flag ratio ramp: P(flag=True) in [0.65, 0.95], linear.
 #   5. train_lm_head=false (frozen at LLaDA tied weights).
 #   6. NEW IN v6d: add_anchor_skip_residual=true (late skip from anchor to lm_head input).
 #
@@ -93,8 +93,8 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.50
-  noise_range_high: 0.90
+  noise_range_low: 0.65
+  noise_range_high: 0.95
   num_workers: 16
 
 train:
@@ -161,11 +161,15 @@ train:
   t3_reveal_threshold: 0.5              # DMax inference's default; mask-path reveal gate.
   mask_token_id: 156895
   # T3-D ADDED: rollout-flag ratio ramp. Each micro_batch's flag is resampled as
-  # Bernoulli(threshold) with threshold ramping 0.50 -> 0.90 over training. Tightened
-  # from v6d's [0.25, 1.0] now that multi-iter training makes both paths meaningful;
-  # the extremes (no-rollout-at-all-early, full-rollout-at-end) were not useful.
-  t3_rollout_ratio_low: 0.50
-  t3_rollout_ratio_high: 0.90
+  # Bernoulli(threshold) with threshold ramping 0.65 -> 0.95 over training. With
+  # the delta-head architecture starting at LLaDA's baseline, the easy end of the
+  # ramp ([0.25, 0.5]) doesn't contribute useful signal -- talk needs to see
+  # mostly-hard cases. The combined effect of noise_range=[0.65, 0.95] and
+  # rollout_ratio=[0.65, 0.95]:
+  #   step 0   : sigma=0.65 (65% masked), 65% rollout path (full-argmax reveal)
+  #   step end : sigma=0.95 (95% masked, near inference-distribution), 95% rollout
+  t3_rollout_ratio_low: 0.65
+  t3_rollout_ratio_high: 0.95
 
   # T3-D ADDED: inline validation every N steps. Computes CE on the deterministic
   # tail-50 of the seed-shuffled training data, at fixed sigmas, single-forward (no

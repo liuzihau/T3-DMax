@@ -712,6 +712,20 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
                         )
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+                # T3-D ADDED: re-init RMSNorm weights to ones inside talk layers.
+                # VeOmni's load_model_weights uses trunc_normal(std=init_std) for
+                # any unmatched key, including these RMSNorm weights -- which means
+                # they end up ~N(0, 0.02^2) instead of the canonical 1.0. That kills
+                # downstream magnitudes (RMSNorm output = x * rms_inv * weight); a
+                # ~50x reduction means gradients into the delta_head are too small
+                # to move it meaningfully in early training.
+                if isinstance(module, LLaDA2MoeRMSNorm):
+                    nn.init.ones_(module.weight)
+
+        # T3-D ADDED: also re-init the talk_model's final RMSNorm. Same reason as
+        # the per-layer RMSNorms above -- VeOmni's loader put it at trunc_normal.
+        if hasattr(self.talk_model, "norm"):
+            nn.init.ones_(self.talk_model.norm.weight)
 
         # T3-D ADDED: re-zero the delta_head after VeOmni's load_model_weights step,
         # which initialises unmatched-key params with truncated_normal(std=init_std).
