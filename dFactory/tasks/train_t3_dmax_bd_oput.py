@@ -384,10 +384,15 @@ def reveal_full_argmax(
 
 
 # T3-D ADDED: inline validation. Builds a transform with fixed sigma, runs the model
-# through `forward` (single iter, no rollout, no multi-iter) on the val examples, and
-# returns CE split into overall / mask-region / clean-region per sigma.
+# through `forward` for N iterations (with DMax-uniform reveal between iters, mirroring
+# training's mask path) on the val examples, and returns CE split into overall /
+# mask-region / clean-region per (sigma, iter).
 #
-# Mirrors `tasks/eval_ce_val.py` semantics so numbers are comparable.
+# iter_0 is the single-forward CE -- the same number `tasks/eval_ce_val.py` reports
+# and what we use to compare with LLaDA baseline.
+# iter_{1..N-1} are post-reveal: input has talk's argmax committed at high-confidence
+# positions. These tell us whether multi-iter is actually producing iter-conditional
+# refinement (iter_last_CE < iter_0_CE) or just stuck at iter-0 behavior.
 @torch.no_grad()
 def _run_validation(
     model,
@@ -400,6 +405,8 @@ def _run_validation(
     block_size,
     mask_token_id,
     text_keys,
+    n_iters,
+    reveal_threshold,
     block_diffusion_attn_mask_prototype,
     block_diffusion_attn_mask_prototype_3L,
     talk_self_attn_mask_prototype_L,
@@ -433,6 +440,8 @@ def _run_validation(
     )
 
     metrics = {}
+    n_iter_max = max(int(n_iters), 1)
+
     for sigma in sigmas:
         transform = partial(
             process_mdm_sft_example,
@@ -444,12 +453,13 @@ def _run_validation(
             progress_state=None,
         )
 
-        loss_sum = 0.0
-        pos_count = 0
-        mask_loss_sum = 0.0
-        mask_count = 0
-        clean_loss_sum = 0.0
-        clean_count = 0
+        # Per-iter accumulators: [overall, mask, clean] sums and counts.
+        loss_sum_per_iter        = [0.0 for _ in range(n_iter_max)]
+        pos_count_per_iter       = [0   for _ in range(n_iter_max)]
+        mask_loss_sum_per_iter   = [0.0 for _ in range(n_iter_max)]
+        mask_count_per_iter      = [0   for _ in range(n_iter_max)]
+        clean_loss_sum_per_iter  = [0.0 for _ in range(n_iter_max)]
+        clean_count_per_iter     = [0   for _ in range(n_iter_max)]
         skipped = 0
 
         for idx in val_indices:
@@ -465,57 +475,96 @@ def _run_validation(
 
             full_ids = torch.cat([noisy, clean], dim=0).unsqueeze(0).to(device)
             labels_dev = labels.unsqueeze(0).to(device)
-            noisy_dev = noisy.unsqueeze(0).to(device)
+            # original_noisy tracks which positions started as [MASK] so we can keep
+            # the mask/clean region split stable across iters as reveals fill positions.
+            original_noisy_dev = noisy.unsqueeze(0).to(device)
 
-            kwargs = {
-                "input_ids": full_ids,
-                "attention_mask": attn_mask_2L,
-                "position_ids": pos_2L,
-                "use_cache": False,
-                "output_router_logits": False,
-            }
-            if attn_mask_3L is not None:
-                kwargs["attention_mask_3L"] = attn_mask_3L
-                kwargs["position_ids_3L"] = torch.cat(
-                    [noisy_pos, noisy_pos, clean_pos], dim=0,
-                ).unsqueeze(0)
-            if attn_mask_L is not None:
-                kwargs["attention_mask_L"] = attn_mask_L
-                kwargs["position_ids_L"] = pos_L
-                kwargs["cross_attention_mask"] = cross_attn_mask
-                kwargs["cross_position_ids"] = cross_pos
-
-            out = model(**kwargs)
-            logits = out.logits
-            # In hybrid_xattn talk outputs [B,L,V]; in other modes [B,2L,V] or [B,3L,V].
-            # Slice to first L (the noisy half / talk's predictions over noisy positions).
-            noisy_logits = logits[:, :L]
-
-            per_pos = torch.nn.functional.cross_entropy(
-                noisy_logits.view(-1, noisy_logits.shape[-1]),
-                labels_dev.view(-1),
-                reduction="none",
-                ignore_index=-100,
-            )
             valid_flat = (labels_dev != -100).view(-1)
-            noisy_flat = noisy_dev.view(-1)
-            mask_region = (noisy_flat == mask_token_id) & valid_flat
-            clean_region = (noisy_flat != mask_token_id) & valid_flat
+            original_noisy_flat = original_noisy_dev.view(-1)
+            mask_region = (original_noisy_flat == mask_token_id) & valid_flat
+            clean_region = (original_noisy_flat != mask_token_id) & valid_flat
 
-            loss_sum += float(per_pos.sum().item())
-            pos_count += int(valid_flat.sum().item())
-            mask_loss_sum += float(per_pos[mask_region].sum().item())
-            mask_count += int(mask_region.sum().item())
-            clean_loss_sum += float(per_pos[clean_region].sum().item())
-            clean_count += int(clean_region.sum().item())
+            current_input_ids = full_ids
+            for iter_idx in range(n_iter_max):
+                kwargs = {
+                    "input_ids": current_input_ids,
+                    "attention_mask": attn_mask_2L,
+                    "position_ids": pos_2L,
+                    "use_cache": False,
+                    "output_router_logits": False,
+                }
+                if attn_mask_3L is not None:
+                    kwargs["attention_mask_3L"] = attn_mask_3L
+                    kwargs["position_ids_3L"] = torch.cat(
+                        [noisy_pos, noisy_pos, clean_pos], dim=0,
+                    ).unsqueeze(0)
+                if attn_mask_L is not None:
+                    kwargs["attention_mask_L"] = attn_mask_L
+                    kwargs["position_ids_L"] = pos_L
+                    kwargs["cross_attention_mask"] = cross_attn_mask
+                    kwargs["cross_position_ids"] = cross_pos
+
+                out = model(**kwargs)
+                logits = out.logits
+                noisy_logits = logits[:, :L]
+
+                per_pos = torch.nn.functional.cross_entropy(
+                    noisy_logits.view(-1, noisy_logits.shape[-1]),
+                    labels_dev.view(-1),
+                    reduction="none",
+                    ignore_index=-100,
+                )
+
+                # Accumulate per-iter, splitting by ORIGINAL mask/clean region.
+                loss_sum_per_iter[iter_idx]       += float(per_pos[valid_flat].sum().item())
+                pos_count_per_iter[iter_idx]      += int(valid_flat.sum().item())
+                mask_loss_sum_per_iter[iter_idx]  += float(per_pos[mask_region].sum().item())
+                mask_count_per_iter[iter_idx]     += int(mask_region.sum().item())
+                clean_loss_sum_per_iter[iter_idx] += float(per_pos[clean_region].sum().item())
+                clean_count_per_iter[iter_idx]    += int(clean_region.sum().item())
+
+                # Reveal for next iter (mirrors training's mask-path DMax-uniform).
+                if iter_idx < n_iter_max - 1:
+                    current_noisy = current_input_ids[:, :L]
+                    new_noisy = reveal_dmax_uniform(
+                        logits=noisy_logits.detach(),
+                        current_noisy=current_noisy,
+                        mask_token_id=mask_token_id,
+                        block_size=block_size,
+                        threshold=reveal_threshold,
+                    )
+                    new_input = current_input_ids.clone()
+                    new_input[:, :L] = new_noisy
+                    current_input_ids = new_input
 
         key = f"sigma_{sigma:.2f}"
-        if pos_count > 0:
-            metrics[f"val/ce_overall_{key}"] = loss_sum / pos_count
-        if mask_count > 0:
-            metrics[f"val/ce_mask_{key}"] = mask_loss_sum / mask_count
-        if clean_count > 0:
-            metrics[f"val/ce_clean_{key}"] = clean_loss_sum / clean_count
+        for i in range(n_iter_max):
+            if pos_count_per_iter[i] > 0:
+                metrics[f"val/ce_overall_{key}_iter{i}"] = (
+                    loss_sum_per_iter[i] / pos_count_per_iter[i]
+                )
+            if mask_count_per_iter[i] > 0:
+                metrics[f"val/ce_mask_{key}_iter{i}"] = (
+                    mask_loss_sum_per_iter[i] / mask_count_per_iter[i]
+                )
+            if clean_count_per_iter[i] > 0:
+                metrics[f"val/ce_clean_{key}_iter{i}"] = (
+                    clean_loss_sum_per_iter[i] / clean_count_per_iter[i]
+                )
+        # Also expose a "summary" (iter_0 -> single-forward, what eval_ce_val.py
+        # reports): keep the legacy unsuffixed keys for direct comparison to LLaDA.
+        if pos_count_per_iter[0] > 0:
+            metrics[f"val/ce_overall_{key}"] = (
+                loss_sum_per_iter[0] / pos_count_per_iter[0]
+            )
+        if mask_count_per_iter[0] > 0:
+            metrics[f"val/ce_mask_{key}"] = (
+                mask_loss_sum_per_iter[0] / mask_count_per_iter[0]
+            )
+        if clean_count_per_iter[0] > 0:
+            metrics[f"val/ce_clean_{key}"] = (
+                clean_loss_sum_per_iter[0] / clean_count_per_iter[0]
+            )
 
     model.train()
     return metrics
@@ -964,6 +1013,8 @@ def main():
             block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
             mask_token_id=args.train.mask_token_id,
             text_keys=args.data.text_keys,
+            n_iters=args.train.t3_train_iterations,
+            reveal_threshold=args.train.t3_reveal_threshold,
             block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
             block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
             talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
@@ -1318,6 +1369,8 @@ def main():
                     block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
                     mask_token_id=args.train.mask_token_id,
                     text_keys=args.data.text_keys,
+                    n_iters=args.train.t3_train_iterations,
+                    reveal_threshold=args.train.t3_reveal_threshold,
                     block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
                     block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
                     talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
