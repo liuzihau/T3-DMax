@@ -1,29 +1,46 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# T3-D, single-GPU variant -- v6d (hybrid xattn + FROZEN lm_head + ZERO-INIT DELTA HEAD).
+# T3-D, single-GPU variant -- v6e (v6d + MULTI-ITER training, A4).
 #
 # Background:
-#   v2 plateaued at loss ~8.2; v4/v5 worse; v6b had lm_head drift catastrophe (cosine
-#   0.01 to LLaDA at step 15000, talk never learned to use anchor).
-#   v6c froze lm_head to fix that, but then loss couldn't move at all -- with random-
-#   init talk hidden states going through a frozen lm_head, the output was uniform
-#   logits regardless of input, so there was no gradient signal pointing talk anywhere.
+#   v2 plateaued at ~8.2 loss; v6b had lm_head drift catastrophe; v6c froze lm_head
+#   but loss couldn't move (no useful gradient signal); v6d added tata-style zero-init
+#   delta head -- loss started at LLaDA's CE 4.5 exactly, BUT descended slowly
+#   (4.4 -> 4.29 over 2k steps with grad_norm 0.05). Diagnosis: single-iter training
+#   gives talk only a thin gradient signal -- the model's input is just "masked" once
+#   and CE is computed on that one input distribution.
 #
-# v6d design (tata-style):
-#   Adds a ZERO-INIT DELTA HEAD on top of v6c. After talk's transformer + final norm,
-#   talk_hidden is wrapped through a Linear whose weight AND bias are zero-initialised:
+# v6e design (tata-style architecture + multi-iter training):
+#   ARCHITECTURE (unchanged from v6d):
+#     hybrid_xattn (gated residual at layer 0 + cross-attn every layer) + 4-layer talk
+#     + frozen lm_head + zero-init delta head.
 #       delta_h      = delta_head(talk_hidden)          # = 0 EXACTLY at step 0
-#       final_hidden = anchor[:, :L] + delta_h           # = anchor EXACTLY at step 0
+#       final_hidden = anchor[:, :L] + delta_h           # = anchor at step 0
 #       logits       = lm_head(final_hidden)             # = LLaDA's logits at step 0
-#   Since lm_head is frozen at LLaDA's tied word_embeddings, the step-0 output is
-#   logit-equivalent to LLaDA exactly. Training learns the delta to improve over
-#   LLaDA's strong baseline. Cannot do worse than LLaDA on any input it has seen.
 #
-#   Borrowed from peft_project/tata/delta_model/models/heads.py (the DeltaHead class).
-#   The simple-skip variant we initially planned (talk_hidden + anchor without the
-#   zero-init projection) would start at ~LLaDA + noise rather than exactly LLaDA;
-#   that noise on the logits perturbs softmax outputs at step 0 enough to matter.
+#   NEW: MULTI-ITER TRAINING (A4). Each training step runs N=5 talk forwards with grad:
+#       iter 0: think once -> anchor; talk on raw masked input; CE loss; reveal
+#       iter 1: talk on partially-revealed input; CE loss; reveal
+#       iter 2: talk on more-revealed input; CE loss; reveal
+#       iter 3: ...
+#       iter 4: final iter, CE loss
+#     Loss is the uniform mean of per-iter CE. Gradients accumulate (backward-per-iter).
+#     The anchor (think's output) is computed ONCE and reused across all iterations,
+#     matching inference where think runs once per block.
+#
+#   Reveal strategies (between iters, no-grad):
+#     flag=False (mask path)    -> DMax-uniform reveal (per-block, left-to-right
+#                                  confident prefix, threshold=0.5, fallback: commit
+#                                  leftmost mask if no high-conf position).
+#                                  Matches DMax inference behaviour.
+#     flag=True  (rollout path) -> full argmax (replace ALL [MASK] positions with the
+#                                  model's argmax each iter; no threshold). Harder
+#                                  training distribution.
+#
+#   This restores the iterative-refinement gradient signal that single-iter elided.
+#   talk now sees the inference-distribution range of inputs (raw -> partially
+#   revealed -> mostly filled), with iter-specific gradient at each.
 #
 # Architecture summary:
 #   1. Talk depth: 4 layers.
@@ -76,12 +93,12 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.25
-  noise_range_high: 1.00
+  noise_range_low: 0.50
+  noise_range_high: 0.90
   num_workers: 16
 
 train:
-  output_dir: ./outputs/t3d_1gpu_v6d_xattn_talk4_FROZEN_lmhead_anchorSKIP_lr1e4
+  output_dir: ./outputs/t3d_1gpu_v6e_xattn_talk4_FROZEN_anchorDELTA_multiITER5_lr1e4
 
   # Distributed -- single GPU, DDP wrap is a no-op
   data_parallel_mode: ddp
@@ -137,18 +154,30 @@ train:
   t3_rollout_mode: dmax_oput
   t3_rollout_target: talk_only          # think runs once on masked input; talk does rollout
   t3_rollout_replace: all_masked
-  t3_train_iterations: 1
+  # T3-D v6e: multi-iter training (A4). Both flag=False (mask path, DMax-uniform reveal)
+  # and flag=True (rollout path, full-argmax reveal) run this many talk forwards with
+  # grad per training step. Loss = uniform mean of per-iter CE.
+  t3_train_iterations: 5
+  t3_reveal_threshold: 0.5              # DMax inference's default; mask-path reveal gate.
   mask_token_id: 156895
   # T3-D ADDED: rollout-flag ratio ramp. Each micro_batch's flag is resampled as
-  # Bernoulli(threshold) with threshold ramping 0.25 -> 0.75 over training. Pairs with the
-  # noise-range ramp (0.25 -> 0.75) so both task difficulty and OPUT distribution share
-  # the same curriculum: start easy (low sigma, mostly mask path), end hard (high sigma,
-  # mostly rollout path matching inference).
-  t3_rollout_ratio_low: 0.25
-  t3_rollout_ratio_high: 1.00
+  # Bernoulli(threshold) with threshold ramping 0.50 -> 0.90 over training. Tightened
+  # from v6d's [0.25, 1.0] now that multi-iter training makes both paths meaningful;
+  # the extremes (no-rollout-at-all-early, full-rollout-at-end) were not useful.
+  t3_rollout_ratio_low: 0.50
+  t3_rollout_ratio_high: 0.90
+
+  # T3-D ADDED: inline validation every N steps. Computes CE on the deterministic
+  # tail-50 of the seed-shuffled training data, at fixed sigmas, single-forward (no
+  # multi-iter, no rollout). Logs val/ce_{overall,mask,clean}_sigma_{0.50,0.75}.
+  # Also runs once at step 0 as the baseline (should reproduce LLaDA's CE at the
+  # eval-script numbers, confirming the zero-init delta head start-state).
+  t3_val_every: 5000
+  t3_val_tail: 50
+  t3_val_sigmas: "0.5,0.75"
 
   # Logging -- set WANDB_API_KEY in env, or `wandb login` once before launch
   use_wandb: true
   wandb_project: T3-DMax
-  wandb_name: t3d_1gpu_v6d_xattn_talk4_FROZEN_lmhead_anchorSKIP_lr1e4
+  wandb_name: t3d_1gpu_v6e_xattn_talk4_FROZEN_anchorDELTA_multiITER5_lr1e4
   log_steps: 1

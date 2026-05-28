@@ -129,7 +129,14 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
     t3_train_iterations: int = field(
         default=1,
         metadata={"help": "Number of talk-side denoising iterations per grad step. "
-                          "Set >1 for ablation A4 (multi-step talk training). Not implemented in M1."},
+                          "Set >1 for multi-iter training (A4): each step runs N talk "
+                          "forwards through with grad, with reveal between iterations. "
+                          "Loss is the uniform average of per-iter CE."},
+    )
+    t3_reveal_threshold: float = field(
+        default=0.5,
+        metadata={"help": "Softmax-peak threshold for DMax-uniform reveal (mask path "
+                          "between training iterations). DMax's released code uses 0.5."},
     )
     mask_token_id: int = field(
         default=156895,
@@ -162,6 +169,26 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
         default=0.5,
         metadata={"help": "Probability that a micro_batch follows the rollout path at "
                           "training end. Linearly ramped from t3_rollout_ratio_low."},
+    )
+    # T3-D ADDED: inline validation knobs. Validation runs the deterministic tail of the
+    # training data through model.forward (single iter, no rollout) at fixed sigmas, and
+    # logs CE split into overall / mask-region / clean-region per sigma. Useful for
+    # tracking real progress past the noisy training-loss curve (which mixes per-step
+    # sigma noise from the ramp).
+    t3_val_every: int = field(
+        default=0,
+        metadata={"help": "Run validation every N global steps (in addition to step 0 "
+                          "baseline). 0 disables inline validation."},
+    )
+    t3_val_tail: int = field(
+        default=50,
+        metadata={"help": "Number of samples (from the tail of the seed-shuffled train "
+                          "data) to use as the inline-validation set. Same shuffle "
+                          "convention as tasks/eval_ce_val.py."},
+    )
+    t3_val_sigmas: str = field(
+        default="0.5,0.75",
+        metadata={"help": "Comma-separated sigma values to evaluate at."},
     )
 
 
@@ -273,6 +300,212 @@ def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
     noisy_kv_always_ok = ~kv_is_clean
     clean_kv_prior_block = kv_is_clean & (q_block > kv_block)
     return noisy_kv_always_ok | clean_kv_prior_block
+
+
+# T3-D ADDED: between-iteration reveal helpers (A4 multi-iter training).
+# Both helpers take talk's noisy-half logits and the current noisy input, and return
+# an updated noisy input where some [MASK] positions have been replaced with the model's
+# argmax. The reveal strategy differs per OPUT flag.
+#
+# `reveal_dmax_uniform` (mask path, flag=False):
+#   For each block of `block_size` positions, scan left-to-right; commit positions
+#   whose softmax peak > threshold; stop at the first that fails. If no position in
+#   a block qualifies and that block still has [MASK]s, commit the leftmost masked
+#   position (guaranteed-progress fallback). Mirrors DMax inference's reveal rule.
+#
+# `reveal_full_argmax` (rollout path, flag=True):
+#   Replace every currently-masked position with the model's argmax. No threshold,
+#   no left-to-right gating. Harder training distribution: simulates "what if my
+#   bulk prediction was just argmaxed without confidence gating?".
+def reveal_dmax_uniform(
+    logits: torch.Tensor,
+    current_noisy: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    threshold: float,
+) -> torch.Tensor:
+    B, L = current_noisy.shape
+    probs = torch.softmax(logits.float(), dim=-1)
+    max_probs, argmax_ids = probs.max(dim=-1)        # both [B, L]
+    masked = (current_noisy == mask_token_id)         # [B, L]
+
+    num_blocks = L // block_size
+    confident_blocks = (max_probs > threshold).view(B, num_blocks, block_size).long()
+    cum_conf = torch.cumprod(confident_blocks, dim=-1).bool().view(B, L)
+    commit_mask = cum_conf & masked                    # [B, L]
+
+    # Guaranteed-progress fallback per (sample, block).
+    any_commit = commit_mask.view(B, num_blocks, block_size).any(dim=-1)         # [B, nb]
+    masked_blocks = masked.view(B, num_blocks, block_size)                        # [B, nb, bs]
+    has_mask = masked_blocks.any(dim=-1)                                          # [B, nb]
+    needs_fallback = (~any_commit) & has_mask                                     # [B, nb]
+    if bool(needs_fallback.any()):
+        first_mask_idx = masked_blocks.long().argmax(dim=-1)                      # [B, nb]
+        block_offset = (
+            torch.arange(num_blocks, device=current_noisy.device) * block_size
+        )                                                                          # [nb]
+        abs_pos = block_offset[None] + first_mask_idx                              # [B, nb]
+        batch_idx = (
+            torch.arange(B, device=current_noisy.device)[:, None]
+            .expand(-1, num_blocks)
+        )                                                                          # [B, nb]
+        flat_b = batch_idx[needs_fallback]
+        flat_p = abs_pos[needs_fallback]
+        fallback_mask = torch.zeros(
+            B, L, dtype=torch.bool, device=current_noisy.device,
+        )
+        fallback_mask[flat_b, flat_p] = True
+        commit_mask = commit_mask | fallback_mask
+
+    return torch.where(commit_mask, argmax_ids, current_noisy)
+
+
+def reveal_full_argmax(
+    logits: torch.Tensor,
+    current_noisy: torch.Tensor,
+    mask_token_id: int,
+) -> torch.Tensor:
+    argmax_ids = logits.argmax(dim=-1)
+    masked = (current_noisy == mask_token_id)
+    return torch.where(masked, argmax_ids, current_noisy)
+
+
+# T3-D ADDED: inline validation. Builds a transform with fixed sigma, runs the model
+# through `forward` (single iter, no rollout, no multi-iter) on the val examples, and
+# returns CE split into overall / mask-region / clean-region per sigma.
+#
+# Mirrors `tasks/eval_ce_val.py` semantics so numbers are comparable.
+@torch.no_grad()
+def _run_validation(
+    model,
+    val_raw_examples,
+    val_indices,
+    sigmas,
+    *,
+    tokenizer,
+    max_seq_len,
+    block_size,
+    mask_token_id,
+    text_keys,
+    block_diffusion_attn_mask_prototype,
+    block_diffusion_attn_mask_prototype_3L,
+    talk_self_attn_mask_prototype_L,
+    talk_cross_attn_mask_prototype,
+    device,
+):
+    """Inline single-forward CE validation. Returns dict of wandb-keyed metrics."""
+    model.eval()
+
+    L = max_seq_len
+    # Pre-build per-batch=1 position_ids (same convention as training).
+    noisy_pos = torch.arange(L, dtype=torch.long, device=device)
+    clean_pos = torch.arange(L, dtype=torch.long, device=device)
+    pos_2L = torch.cat([noisy_pos, clean_pos], dim=0).unsqueeze(0)
+    pos_L = noisy_pos.unsqueeze(0)
+    cross_pos = torch.cat([noisy_pos, clean_pos], dim=0).unsqueeze(0)
+
+    # Reusable masks (prototypes are already shape [1,1,...] which works for batch=1).
+    attn_mask_2L = block_diffusion_attn_mask_prototype.to(device, non_blocking=True)
+    attn_mask_3L = (
+        block_diffusion_attn_mask_prototype_3L.to(device, non_blocking=True)
+        if block_diffusion_attn_mask_prototype_3L is not None else None
+    )
+    attn_mask_L = (
+        talk_self_attn_mask_prototype_L.to(device, non_blocking=True)
+        if talk_self_attn_mask_prototype_L is not None else None
+    )
+    cross_attn_mask = (
+        talk_cross_attn_mask_prototype.to(device, non_blocking=True)
+        if talk_cross_attn_mask_prototype is not None else None
+    )
+
+    metrics = {}
+    for sigma in sigmas:
+        transform = partial(
+            process_mdm_sft_example,
+            tokenizer=tokenizer,
+            max_seq_len=max_seq_len,
+            text_keys=text_keys,
+            noise_range=(sigma, sigma),
+            mask_token_id=mask_token_id,
+            progress_state=None,
+        )
+
+        loss_sum = 0.0
+        pos_count = 0
+        mask_loss_sum = 0.0
+        mask_count = 0
+        clean_loss_sum = 0.0
+        clean_count = 0
+        skipped = 0
+
+        for idx in val_indices:
+            try:
+                transformed = transform(val_raw_examples[idx])[0]
+            except Exception:
+                skipped += 1
+                continue
+
+            noisy = transformed["noisy_input_ids"]
+            clean = transformed["input_ids"]
+            labels = transformed["labels"]
+
+            full_ids = torch.cat([noisy, clean], dim=0).unsqueeze(0).to(device)
+            labels_dev = labels.unsqueeze(0).to(device)
+            noisy_dev = noisy.unsqueeze(0).to(device)
+
+            kwargs = {
+                "input_ids": full_ids,
+                "attention_mask": attn_mask_2L,
+                "position_ids": pos_2L,
+                "use_cache": False,
+                "output_router_logits": False,
+            }
+            if attn_mask_3L is not None:
+                kwargs["attention_mask_3L"] = attn_mask_3L
+                kwargs["position_ids_3L"] = torch.cat(
+                    [noisy_pos, noisy_pos, clean_pos], dim=0,
+                ).unsqueeze(0)
+            if attn_mask_L is not None:
+                kwargs["attention_mask_L"] = attn_mask_L
+                kwargs["position_ids_L"] = pos_L
+                kwargs["cross_attention_mask"] = cross_attn_mask
+                kwargs["cross_position_ids"] = cross_pos
+
+            out = model(**kwargs)
+            logits = out.logits
+            # In hybrid_xattn talk outputs [B,L,V]; in other modes [B,2L,V] or [B,3L,V].
+            # Slice to first L (the noisy half / talk's predictions over noisy positions).
+            noisy_logits = logits[:, :L]
+
+            per_pos = torch.nn.functional.cross_entropy(
+                noisy_logits.view(-1, noisy_logits.shape[-1]),
+                labels_dev.view(-1),
+                reduction="none",
+                ignore_index=-100,
+            )
+            valid_flat = (labels_dev != -100).view(-1)
+            noisy_flat = noisy_dev.view(-1)
+            mask_region = (noisy_flat == mask_token_id) & valid_flat
+            clean_region = (noisy_flat != mask_token_id) & valid_flat
+
+            loss_sum += float(per_pos.sum().item())
+            pos_count += int(valid_flat.sum().item())
+            mask_loss_sum += float(per_pos[mask_region].sum().item())
+            mask_count += int(mask_region.sum().item())
+            clean_loss_sum += float(per_pos[clean_region].sum().item())
+            clean_count += int(clean_region.sum().item())
+
+        key = f"sigma_{sigma:.2f}"
+        if pos_count > 0:
+            metrics[f"val/ce_overall_{key}"] = loss_sum / pos_count
+        if mask_count > 0:
+            metrics[f"val/ce_mask_{key}"] = mask_loss_sum / mask_count
+        if clean_count > 0:
+            metrics[f"val/ce_clean_{key}"] = clean_loss_sum / clean_count
+
+    model.train()
+    return metrics
 
 
 # T3-D ADDED: per-step diagnostic metrics. Reads scalars off the model + optimiser to
@@ -677,6 +910,57 @@ def main():
             f"over the full training schedule."
         )
 
+    # T3-D ADDED: inline-validation setup. Read the same train file, take the tail of
+    # the seed-shuffled order as a deterministic held-out set, build a fixed-sigma
+    # transform factory. Validation runs at step 0 (baseline) and every t3_val_every
+    # steps. Tail of the shuffle is the chunk training will reach LAST -- so at any
+    # training step before that, it's truly unseen.
+    val_enabled = (
+        args.train.t3_val_every > 0
+        and args.train.global_rank == 0
+        and args.data.data_type == "conversation"
+    )
+    val_raw_examples: List[Dict[str, Any]] = []
+    val_indices: List[int] = []
+    val_sigmas: List[float] = []
+    if val_enabled:
+        logger.info_rank0(
+            f"[T3-D val] Loading val examples from {args.data.train_path} ..."
+        )
+        with open(args.data.train_path) as _vf:
+            for _line in _vf:
+                val_raw_examples.append(json.loads(_line))
+        _n_val_total = len(val_raw_examples)
+        _val_gen = torch.Generator().manual_seed(args.train.seed)
+        _shuffled = torch.randperm(_n_val_total, generator=_val_gen).tolist()
+        val_indices = _shuffled[-args.train.t3_val_tail:]
+        val_sigmas = [float(s.strip()) for s in args.train.t3_val_sigmas.split(",") if s.strip()]
+        logger.info_rank0(
+            f"[T3-D val] tail-{args.train.t3_val_tail} of seed-shuffled "
+            f"{_n_val_total} examples; sigmas={val_sigmas}; "
+            f"every {args.train.t3_val_every} steps."
+        )
+
+    # Baseline validation (step 0, before any training).
+    if val_enabled:
+        logger.info_rank0("[T3-D val] Running baseline validation (step 0)...")
+        _val_metrics = _run_validation(
+            model, val_raw_examples, val_indices, val_sigmas,
+            tokenizer=tokenizer,
+            max_seq_len=args.data.max_seq_len,
+            block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+            mask_token_id=args.train.mask_token_id,
+            text_keys=args.data.text_keys,
+            block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+            block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+            talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+            talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+            device=get_device_type(),
+        )
+        logger.info_rank0(f"[T3-D val] step 0: {_val_metrics}")
+        if args.train.use_wandb:
+            wandb.log(_val_metrics, step=0)
+
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -732,6 +1016,14 @@ def main():
             loss_mask_path_n = 0
             loss_rollout_path_sum = 0.0
             loss_rollout_path_n = 0
+            # T3-D ADDED: per-iter loss accumulators (A4 multi-iter training).
+            # iter 0 is the first forward (raw masked input or first reveal at flag=True);
+            # iter k is the forward after k reveals. With t3_train_iterations=1 only iter 0
+            # is populated; with N>1 we get a curve per training step that shows whether
+            # later iterations achieve lower loss (the actual hypothesis test for A4).
+            n_iter_max = max(int(args.train.t3_train_iterations), 1)
+            loss_per_iter_sum = [0.0 for _ in range(n_iter_max)]
+            loss_per_iter_n = [0 for _ in range(n_iter_max)]
             synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
@@ -806,71 +1098,39 @@ def main():
                 noisy_len = noisy_input_ids.shape[1] if args.train.block_diffusion_mode else micro_batch["input_ids"].shape[1]
 
                 # =====================================================================
-                # T3-D MODIFIED: On-policy rollout, talk-only variant (brief sec 8.3).
+                # T3-D v6e -- MULTI-ITER TRAINING (A4).
                 #
-                # Original DMax flow:
-                #     no_grad full_model_forward (think+talk equivalent in single model)
-                #     → argmax → replace masked positions in input_ids
-                #     → grad full_model_forward on the updated input_ids
-                #
-                # T3-D talk-only flow:
-                #     no_grad think_forward (on the masked input) → anchor (cached)
-                #     no_grad talk_forward(input_ids, anchor) → argmax → replace masked positions
-                #     grad   talk_forward(updated_input_ids, anchor.detach())
-                #
-                # think runs once per flag=True sample; talk runs twice (rollout + grad).
-                # Think sees no gradient on flag=True samples; that is intentional --
-                # think only ever sees masked inputs at inference (it runs once per block,
-                # on the all-mask block) so training on the masked distribution is the
-                # right inductive bias.
+                # Both flag=False (mask path) and flag=True (rollout path) run N talk
+                # forwards with grad. Loss is the uniform mean of per-iter CE.
+                #   think runs once at the start; anchor is reused across all iterations.
+                #   Reveal between iters:
+                #     mask path    -> DMax-uniform (per-block, left-to-right confident
+                #                     prefix, threshold=0.5, with leftmost-mask fallback).
+                #                     Matches DMax inference's reveal rule.
+                #     rollout path -> full argmax (every still-masked position is replaced
+                #                     with the model's argmax). Harder distribution; no
+                #                     confidence gating.
+                # gradients accumulate via backward-per-iter (memory bounded to one iter's
+                # activations at a time).
                 # =====================================================================
 
-                anchor_cached = None
-                # T3-D MODIFIED: gate the rollout on the (possibly ramp-overridden) flag_bool.
-                if args.train.t3_rollout_mode == "dmax_oput" and flag_bool is True:
-                    model.eval()
-                    with torch.no_grad():
-                        # 1. Think forward on the masked input -> anchor.
-                        anchor_cached = model.run_think_and_anchor(
-                            input_ids=micro_batch["input_ids"],
-                            attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"],
-                        )
-                        # 2. Talk rollout with that anchor -> argmax tokens at masked positions.
-                        rollout_logits = model.run_talk(
-                            input_ids=micro_batch["input_ids"],
-                            anchor=anchor_cached,
-                            attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"],
-                            # T3-D ADDED: per-mode extra tensors. run_talk picks the right path
-                            # by inspecting self.is_concat_segment / self.is_hybrid_xattn.
-                            attention_mask_3L=micro_batch.get("attention_mask_3L"),
-                            position_ids_3L=micro_batch.get("position_ids_3L"),
-                            attention_mask_L=micro_batch.get("attention_mask_L"),
-                            position_ids_L=micro_batch.get("position_ids_L"),
-                            cross_attention_mask=micro_batch.get("cross_attention_mask"),
-                            cross_position_ids=micro_batch.get("cross_position_ids"),
-                        )
-                        rollout_tokens = rollout_logits.argmax(dim=-1)
-                        active_mask = (micro_batch["input_ids"][:, :noisy_len] == args.train.mask_token_id)
-                        # 3. Replace masked positions in the noisy half with talk's argmax.
-                        micro_batch["input_ids"][:, :noisy_len] = torch.where(
-                            active_mask,
-                            rollout_tokens[:, :noisy_len],
-                            micro_batch["input_ids"][:, :noisy_len],
-                        )
-                    model.train()
+                # 1. Compute anchor once (no-grad). Reused by every iter.
+                model.eval()
+                with torch.no_grad():
+                    anchor_cached = model.run_think_and_anchor(
+                        input_ids=micro_batch["input_ids"],
+                        attention_mask=micro_batch["attention_mask"],
+                        position_ids=micro_batch["position_ids"],
+                    )
+                model.train()
 
-                # ---------------------------------------------------------------------
-                # Grad forward.
-                #
-                # When anchor_cached is set (flag=True branch), reuse it -- only talk
-                # gets gradient. Otherwise (flag=False, or rollout disabled) do the full
-                # think+talk forward through `model(**micro_batch)` so both get gradient.
-                # ---------------------------------------------------------------------
-                with model_fwd_context:
-                    if anchor_cached is not None:
-                        # T3-D ADDED: gradient flows only through talk + LM head.
+                # 2. Pick reveal strategy per flag.
+                reveal_kind = "full_argmax" if flag_bool else "dmax_uniform"
+
+                # 3. N grad iterations. Each iter: forward, CE, backward, then no-grad reveal.
+                n_iters = max(int(args.train.t3_train_iterations), 1)
+                for iter_idx in range(n_iters):
+                    with model_fwd_context:
                         logits = model.run_talk(
                             input_ids=micro_batch["input_ids"],
                             anchor=anchor_cached.detach(),
@@ -883,50 +1143,72 @@ def main():
                             cross_attention_mask=micro_batch.get("cross_attention_mask"),
                             cross_position_ids=micro_batch.get("cross_position_ids"),
                         )
+
+                        if args.train.block_diffusion_mode:
+                            noisy_logits = logits[:, :noisy_len].contiguous()
+                        else:
+                            noisy_logits = logits
+
+                        if args.train.same_token_labels:
+                            unscaled_loss = torch.nn.functional.cross_entropy(
+                                noisy_logits.view(-1, noisy_logits.shape[-1]),
+                                labels.view(-1),
+                                reduction="none",
+                            )
+                            valid = (labels != -100).sum().clamp_min(1)
+                            ce_iter = unscaled_loss.sum() / valid
+                        else:
+                            shifted_logits = noisy_logits[:, :-1, :].contiguous()
+                            shifted_labels = labels[:, 1:].contiguous()
+                            unscaled_loss = torch.nn.functional.cross_entropy(
+                                shifted_logits.view(-1, shifted_logits.shape[-1]),
+                                shifted_labels.view(-1),
+                                reduction="none",
+                            )
+                            valid = (shifted_labels != -100).sum().clamp_min(1)
+                            ce_iter = unscaled_loss.sum() / valid
+
+                        # Scale for grad accumulation across iters x micro_batches.
+                        loss_scaled = ce_iter / (n_iters * len(micro_batches))
+
+                    with model_bwd_context:
+                        loss_scaled.backward()
+
+                    # Per-iter / per-flag / total loss bookkeeping.
+                    ce_iter_val = float(ce_iter.item())
+                    total_loss += float(loss_scaled.item())   # sum gives mean CE across iter+mb
+                    loss_per_iter_sum[iter_idx] += ce_iter_val
+                    loss_per_iter_n[iter_idx] += 1
+                    if flag_bool:
+                        loss_rollout_path_sum += ce_iter_val
+                        loss_rollout_path_n += 1
                     else:
-                        logits = model(
-                            **micro_batch, use_cache=False, output_router_logits=False,
-                        ).logits
+                        loss_mask_path_sum += ce_iter_val
+                        loss_mask_path_n += 1
 
-                    if args.train.block_diffusion_mode:
-                        noisy_logits = logits[:, :noisy_len].contiguous()
-                    else:
-                        noisy_logits = logits
+                    # 4. Reveal for next iter (no-grad). Skip on last iter (no next forward).
+                    if iter_idx < n_iters - 1:
+                        with torch.no_grad():
+                            current_noisy = micro_batch["input_ids"][:, :noisy_len]
+                            if reveal_kind == "dmax_uniform":
+                                new_noisy = reveal_dmax_uniform(
+                                    logits=noisy_logits.detach(),
+                                    current_noisy=current_noisy,
+                                    mask_token_id=args.train.mask_token_id,
+                                    block_size=args.train.block_size,
+                                    threshold=args.train.t3_reveal_threshold,
+                                )
+                            else:  # full_argmax
+                                new_noisy = reveal_full_argmax(
+                                    logits=noisy_logits.detach(),
+                                    current_noisy=current_noisy,
+                                    mask_token_id=args.train.mask_token_id,
+                                )
+                            # Update the full input_ids; we replace the noisy half only.
+                            new_input = micro_batch["input_ids"].clone()
+                            new_input[:, :noisy_len] = new_noisy
+                            micro_batch["input_ids"] = new_input
 
-                    # Loss (unchanged from DMax) ---------------------------------------
-                    if args.train.same_token_labels:
-                        unscaled_loss = torch.nn.functional.cross_entropy(
-                            noisy_logits.view(-1, noisy_logits.shape[-1]),
-                            labels.view(-1),
-                            reduction="none",
-                        )
-                        loss = unscaled_loss.sum() / (labels != -100).sum() / len(micro_batches)
-                    else:
-                        shifted_noisy_logits = noisy_logits[:, :-1, :].contiguous()
-                        shifted_labels = labels[:, 1:].contiguous()
-                        unscaled_loss = torch.nn.functional.cross_entropy(
-                            shifted_noisy_logits.view(-1, shifted_noisy_logits.shape[-1]),
-                            shifted_labels.view(-1),
-                            reduction="none",
-                        ).view(shifted_noisy_logits.shape[0], -1)
-                        loss = unscaled_loss.sum() / (shifted_labels != -100).sum() / len(micro_batches)
-
-                with model_bwd_context:
-                    loss.backward()
-
-                loss_item = loss.item()
-                total_loss += loss_item
-                # T3-D ADDED: per-flag bookkeeping. `loss` is pre-scaled by 1/len(micro_batches)
-                # for gradient accumulation. Multiply back so each per-flag entry is on the
-                # same scale as a single micro_batch loss (matches the units of training/loss
-                # when there's exactly one micro_batch in the step).
-                unscaled_micro_loss = loss_item * len(micro_batches)
-                if flag_bool:
-                    loss_rollout_path_sum += unscaled_micro_loss
-                    loss_rollout_path_n += 1
-                else:
-                    loss_mask_path_sum += unscaled_micro_loss
-                    loss_mask_path_n += 1
                 del micro_batch
 
             # ---- Optimiser step (unchanged from DMax) ----------------------------
@@ -987,11 +1269,47 @@ def main():
                     )
                 total_micro_n = loss_mask_path_n + loss_rollout_path_n
                 if total_micro_n > 0:
+                    # Note: with multi-iter, this rate is "iter-samples with flag=True"
+                    # divided by total iter-samples (= n_iters x len(micro_batches)). Since
+                    # the flag is per-micro_batch, this still recovers the per-micro_batch
+                    # flag-True rate up to constant scaling.
                     train_metrics["t3/rollout_flag_rate"] = (
                         loss_rollout_path_n / total_micro_n
                     )
                 if rollout_threshold is not None:
                     train_metrics["t3/rollout_ratio_target"] = rollout_threshold
+                # T3-D ADDED: per-iter loss curve. With multi-iter training (v6e), each
+                # step contributes one CE per iter per micro_batch; we log the mean CE for
+                # each iter index. If multi-iter is working as intended, loss_iter_0 stays
+                # near baseline while loss_iter_{k>0} drops as talk learns to use the
+                # progressively-revealed input.
+                for i in range(n_iter_max):
+                    if loss_per_iter_n[i] > 0:
+                        train_metrics[f"training/loss_iter_{i}"] = (
+                            loss_per_iter_sum[i] / loss_per_iter_n[i]
+                        )
+
+            # T3-D ADDED: inline validation. Runs every t3_val_every steps on the
+            # deterministic tail-N held-out subset, computing CE at fixed sigmas.
+            # Always logs as `val/ce_*` on the same step as training metrics so wandb
+            # plots them together.
+            if val_enabled and global_step % args.train.t3_val_every == 0:
+                _val_metrics = _run_validation(
+                    model, val_raw_examples, val_indices, val_sigmas,
+                    tokenizer=tokenizer,
+                    max_seq_len=args.data.max_seq_len,
+                    block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+                    mask_token_id=args.train.mask_token_id,
+                    text_keys=args.data.text_keys,
+                    block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+                    block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+                    talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+                    talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+                    device=get_device_type(),
+                )
+                logger.info_rank0(f"[T3-D val] step {global_step}: {_val_metrics}")
+                if args.train.use_wandb and args.train.global_rank == 0:
+                    wandb.log(_val_metrics, step=global_step)
                 wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
