@@ -72,6 +72,11 @@ class ThinkTalkT3DInference:
         self.device = device
         self.dtype = dtype
 
+        # Resolve to absolute path; HF rejects relative paths starting with `..`
+        # because they look like invalid repo IDs.
+        if os.path.isdir(model_path):
+            model_path = os.path.abspath(model_path)
+
         # Load config; VeOmni's registry uses the `_veomni` suffix to dispatch to
         # the local modeling file rather than HuggingFace's AutoModel fallback.
         config = ThinkTalkLLaDA2Config.from_pretrained(model_path)
@@ -95,7 +100,12 @@ class ThinkTalkT3DInference:
 
         self.model.eval().to(device)
 
+        # HF's AutoTokenizer.from_pretrained interprets non-absolute strings as
+        # HuggingFace repo IDs. Resolve to absolute path when the arg points at
+        # a local directory so `../LLaDA2.0-mini-moe-merge` works.
         tok_path = tokenizer_path or model_path
+        if os.path.isdir(tok_path):
+            tok_path = os.path.abspath(tok_path)
         self.tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
 
         # Resolved knobs.
