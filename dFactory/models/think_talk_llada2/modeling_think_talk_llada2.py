@@ -914,24 +914,92 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: torch.LongTensor,
-    ) -> torch.Tensor:
-        """Forward through think + anchor fuser only. Always operates on the 2L sequence
-        regardless of injection mode. Used by the talk-only OPUT rollout (brief sec 8.3)
-        and by efficient inference (think once per block).
+        past_key_values=None,
+        use_cache: bool = False,
+    ):
+        """Forward through think + anchor fuser only.
 
-        Returns: anchor of shape [B, 2L, D]. In concat_segment mode the caller will slice
-        anchor[:, :L] inside the talk pathway.
+        Training-time call (no cache): returns just the anchor [B, seq_len, D]. Used by
+        the talk-only OPUT rollout (brief sec 8.3); seq_len is 2L (the doubled sequence).
+
+        Inference-time call (use_cache=True): extends the think KV cache. Returns
+        (anchor_for_new_positions, past_key_values). anchor covers only the query
+        positions (length q_len = input_ids.shape[1]); the caller maintains a running
+        anchor tensor that accumulates new chunks across blocks. See dInfer/python/dinfer/
+        decoding/generate_t3d.py for the block-by-block inference loop.
         """
         think_out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=False,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
             output_hidden_states=True,
             output_router_logits=False,
             return_dict=True,
         )
-        return self.anchor_fuser(think_out.hidden_states)
+        anchor = self.anchor_fuser(think_out.hidden_states)
+        if use_cache:
+            return anchor, think_out.past_key_values
+        return anchor
+
+    @torch.no_grad()
+    def run_talk_block(
+        self,
+        block_input_ids: torch.LongTensor,
+        anchor_so_far: torch.Tensor,
+        block_start: int,
+        block_end: int,
+    ) -> torch.Tensor:
+        """Run talk on a single block at inference. Returns logits [B, block_length, V].
+
+        Args:
+          block_input_ids: [B, block_length] noisy tokens for the current block.
+          anchor_so_far:   [B, block_end, D] anchor accumulated over all positions decoded
+                           so far (prompt + committed prior blocks + current block).
+          block_start, block_end: absolute positions of the current block in `x`.
+
+        Inference simplifications vs `run_talk`:
+          - No doubled sequence. Talk operates on block-only input + a single-L anchor.
+          - No clean-half-leak path, so cross-attn mask is fully open (block b sees
+            anchor at positions [0, block_end), which is exactly block-causal by
+            construction).
+          - Talk self-attn is fully open within the block (matches training's M_BD
+            restricted to a single block).
+        """
+        if not self.is_hybrid_xattn:
+            raise NotImplementedError(
+                "run_talk_block is currently only implemented for hybrid_xattn anchor "
+                "injection mode."
+            )
+
+        B, q_len = block_input_ids.shape[:2]
+        device = block_input_ids.device
+
+        talk_embeds = self.model.word_embeddings(block_input_ids)
+        anchor_block = anchor_so_far[:, block_start:block_end, :].contiguous()
+
+        pos_self = torch.arange(block_start, block_end, dtype=torch.long, device=device)
+        pos_self = pos_self.unsqueeze(0).expand(B, -1).contiguous()
+
+        pos_cross_kv = torch.arange(0, block_end, dtype=torch.long, device=device)
+        pos_cross_kv = pos_cross_kv.unsqueeze(0).expand(B, -1).contiguous()
+
+        talk_hidden = self.talk_model(
+            inputs_embeds=talk_embeds,
+            anchor=anchor_block,
+            attention_mask=None,
+            position_ids=pos_self,
+            anchor_kv=anchor_so_far,
+            cross_attention_mask=None,
+            cross_position_ids=pos_cross_kv,
+        )
+        if self.delta_head is not None:
+            talk_hidden = anchor_block + self.delta_head(talk_hidden)
+        elif getattr(self.config, "add_anchor_skip_residual", False):
+            talk_hidden = talk_hidden + anchor_block
+
+        return self.lm_head(talk_hidden)
 
     def run_talk(
         self,
