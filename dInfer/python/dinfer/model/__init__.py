@@ -15,9 +15,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
-from .configuration_llada import LLaDAConfig
-from .modeling_llada import LLaDAModelLM
-from .modeling_fused_olmoe import FusedOlmoeForCausalLM as LLaDAMoeModelLM
-from .modeling_llada2_moe import LLaDA2MoeModelLM
-__all__ = ['LLaDAConfig', 'LLaDAModelLM', 'LLaDAMoeModelLM', 'LLaDA2MoeModelLM']
+# T3-D MODIFIED: DMax's original __init__ pulls in LLaDA-family inference
+# models that depend on vllm/sglang. Wrap so `from dinfer.model.modeling_think_talk_t3d
+# import ThinkTalkT3DInference` works in our single-GPU env without those deps.
+try:
+    from .configuration_llada import LLaDAConfig
+    from .modeling_llada import LLaDAModelLM
+    from .modeling_fused_olmoe import FusedOlmoeForCausalLM as LLaDAMoeModelLM
+    from .modeling_llada2_moe import LLaDA2MoeModelLM
+    __all__ = ['LLaDAConfig', 'LLaDAModelLM', 'LLaDAMoeModelLM', 'LLaDA2MoeModelLM']
+except ImportError:
+    __all__ = []
 
