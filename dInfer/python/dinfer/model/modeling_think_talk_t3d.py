@@ -24,6 +24,21 @@ from typing import Optional, Tuple
 
 import torch
 from transformers import AutoTokenizer
+from transformers.cache_utils import DynamicCache
+
+
+# transformers 4.46+ removed `DynamicCache.get_usable_length(seq_length)` in
+# favor of `get_seq_length()`. The dFactory training model file was vendored
+# from LLaDA2's official release against an older transformers version and
+# still calls the old API. Training never exercises this path (use_cache=False),
+# so the issue only surfaces at inference. We restore the method here instead
+# of editing the vendored modeling file -- training and inference paths stay
+# untouched in their respective concerns. The two methods were semantically
+# identical (the `new_seq_length` argument was unused in DynamicCache).
+if not hasattr(DynamicCache, "get_usable_length"):
+    DynamicCache.get_usable_length = lambda self, new_seq_length=None, layer_idx=0: (
+        self.get_seq_length(layer_idx)
+    )
 
 
 def _ensure_dfactory_on_path():
