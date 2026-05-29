@@ -298,24 +298,40 @@ def _smoke_test():
     p.add_argument("--gen_length", type=int, default=128)
     p.add_argument("--block_length", type=int, default=32)
     p.add_argument("--threshold", type=float, default=0.9)
+    p.add_argument("--no_early_stop", action="store_true",
+                   help="Disable EOS-triggered termination + pad fill so you see the full decode")
+    p.add_argument("--show_raw_ids", action="store_true",
+                   help="Print response token IDs before detokenisation")
     args = p.parse_args()
 
     inf = ThinkTalkT3DInference(args.model_path, args.tokenizer_path)
+    print(f"[T3-D] mask_id={inf.mask_id} eos_id={inf.eos_id} pad_id={inf.pad_id}")
     messages = [{"role": "user", "content": args.prompt}]
     prompt_ids = inf.tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True, return_tensors="pt",
     ).to(inf.device)
+    print(f"[T3-D] prompt_length={prompt_ids.shape[1]} prompt_text_preview={args.prompt!r}")
+
     out, stats = generate_t3d(
         inf, prompt_ids,
         gen_length=args.gen_length,
         block_length=args.block_length,
         threshold=args.threshold,
+        early_stop=not args.no_early_stop,
     )
-    text = inf.tokenizer.decode(
-        out[0, prompt_ids.shape[1]:], skip_special_tokens=True,
-    )
-    print(f"[T3-D] think={stats.think_forwards} talk={stats.talk_forwards}")
-    print(f"[T3-D] answer: {text}")
+    response_ids = out[0, prompt_ids.shape[1]:]
+    text = inf.tokenizer.decode(response_ids, skip_special_tokens=True)
+    text_raw = inf.tokenizer.decode(response_ids, skip_special_tokens=False)
+
+    print(f"[T3-D] think_forwards={stats.think_forwards} talk_forwards={stats.talk_forwards}")
+    n_mask = int((response_ids == inf.mask_id).sum().item())
+    n_eos  = int((response_ids == inf.eos_id).sum().item())
+    n_pad  = int((response_ids == inf.pad_id).sum().item())
+    print(f"[T3-D] response composition: total={response_ids.shape[0]} mask={n_mask} eos={n_eos} pad={n_pad}")
+    if args.show_raw_ids:
+        print(f"[T3-D] first 64 response token IDs: {response_ids[:64].tolist()}")
+    print(f"[T3-D] answer (skip_special=True):  {text!r}")
+    print(f"[T3-D] answer (skip_special=False): {text_raw!r}")
 
 
 if __name__ == "__main__":
