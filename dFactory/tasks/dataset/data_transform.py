@@ -15,6 +15,9 @@ def process_mdm_sft_example(
     # noise_range[0] (at progress=0) to noise_range[1] (at progress=1). Without it,
     # sigma is uniform-sampled in [noise_range[0], noise_range[1]] per sample (DMax default).
     progress_state: Optional[Any] = None,
+    # T3-D v2 ADDED: stochastic gate width on sigma (0.0 disables). Per-sample sigma is
+    # drawn uniformly in [ramp_center - gate, ramp_center + gate], clipped to [0, 1].
+    sigma_gate: float = 0.0,
 ) -> List[Dict[str, "torch.Tensor"]]:
     if isinstance(text_keys, str):
         messages = example[text_keys]
@@ -42,10 +45,17 @@ def process_mdm_sft_example(
         maskable_mask=maskable_mask,
         mask_token_id=mask_token_id,
         progress_state=progress_state,
+        sigma_gate=sigma_gate,
     )
 
     loss_mask = noisy_input_ids == mask_token_id
-    # labels[~loss_mask] = -100
+    # T3-D FIX (2026-05-31): the SFT-label leak. Previously commented out (DMax inherited
+    # the bug from its own SFT path; their tokenized path at line 122 has it active). With
+    # same_token_labels=True (v6e config), keeping labels at unmasked response positions
+    # lets the model satisfy CE via identity copy through the tied lm_head/embedding -- no
+    # delta_head pressure, training loss collapses to ~0.098 without real learning.
+    # Restoring the LLaDA paper's masked-token-only objective: loss only at MASK positions.
+    labels[~loss_mask] = -100
 
     eos_id = tokenizer.pad_token_id  # endtoken id
 
@@ -132,7 +142,7 @@ def process_mdm_tokenized_example(
 
 
 
-def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id, progress_state=None):
+def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id, progress_state=None, sigma_gate=0.0):
     """
     Performs a noise transition by masking tokens.
 
@@ -151,6 +161,10 @@ def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id, progres
             The training script writes the current step/total_steps fraction here so each
             worker sees a smoothly-ramped sigma. Without it, behaviour is unchanged
             (per-sample uniform sampling).
+        sigma_gate (float): T3-D v2 stochastic gate width on sigma. When > 0 AND
+            progress_state is provided, per-sample sigma is drawn uniformly from
+            [center - sigma_gate, center + sigma_gate] around the ramp center,
+            clipped to [0, 1]. 0.0 = no gate (deterministic ramp).
 
     Returns:
         torch.Tensor: The sequence after masking.
@@ -163,7 +177,13 @@ def sft_noise_transition(x_0, noise_range, maskable_mask, mask_token_id, progres
         else:
             progress = float(progress_state)
         progress = max(0.0, min(1.0, progress))
-        sigma = noise_range[0] + (noise_range[1] - noise_range[0]) * progress
+        center = noise_range[0] + (noise_range[1] - noise_range[0]) * progress
+        if sigma_gate > 0.0:
+            # T3-D v2 stochastic gate: per-sample sigma in [center - gate, center + gate].
+            sigma = float(torch.empty(1).uniform_(center - sigma_gate, center + sigma_gate).item())
+            sigma = max(0.0, min(1.0, sigma))
+        else:
+            sigma = center
     else:
         t_tensor = torch.rand(1) * (noise_range[1] - noise_range[0]) + noise_range[0]
         sigma = t_tensor.item()

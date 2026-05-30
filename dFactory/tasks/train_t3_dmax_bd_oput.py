@@ -128,15 +128,49 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
     )
     t3_train_iterations: int = field(
         default=1,
-        metadata={"help": "Number of talk-side denoising iterations per grad step. "
-                          "Set >1 for multi-iter training (A4): each step runs N talk "
-                          "forwards through with grad, with reveal between iterations. "
-                          "Loss is the uniform average of per-iter CE."},
+        metadata={"help": "Maximum N for multi-iter training (A4 curriculum endpoint). "
+                          "Acts as a ceiling: per-step N is sampled from "
+                          "[t3_train_iterations_min, t3_train_iterations] +/- "
+                          "t3_n_iter_gate via the stochastic gate. Set =1 to disable "
+                          "multi-iter (same as old single-iter behavior). For the v2 "
+                          "redesign, set =5 with t3_train_iterations_min=2."},
+    )
+    # T3-D v2 ADDED: curriculum lower bound + stochastic gates.
+    t3_train_iterations_min: int = field(
+        default=1,
+        metadata={"help": "Curriculum start for N (iter count). When > 1, per-step N "
+                          "ramps from this to t3_train_iterations across training, with "
+                          "+/- t3_n_iter_gate stochastic sampling per step. Set =2 for "
+                          "the v2 redesign."},
+    )
+    t3_n_iter_gate: int = field(
+        default=1,
+        metadata={"help": "Stochastic gate width on N per step. Per-step N is sampled "
+                          "uniformly from {center-gate, ..., center+gate} and clipped "
+                          "to [1, 7]. Set =1 for the v2 redesign."},
+    )
+    t3_sigma_gate: float = field(
+        default=0.0,
+        metadata={"help": "Stochastic gate width on sigma per step. Per-step sigma is "
+                          "sampled uniformly from [center-gate, center+gate] around the "
+                          "ramp center. Set =0.10 for the v2 redesign. 0.0 disables the "
+                          "gate (sigma = ramp center exactly)."},
+    )
+    t3_rollout_ratio_gate: float = field(
+        default=0.0,
+        metadata={"help": "Stochastic gate width on rollout_ratio per step. Per-step "
+                          "Bernoulli p is sampled uniformly from [center-gate, "
+                          "center+gate] around the ramp center. Set =0.10 for the v2 "
+                          "redesign. 0.0 disables the gate."},
     )
     t3_reveal_threshold: float = field(
         default=0.5,
-        metadata={"help": "Softmax-peak threshold for DMax-uniform reveal (mask path "
-                          "between training iterations). DMax's released code uses 0.5."},
+        metadata={"help": "Softmax-peak threshold for DMax-style reveal. On the mask "
+                          "path (v2 redesign) this drives teacher-forcing (ground truth "
+                          "substituted at masked positions where conf > threshold). On "
+                          "the validation path it still drives the DMax-uniform model-"
+                          "argmax reveal that mirrors inference behavior. DMax's "
+                          "released inference code uses 0.3; training default 0.5."},
     )
     mask_token_id: int = field(
         default=156895,
@@ -315,6 +349,62 @@ def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
     return noisy_kv_ok | clean_kv_ok
 
 
+# T3-D v2 ADDED: per-step curriculum sampler. Returns (centers + samples) for the
+# three-dim ramp (sigma, rollout_ratio, N). Centers are the schedule midpoints; samples
+# include the stochastic gate. Sigma sample drives noise_progress (data workers read it);
+# rollout sample drives the per-step Bernoulli flag override; N sample sets the iter
+# loop bound for the step.
+def _sample_curriculum(progress, args):
+    """progress in [0, 1]; args is T3TrainingArguments. Returns dict with centers + samples."""
+    # Sigma: ramp data.noise_range_low -> data.noise_range_high. Optional ±gate.
+    sigma_center = (
+        args.data.noise_range_low
+        + (args.data.noise_range_high - args.data.noise_range_low) * progress
+    )
+    sigma_gate = float(args.train.t3_sigma_gate)
+    if sigma_gate > 0.0:
+        sigma_sample = float(torch.empty(1).uniform_(
+            sigma_center - sigma_gate, sigma_center + sigma_gate
+        ).item())
+        sigma_sample = max(0.0, min(1.0, sigma_sample))
+    else:
+        sigma_sample = sigma_center
+
+    # Rollout ratio: ramp t3_rollout_ratio_low -> t3_rollout_ratio_high. Optional ±gate.
+    rollout_center = (
+        args.train.t3_rollout_ratio_low
+        + (args.train.t3_rollout_ratio_high - args.train.t3_rollout_ratio_low) * progress
+    )
+    rollout_gate = float(args.train.t3_rollout_ratio_gate)
+    if rollout_gate > 0.0:
+        rollout_sample = float(torch.empty(1).uniform_(
+            rollout_center - rollout_gate, rollout_center + rollout_gate
+        ).item())
+        rollout_sample = max(0.0, min(1.0, rollout_sample))
+    else:
+        rollout_sample = rollout_center
+
+    # N iterations: ramp t3_train_iterations_min -> t3_train_iterations. ±t3_n_iter_gate.
+    n_min = max(1, int(args.train.t3_train_iterations_min))
+    n_max = max(n_min, int(args.train.t3_train_iterations))
+    n_center = n_min + (n_max - n_min) * progress
+    n_gate = int(args.train.t3_n_iter_gate)
+    if n_gate > 0:
+        # integer uniform in [round(center) - gate, round(center) + gate]
+        c = int(round(n_center))
+        lo, hi = c - n_gate, c + n_gate
+        n_sample = int(torch.randint(lo, hi + 1, (1,)).item())
+    else:
+        n_sample = int(round(n_center))
+    n_sample = max(1, min(7, n_sample))
+
+    return {
+        "sigma_center": sigma_center, "sigma_sample": sigma_sample,
+        "rollout_center": rollout_center, "rollout_sample": rollout_sample,
+        "n_center": n_center, "n_sample": n_sample,
+    }
+
+
 # T3-D ADDED: between-iteration reveal helpers (A4 multi-iter training).
 # Both helpers take talk's noisy-half logits and the current noisy input, and return
 # an updated noisy input where some [MASK] positions have been replaced with the model's
@@ -342,8 +432,15 @@ def reveal_dmax_uniform(
     max_probs, argmax_ids = probs.max(dim=-1)        # both [B, L]
     masked = (current_noisy == mask_token_id)         # [B, L]
 
+    # T3-D v2 FIX (2026-05-31): mirror DMax inference's filter (parallel_strategy.py:444):
+    # only masked positions can fail the cutoff. Non-mask positions get an implicit pass
+    # so they never break the prefix prematurely. Before this fix, a low-confidence
+    # unmasked position would gate later masked positions from being revealed -- a silent
+    # divergence from the inference-time reveal rule.
+    effective_conf = torch.where(masked, max_probs, torch.ones_like(max_probs))
+
     num_blocks = L // block_size
-    confident_blocks = (max_probs > threshold).view(B, num_blocks, block_size).long()
+    confident_blocks = (effective_conf > threshold).view(B, num_blocks, block_size).long()
     cum_conf = torch.cumprod(confident_blocks, dim=-1).bool().view(B, L)
     commit_mask = cum_conf & masked                    # [B, L]
 
@@ -381,6 +478,67 @@ def reveal_full_argmax(
     argmax_ids = logits.argmax(dim=-1)
     masked = (current_noisy == mask_token_id)
     return torch.where(masked, argmax_ids, current_noisy)
+
+
+# T3-D v2 ADDED: teacher-forcing reveal for the mask path. Mirrors reveal_dmax_uniform's
+# per-block left-to-right prefix-cutoff structure (with the DMax-aligned mask filter) but
+# substitutes ground-truth tokens from `labels` instead of model argmax. The caller must
+# then write labels[revealed_mask] = -100 BEFORE the next iter's grad forward to avoid
+# the identity-copy leak through tied embeddings.
+#
+# Returns (new_noisy, revealed_mask):
+#   new_noisy:     [B, L] -- current_noisy with ground-truth substituted at revealed positions
+#   revealed_mask: [B, L] -- True at positions just revealed this call (use to mask labels)
+def reveal_teacher_force(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    current_noisy: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    threshold: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, L = current_noisy.shape
+    probs = torch.softmax(logits.float(), dim=-1)
+    max_probs, _ = probs.max(dim=-1)
+    masked = (current_noisy == mask_token_id)
+
+    # DMax-aligned mask filter: non-mask positions never break the cutoff.
+    effective_conf = torch.where(masked, max_probs, torch.ones_like(max_probs))
+
+    num_blocks = L // block_size
+    confident_blocks = (effective_conf > threshold).view(B, num_blocks, block_size).long()
+    cum_conf = torch.cumprod(confident_blocks, dim=-1).bool().view(B, L)
+    commit_mask = cum_conf & masked
+
+    # Per-block leftmost-mask fallback: if a block has masks but no position met the
+    # threshold, force-reveal the leftmost masked position (guarantees progress).
+    any_commit = commit_mask.view(B, num_blocks, block_size).any(dim=-1)        # [B, nb]
+    masked_blocks = masked.view(B, num_blocks, block_size)                       # [B, nb, bs]
+    has_mask = masked_blocks.any(dim=-1)                                         # [B, nb]
+    needs_fallback = (~any_commit) & has_mask                                    # [B, nb]
+    if bool(needs_fallback.any()):
+        first_mask_idx = masked_blocks.long().argmax(dim=-1)                     # [B, nb]
+        block_offset = (
+            torch.arange(num_blocks, device=current_noisy.device) * block_size
+        )                                                                         # [nb]
+        abs_pos = block_offset[None] + first_mask_idx                             # [B, nb]
+        batch_idx = (
+            torch.arange(B, device=current_noisy.device)[:, None]
+            .expand(-1, num_blocks)
+        )                                                                         # [B, nb]
+        flat_b = batch_idx[needs_fallback]
+        flat_p = abs_pos[needs_fallback]
+        fallback_mask = torch.zeros(B, L, dtype=torch.bool, device=current_noisy.device)
+        fallback_mask[flat_b, flat_p] = True
+        commit_mask = commit_mask | fallback_mask
+
+    # Substitute ground-truth from labels at revealed positions. Where labels == -100
+    # (should not occur at masked positions after the line-48 fix, but defensive), keep
+    # the current_noisy value -- the MASK token stays in place rather than getting a
+    # garbage -100 substitution.
+    safe_labels = torch.where(labels != -100, labels, current_noisy)
+    new_noisy = torch.where(commit_mask, safe_labels, current_noisy)
+    return new_noisy, commit_mask
 
 
 # T3-D ADDED: inline validation. Builds a transform with fixed sigma, runs the model
@@ -604,6 +762,23 @@ def _t3d_diagnostic_metrics(model, optimizer):
     except Exception:
         pass
 
+    # T3-D v2 D3: delta_head weight norm. If this stays at 0 throughout training,
+    # talk is not contributing -- the identity-copy bypass is dominating or the
+    # multi-iter A4 loss formulation isn't producing gradient. Healthy curve:
+    # starts at 0 (zero-init), grows above ~0.1 in the first ~5k steps.
+    try:
+        if inner.delta_head is not None:
+            w = inner.delta_head.weight
+            # FSDP: prefer full_tensor view if available; else the local shard is fine
+            # for a directional health metric (zero shard => zero global).
+            if hasattr(w, "full_tensor"):
+                w_full = w.full_tensor()
+                metrics["t3/delta_head_weight_norm"] = float(w_full.detach().norm().item())
+            else:
+                metrics["t3/delta_head_weight_norm"] = float(w.detach().norm().item())
+    except (AttributeError, RuntimeError):
+        pass
+
     return metrics
 
 
@@ -663,6 +838,7 @@ def main():
             noise_range=(args.data.noise_range_low, args.data.noise_range_high),
             mask_token_id=args.train.mask_token_id,  # T3-D MODIFIED: configurable.
             progress_state=noise_progress,  # T3-D ADDED: step-based ramp (None disables it).
+            sigma_gate=args.train.t3_sigma_gate,  # T3-D v2: stochastic gate (0.0 = off).
         )
     elif args.data.data_type == "tokenid":
         transform = partial(
@@ -1044,21 +1220,28 @@ def main():
             # ramp. Workers read this lock-free; some staleness due to prefetch is fine.
             total_steps = max(args.train.train_steps * args.train.num_train_epochs, 1)
             step_progress = min(global_step / total_steps, 1.0)
+
+            # T3-D v2: single sampler returns all three curriculum dims (sigma / rollout /
+            # N) with per-step stochastic gates. Each dim's gate is independently sampled
+            # around its ramp center. Logged below for attribution across the 3-dim ramp.
+            curriculum = _sample_curriculum(step_progress, args)
+
             if noise_progress is not None:
+                # Data workers read this lock-free for their per-sample sigma center.
+                # The actual per-sample sigma includes the t3_sigma_gate ±gate sampling
+                # inside sft_noise_transition (data_transform.py), so the gate is applied
+                # by the worker -- not here. We just advance the schedule progress.
                 noise_progress.value = step_progress
 
-            # T3-D ADDED: compute this step's rollout-flag threshold (used to override the
-            # dataset's per-micro_batch flag value when the ramp is active).
+            # T3-D v2: per-step rollout threshold (post-gate). use_rollout_ramp gate is
+            # still honored for backward compat (disables the ramp entirely if low==high).
             if use_rollout_ramp:
-                rollout_threshold = (
-                    args.train.t3_rollout_ratio_low
-                    + (
-                        args.train.t3_rollout_ratio_high
-                        - args.train.t3_rollout_ratio_low
-                    ) * step_progress
-                )
+                rollout_threshold = curriculum["rollout_sample"]
             else:
                 rollout_threshold = None
+
+            # T3-D v2: per-step N (iter count). Used as the ceiling for the iter loop.
+            n_iters_step = int(curriculum["n_sample"])
 
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -1069,23 +1252,36 @@ def main():
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
+            # T3-D v2: dual-normalizer accounting. Gradient stays at per-iter equal weight
+            # (loss_scaled = ce_iter / (N * num_mb), backward per iter). Reported losses use
+            # per-token mean (total_ce_sum / total_valid_count). See training_redesign_plan
+            # §1.4 for rationale: per-iter grad protects late-iter learning signal; per-token
+            # reporting gives an honest "how well is the model doing per token" number.
+            #
+            # We track both: total_loss is the legacy "mean of mean" used as a fallback
+            # reporting value via all_reduce; sums/counts below produce the true per-token
+            # mean for wandb. Both stay synced through all_reduce in case FSDP shards differ.
             total_loss = 0
-            # T3-D ADDED: split loss logging by OPUT flag.
-            #   flag=False -> "mask path"   : input is the standard masked sequence.
-            #   flag=True  -> "rollout path": input has talk's argmax in place of [MASK]s.
-            # The rollout path is structurally harder (talk's argmax is mostly wrong early),
-            # so loss_rollout_path > loss_mask_path is expected at start. As talk improves
-            # the gap should shrink -- a useful signal independent of the noise ramp.
+            # Per-token mean accumulators (T3-D v2 NEW).
+            total_ce_sum = 0.0
+            total_valid_count = 0
+            # Split by OPUT flag (mask path vs rollout path).
+            ce_mask_sum, valid_mask_count = 0.0, 0
+            ce_rollout_sum, valid_rollout_count = 0.0, 0
+            # Per-iter splits. Array size = curriculum max (so per-step N variation can fit).
+            n_iter_max = max(int(args.train.t3_train_iterations), 1)
+            ce_per_iter_sum = [0.0 for _ in range(n_iter_max)]
+            valid_per_iter_count = [0 for _ in range(n_iter_max)]
+            # D1/D2 region split (T3-D v2 NEW): mask-region vs clean-region CE on iter 0.
+            # D2 should be NaN post-leak-fix (clean region labels are all -100). Non-NaN at
+            # any point => leak regressed. D1 should trend toward LLaDA's baseline.
+            ce_mask_region_sum, mask_region_count = 0.0, 0
+            ce_clean_region_sum, clean_region_count = 0.0, 0
+            # Legacy "mean of mean" accumulators kept for the all_reduce / tqdm postfix path.
             loss_mask_path_sum = 0.0
             loss_mask_path_n = 0
             loss_rollout_path_sum = 0.0
             loss_rollout_path_n = 0
-            # T3-D ADDED: per-iter loss accumulators (A4 multi-iter training).
-            # iter 0 is the first forward (raw masked input or first reveal at flag=True);
-            # iter k is the forward after k reveals. With t3_train_iterations=1 only iter 0
-            # is populated; with N>1 we get a curve per training step that shows whether
-            # later iterations achieve lower loss (the actual hypothesis test for A4).
-            n_iter_max = max(int(args.train.t3_train_iterations), 1)
             loss_per_iter_sum = [0.0 for _ in range(n_iter_max)]
             loss_per_iter_n = [0 for _ in range(n_iter_max)]
             synchronize()
@@ -1162,20 +1358,23 @@ def main():
                 noisy_len = noisy_input_ids.shape[1] if args.train.block_diffusion_mode else micro_batch["input_ids"].shape[1]
 
                 # =====================================================================
-                # T3-D v6e -- MULTI-ITER TRAINING (A4).
+                # T3-D v2 -- MULTI-ITER TRAINING with split iter-1+ reveal.
                 #
-                # Both flag=False (mask path) and flag=True (rollout path) run N talk
-                # forwards with grad. Loss is the uniform mean of per-iter CE.
-                #   think runs once at the start; anchor is reused across all iterations.
-                #   Reveal between iters:
-                #     mask path    -> DMax-uniform (per-block, left-to-right confident
-                #                     prefix, threshold=0.5, with leftmost-mask fallback).
-                #                     Matches DMax inference's reveal rule.
-                #     rollout path -> full argmax (every still-masked position is replaced
-                #                     with the model's argmax). Harder distribution; no
-                #                     confidence gating.
-                # gradients accumulate via backward-per-iter (memory bounded to one iter's
-                # activations at a time).
+                # Iter 0: anchor (no-grad) + optional no-grad talk rollout (flag=True only)
+                #         + grad talk + CE + backward.
+                # Iter 1+:
+                #   mask path (flag=False)   -> teacher-forcing reveal: substitute ground-
+                #                               truth at masked positions where conf > thr
+                #                               (with leftmost-mask fallback). Set labels
+                #                               at revealed positions to -100 to close the
+                #                               identity-copy bypass via tied embeddings.
+                #   rollout path (flag=True) -> full-argmax reveal: model's argmax replaces
+                #                               every masked position. Labels unchanged
+                #                               (OPUT signal -- model has to predict ground
+                #                               truth despite its own past errors at correct
+                #                               or incorrect positions).
+                # Anchor is reused across all iters (talk-only OPUT).
+                # gradients accumulate via backward-per-iter; per-iter equal weight.
                 # =====================================================================
 
                 # 1. Compute anchor once (no-grad). Reused by every iter.
@@ -1186,13 +1385,42 @@ def main():
                         attention_mask=micro_batch["attention_mask"],
                         position_ids=micro_batch["position_ids"],
                     )
+                    # T3-D v2: iter-0 no-grad rollout. ONLY for flag=True. The no-grad talk
+                    # forward produces argmax at masked positions; that argmax overwrites
+                    # the noisy half of input_ids before the grad forward. flag=False
+                    # batches skip this -- saves talk compute roughly proportional to
+                    # (1 - rollout_ratio) of the time.
+                    if flag_bool:
+                        rollout_logits = model.run_talk(
+                            input_ids=micro_batch["input_ids"],
+                            anchor=anchor_cached,
+                            attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"],
+                            attention_mask_3L=micro_batch.get("attention_mask_3L"),
+                            position_ids_3L=micro_batch.get("position_ids_3L"),
+                            attention_mask_L=micro_batch.get("attention_mask_L"),
+                            position_ids_L=micro_batch.get("position_ids_L"),
+                            cross_attention_mask=micro_batch.get("cross_attention_mask"),
+                            cross_position_ids=micro_batch.get("cross_position_ids"),
+                        )
+                        if args.train.block_diffusion_mode:
+                            rollout_noisy_logits = rollout_logits[:, :noisy_len]
+                        else:
+                            rollout_noisy_logits = rollout_logits
+                        rollout_argmax = rollout_noisy_logits.argmax(dim=-1)
+                        current_noisy = micro_batch["input_ids"][:, :noisy_len]
+                        masked_now = current_noisy == args.train.mask_token_id
+                        new_input = micro_batch["input_ids"].clone()
+                        new_input[:, :noisy_len] = torch.where(
+                            masked_now, rollout_argmax, current_noisy
+                        )
+                        micro_batch["input_ids"] = new_input
                 model.train()
 
-                # 2. Pick reveal strategy per flag.
-                reveal_kind = "full_argmax" if flag_bool else "dmax_uniform"
+                # 2. Per-step N comes from the curriculum sampler (clamped to ceiling).
+                n_iters = min(int(n_iters_step), n_iter_max)
 
                 # 3. N grad iterations. Each iter: forward, CE, backward, then no-grad reveal.
-                n_iters = max(int(args.train.t3_train_iterations), 1)
                 for iter_idx in range(n_iters):
                     with model_fwd_context:
                         logits = model.run_talk(
@@ -1219,8 +1447,11 @@ def main():
                                 labels.view(-1),
                                 reduction="none",
                             )
-                            valid = (labels != -100).sum().clamp_min(1)
+                            valid_mask_tensor = labels != -100
+                            valid = valid_mask_tensor.sum().clamp_min(1)
                             ce_iter = unscaled_loss.sum() / valid
+                            iter_ce_sum_val = float(unscaled_loss.sum().item())
+                            iter_valid_count = int(valid_mask_tensor.sum().item())
                         else:
                             shifted_logits = noisy_logits[:, :-1, :].contiguous()
                             shifted_labels = labels[:, 1:].contiguous()
@@ -1229,8 +1460,11 @@ def main():
                                 shifted_labels.view(-1),
                                 reduction="none",
                             )
-                            valid = (shifted_labels != -100).sum().clamp_min(1)
+                            valid_mask_tensor = shifted_labels != -100
+                            valid = valid_mask_tensor.sum().clamp_min(1)
                             ce_iter = unscaled_loss.sum() / valid
+                            iter_ce_sum_val = float(unscaled_loss.sum().item())
+                            iter_valid_count = int(valid_mask_tensor.sum().item())
 
                         # Scale for grad accumulation across iters x micro_batches.
                         loss_scaled = ce_iter / (n_iters * len(micro_batches))
@@ -1238,9 +1472,44 @@ def main():
                     with model_bwd_context:
                         loss_scaled.backward()
 
-                    # Per-iter / per-flag / total loss bookkeeping.
+                    # T3-D v2: per-token accumulators (true per-token mean for reporting).
+                    total_ce_sum += iter_ce_sum_val
+                    total_valid_count += iter_valid_count
+                    ce_per_iter_sum[iter_idx] += iter_ce_sum_val
+                    valid_per_iter_count[iter_idx] += iter_valid_count
+                    if flag_bool:
+                        ce_rollout_sum += iter_ce_sum_val
+                        valid_rollout_count += iter_valid_count
+                    else:
+                        ce_mask_sum += iter_ce_sum_val
+                        valid_mask_count += iter_valid_count
+
+                    # T3-D v2: D1/D2 region split on iter 0 only (matches LLaDA single-iter
+                    # CE convention used by tasks/eval_ce_val.py). At iter 0 the input is
+                    # the original masked sequence (mask path) or the rollout-replaced
+                    # input (rollout path with flag=True). Region attribution uses the
+                    # ORIGINAL noisy_input_ids to be stable across iters.
+                    if iter_idx == 0 and args.train.block_diffusion_mode:
+                        with torch.no_grad():
+                            orig_noisy = noisy_input_ids[:, :].to(labels.device)
+                            if args.train.same_token_labels:
+                                per_pos_loss = unscaled_loss.view(noisy_logits.shape[:2])
+                                lab_2d = labels
+                            else:
+                                per_pos_loss = unscaled_loss.view(shifted_labels.shape)
+                                lab_2d = shifted_labels
+                                orig_noisy = orig_noisy[:, 1:]
+                            valid_2d = lab_2d != -100
+                            mask_region = (orig_noisy == args.train.mask_token_id) & valid_2d
+                            clean_region = (orig_noisy != args.train.mask_token_id) & valid_2d
+                            ce_mask_region_sum += float(per_pos_loss[mask_region].sum().item())
+                            mask_region_count += int(mask_region.sum().item())
+                            ce_clean_region_sum += float(per_pos_loss[clean_region].sum().item())
+                            clean_region_count += int(clean_region.sum().item())
+
+                    # Legacy "mean of mean" trail (kept for all_reduce + tqdm).
                     ce_iter_val = float(ce_iter.item())
-                    total_loss += float(loss_scaled.item())   # sum gives mean CE across iter+mb
+                    total_loss += float(loss_scaled.item())   # legacy reported value
                     loss_per_iter_sum[iter_idx] += ce_iter_val
                     loss_per_iter_n[iter_idx] += 1
                     if flag_bool:
@@ -1254,15 +1523,25 @@ def main():
                     if iter_idx < n_iters - 1:
                         with torch.no_grad():
                             current_noisy = micro_batch["input_ids"][:, :noisy_len]
-                            if reveal_kind == "dmax_uniform":
-                                new_noisy = reveal_dmax_uniform(
+                            if not flag_bool:
+                                # Mask path: teacher-forcing reveal + labels masking.
+                                new_noisy, revealed_mask = reveal_teacher_force(
                                     logits=noisy_logits.detach(),
+                                    labels=labels[:, :noisy_len] if args.train.same_token_labels else labels[:, :noisy_len],
                                     current_noisy=current_noisy,
                                     mask_token_id=args.train.mask_token_id,
                                     block_size=args.train.block_size,
                                     threshold=args.train.t3_reveal_threshold,
                                 )
-                            else:  # full_argmax
+                                # CLOSE the identity-copy leak: at teacher-forced positions,
+                                # labels would equal input (both = ground truth) -> trivial
+                                # 0 loss via tied embedding. Set labels to -100 there.
+                                labels = labels.clone()
+                                labels[:, :noisy_len][revealed_mask] = -100
+                            else:
+                                # Rollout path: full argmax reveal. Labels stay intact --
+                                # the OPUT signal trains the model to predict ground truth
+                                # despite seeing its own (possibly wrong) predictions.
                                 new_noisy = reveal_full_argmax(
                                     logits=noisy_logits.detach(),
                                     current_noisy=current_noisy,
@@ -1288,20 +1567,30 @@ def main():
             if hasattr(grad_norm, "full_tensor"):
                 grad_norm = grad_norm.full_tensor().item()
 
-            total_loss, grad_norm = all_reduce(
-                (total_loss, grad_norm), group=get_parallel_state().fsdp_group,
+            # T3-D v2: compute per-token mean reported loss BEFORE all_reduce.
+            # This replaces the legacy "mean of mean" total_loss for the reported value;
+            # the legacy one stays as a fallback / tqdm postfix.
+            if total_valid_count > 0:
+                reported_loss = total_ce_sum / total_valid_count
+            else:
+                reported_loss = total_loss  # degenerate edge case
+            total_loss, grad_norm, reported_loss = all_reduce(
+                (total_loss, grad_norm, reported_loss), group=get_parallel_state().fsdp_group,
             )
             synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(f"loss: {reported_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0 and args.train.use_wandb:
+                # T3-D v2: training/loss now reports per-token mean (sum CE / sum valid).
+                # The legacy mean-of-mean is preserved as training/loss_legacy for back-compat.
                 train_metrics.update({
-                    "training/loss": total_loss,
+                    "training/loss": reported_loss,
+                    "training/loss_legacy_mean_of_mean": total_loss,
                     "training/grad_norm": grad_norm,
                     "training/lr": lr,
                 })
@@ -1311,24 +1600,32 @@ def main():
                 t3_metrics = _t3d_diagnostic_metrics(model, optimizer)
                 if t3_metrics:
                     train_metrics.update(t3_metrics)
+                # T3-D v2: per-step curriculum centers + sampled values for all three ramp
+                # dims. With three simultaneous ramps these are essential for attribution
+                # if results regress.
+                train_metrics["t3/sigma_center"] = curriculum["sigma_center"]
+                train_metrics["t3/sigma_sampled"] = curriculum["sigma_sample"]
+                train_metrics["t3/rollout_center"] = curriculum["rollout_center"]
+                train_metrics["t3/rollout_sampled"] = curriculum["rollout_sample"]
+                train_metrics["t3/n_iters_sampled"] = curriculum["n_sample"]
+                train_metrics["t3/n_iters_center"] = curriculum["n_center"]
                 if noise_progress is not None:
                     progress = float(noise_progress.value)
-                    sigma = (
-                        args.data.noise_range_low
-                        + (args.data.noise_range_high - args.data.noise_range_low) * progress
-                    )
                     train_metrics["t3/noise_ramp_progress"] = progress
-                    train_metrics["t3/noise_ramp_sigma"] = sigma
-                # T3-D ADDED: per-flag loss split (mask path vs rollout path).
-                # Only logged when this step actually contained micro_batches of that flag
-                # (each global step typically contains both, since flag is randomised
-                # per-sample, but we guard against the all-one-flag edge case).
+                    # Legacy alias for the sigma center (pre-gate).
+                    train_metrics["t3/noise_ramp_sigma"] = curriculum["sigma_center"]
+                # T3-D v2: per-path loss split using per-token mean.
+                if valid_mask_count > 0:
+                    train_metrics["training/loss_mask_path"] = ce_mask_sum / valid_mask_count
+                if valid_rollout_count > 0:
+                    train_metrics["training/loss_rollout_path"] = ce_rollout_sum / valid_rollout_count
+                # Legacy mean-of-mean per-path for back-compat (named *_legacy).
                 if loss_mask_path_n > 0:
-                    train_metrics["training/loss_mask_path"] = (
+                    train_metrics["training/loss_mask_path_legacy"] = (
                         loss_mask_path_sum / loss_mask_path_n
                     )
                 if loss_rollout_path_n > 0:
-                    train_metrics["training/loss_rollout_path"] = (
+                    train_metrics["training/loss_rollout_path_legacy"] = (
                         loss_rollout_path_sum / loss_rollout_path_n
                     )
                 total_micro_n = loss_mask_path_n + loss_rollout_path_n
@@ -1340,16 +1637,34 @@ def main():
                     train_metrics["t3/rollout_flag_rate"] = (
                         loss_rollout_path_n / total_micro_n
                     )
+                # T3-D v2: D1/D2 region split on iter 0. D2 should stay NaN/empty after
+                # the line-48 leak fix (clean-region labels are all -100). If it ever
+                # reports a finite value, the SFT-label leak has regressed -- HALT.
+                if mask_region_count > 0:
+                    train_metrics["training/loss_mask_region"] = (
+                        ce_mask_region_sum / mask_region_count
+                    )
+                if clean_region_count > 0:
+                    # Non-zero here = leak regressed. Diagnostic tripwire.
+                    train_metrics["training/loss_clean_region_LEAK_TRIPWIRE"] = (
+                        ce_clean_region_sum / clean_region_count
+                    )
                 if rollout_threshold is not None:
                     train_metrics["t3/rollout_ratio_target"] = rollout_threshold
-                # T3-D ADDED: per-iter loss curve. With multi-iter training (v6e), each
-                # step contributes one CE per iter per micro_batch; we log the mean CE for
-                # each iter index. If multi-iter is working as intended, loss_iter_0 stays
-                # near baseline while loss_iter_{k>0} drops as talk learns to use the
-                # progressively-revealed input.
+                # T3-D v2: per-iter loss curve using per-token mean.
+                # loss_iter_0 should trend toward LLaDA baseline; loss_iter_{k>0}
+                # diverges per path:
+                #   mask path -> shrinks because revealed (correct) positions are masked
+                #                out of the loss; only still-hard positions remain.
+                #   rollout path -> trains "fix your past errors" -> should drop as model
+                #                   accuracy improves.
                 for i in range(n_iter_max):
-                    if loss_per_iter_n[i] > 0:
+                    if valid_per_iter_count[i] > 0:
                         train_metrics[f"training/loss_iter_{i}"] = (
+                            ce_per_iter_sum[i] / valid_per_iter_count[i]
+                        )
+                    if loss_per_iter_n[i] > 0:
+                        train_metrics[f"training/loss_iter_{i}_legacy"] = (
                             loss_per_iter_sum[i] / loss_per_iter_n[i]
                         )
                 # Log per-step training metrics. (This line was previously displaced into

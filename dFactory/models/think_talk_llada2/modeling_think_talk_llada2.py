@@ -946,7 +946,9 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
     @torch.no_grad()
     def run_talk_block(
         self,
-        block_input_ids: torch.LongTensor,
+        block_input_ids: Optional[torch.LongTensor] = None,
+        *,
+        inputs_embeds: Optional[torch.Tensor] = None,
         anchor_so_far: torch.Tensor,
         block_start: int,
         block_end: int,
@@ -955,28 +957,32 @@ class ThinkTalkLLaDA2ForCausalLM(LLaDA2MoePreTrainedModel):
 
         Args:
           block_input_ids: [B, block_length] noisy tokens for the current block.
+          inputs_embeds:   [B, block_length, D] pre-built embeddings for the block.
+                           Mutually exclusive with block_input_ids. Used by the
+                           DMax-style soft-embedding feed in the diagnostic and in
+                           generate_t3d's threshold-decoder path.
           anchor_so_far:   [B, block_end, D] anchor accumulated over all positions decoded
                            so far (prompt + committed prior blocks + current block).
           block_start, block_end: absolute positions of the current block in `x`.
-
-        Inference simplifications vs `run_talk`:
-          - No doubled sequence. Talk operates on block-only input + a single-L anchor.
-          - No clean-half-leak path, so cross-attn mask is fully open (block b sees
-            anchor at positions [0, block_end), which is exactly block-causal by
-            construction).
-          - Talk self-attn is fully open within the block (matches training's M_BD
-            restricted to a single block).
         """
         if not self.is_hybrid_xattn:
             raise NotImplementedError(
                 "run_talk_block is currently only implemented for hybrid_xattn anchor "
                 "injection mode."
             )
+        if (block_input_ids is None) == (inputs_embeds is None):
+            raise ValueError(
+                "run_talk_block requires exactly one of block_input_ids or inputs_embeds."
+            )
 
-        B, q_len = block_input_ids.shape[:2]
-        device = block_input_ids.device
-
-        talk_embeds = self.model.word_embeddings(block_input_ids)
+        if inputs_embeds is not None:
+            talk_embeds = inputs_embeds
+            B, q_len = inputs_embeds.shape[:2]
+            device = inputs_embeds.device
+        else:
+            talk_embeds = self.model.word_embeddings(block_input_ids)
+            B, q_len = block_input_ids.shape[:2]
+            device = block_input_ids.device
         anchor_block = anchor_so_far[:, block_start:block_end, :].contiguous()
 
         pos_self = torch.arange(block_start, block_end, dtype=torch.long, device=device)
