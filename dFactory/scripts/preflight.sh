@@ -20,26 +20,49 @@ GRN='\033[0;32m'
 YEL='\033[0;33m'
 RST='\033[0m'
 
-pass()  { printf "${GRN}[PASS]${RST} %s\n" "$*"; }
+# Tally counters so the SUMMARY section can report honestly.
+PASS_COUNT=0
+WARN_COUNT=0
+
+pass()  { printf "${GRN}[PASS]${RST} %s\n" "$*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail()  { printf "${RED}[FAIL]${RST} %s\n" "$*"; exit 1; }
-warn()  { printf "${YEL}[WARN]${RST} %s\n" "$*"; }
+warn()  { printf "${YEL}[WARN]${RST} %s\n" "$*"; WARN_COUNT=$((WARN_COUNT + 1)); }
 stage() { printf "\n${YEL}== %s ==${RST}\n" "$*"; }
 
-# Run a pytest invocation, treating exit code 5 (no tests collected -- usually
-# because torch/transformers/tokenizer weren't available) as a soft skip
-# instead of a hard fail. Real test failures still abort the script.
+# Run a pytest invocation and distinguish:
+#   - exit 5 (no tests collected, module-level skip)              -> WARN
+#   - exit 0 with all tests skipped (per-test skips, no passes)   -> WARN
+#   - exit 0 with at least one pass                                -> PASS
+#   - anything else                                                -> FAIL
+# The skip case is reported clearly so the user knows the gate didn't actually
+# verify anything (vs. genuinely passing).
 run_pytest() {
     local label="$1"
     shift
+    local tmpfile
+    tmpfile="$(mktemp)"
     set +e
-    pytest "$@" --tb=short
-    local rc=$?
+    pytest "$@" --tb=short 2>&1 | tee "$tmpfile"
+    local rc="${PIPESTATUS[0]}"
     set -e
     case "$rc" in
-        0) pass "$label" ;;
-        5) warn "$label -- pytest skipped all (torch/tokenizer missing in this env). Re-run in the training env to actually exercise these gates." ;;
-        *) fail "$label -- pytest exited with code $rc" ;;
+        0)
+            # Look at the trailing pytest summary line for "passed".
+            if tail -5 "$tmpfile" | grep -qE '[0-9]+ passed'; then
+                pass "$label"
+            else
+                warn "$label -- all tests SKIPPED (missing deps in this env). The gate did NOT actually verify the invariant. Install the missing deps or re-run from the training env."
+            fi
+            ;;
+        5)
+            warn "$label -- no tests collected (module-level skip). Re-run in the training env."
+            ;;
+        *)
+            rm -f "$tmpfile"
+            fail "$label -- pytest exited with code $rc"
+            ;;
     esac
+    rm -f "$tmpfile"
 }
 
 # --------------------------------------------------------------------------
@@ -91,7 +114,14 @@ PYTHONPATH="dFactory:${PYTHONPATH:-}" \
 # --------------------------------------------------------------------------
 stage "5. SUMMARY"
 # --------------------------------------------------------------------------
-pass "All preflight gates passed. You can proceed to:"
+echo "  PASS: ${PASS_COUNT}"
+echo "  WARN: ${WARN_COUNT}"
+echo
+if [ "$WARN_COUNT" -gt 0 ]; then
+    warn "Some gates did NOT actually verify (skipped due to missing deps). Do NOT retrain until you re-run in an env where those gates can execute."
+    echo
+fi
+echo "Proceed only when all four gates show [PASS]. Then run:"
 echo
 echo "  (5) Diagnostic v2 dry-run on step-45000:"
 echo "      PYTHONPATH=dFactory:dFactory/VeOmni:\$PYTHONPATH python3 \\"
