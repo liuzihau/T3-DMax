@@ -16,7 +16,10 @@ import importlib.util
 import os
 
 import pytest
-import torch
+
+# Skip the whole module if torch isn't installed (dev box without the
+# training env). The training runtime always has torch.
+torch = pytest.importorskip("torch")
 
 
 def _block_diffusion_mask_from_training_script():

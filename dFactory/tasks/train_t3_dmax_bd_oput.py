@@ -59,6 +59,7 @@ from veomni.models.registry import ModelRegistry
 ModelRegistry.register_modeling_path("models.think_talk_llada2")
 
 from dataset.data_transform import process_mdm_tokenized_example, process_mdm_sft_example
+from tasks.curriculum import sample_curriculum as _sample_curriculum_impl  # noqa: E402
 from dataset import build_local_dataset
 import random
 
@@ -349,60 +350,23 @@ def talk_cross_attn_mask(q_idx, kv_idx, block_size, n):
     return noisy_kv_ok | clean_kv_ok
 
 
-# T3-D v2 ADDED: per-step curriculum sampler. Returns (centers + samples) for the
-# three-dim ramp (sigma, rollout_ratio, N). Centers are the schedule midpoints; samples
-# include the stochastic gate. Sigma sample drives noise_progress (data workers read it);
-# rollout sample drives the per-step Bernoulli flag override; N sample sets the iter
-# loop bound for the step.
+# T3-D v2 ADDED: per-step curriculum sampler. Thin adapter around
+# tasks.curriculum.sample_curriculum so the implementation can be unit-tested
+# without pulling in this trainer's VeOmni / FSDP imports.
 def _sample_curriculum(progress, args):
     """progress in [0, 1]; args is T3TrainingArguments. Returns dict with centers + samples."""
-    # Sigma: ramp data.noise_range_low -> data.noise_range_high. Optional ±gate.
-    sigma_center = (
-        args.data.noise_range_low
-        + (args.data.noise_range_high - args.data.noise_range_low) * progress
+    return _sample_curriculum_impl(
+        progress,
+        noise_range_low=args.data.noise_range_low,
+        noise_range_high=args.data.noise_range_high,
+        sigma_gate=args.train.t3_sigma_gate,
+        rollout_low=args.train.t3_rollout_ratio_low,
+        rollout_high=args.train.t3_rollout_ratio_high,
+        rollout_gate=args.train.t3_rollout_ratio_gate,
+        n_min=args.train.t3_train_iterations_min,
+        n_max=args.train.t3_train_iterations,
+        n_gate=args.train.t3_n_iter_gate,
     )
-    sigma_gate = float(args.train.t3_sigma_gate)
-    if sigma_gate > 0.0:
-        sigma_sample = float(torch.empty(1).uniform_(
-            sigma_center - sigma_gate, sigma_center + sigma_gate
-        ).item())
-        sigma_sample = max(0.0, min(1.0, sigma_sample))
-    else:
-        sigma_sample = sigma_center
-
-    # Rollout ratio: ramp t3_rollout_ratio_low -> t3_rollout_ratio_high. Optional ±gate.
-    rollout_center = (
-        args.train.t3_rollout_ratio_low
-        + (args.train.t3_rollout_ratio_high - args.train.t3_rollout_ratio_low) * progress
-    )
-    rollout_gate = float(args.train.t3_rollout_ratio_gate)
-    if rollout_gate > 0.0:
-        rollout_sample = float(torch.empty(1).uniform_(
-            rollout_center - rollout_gate, rollout_center + rollout_gate
-        ).item())
-        rollout_sample = max(0.0, min(1.0, rollout_sample))
-    else:
-        rollout_sample = rollout_center
-
-    # N iterations: ramp t3_train_iterations_min -> t3_train_iterations. ±t3_n_iter_gate.
-    n_min = max(1, int(args.train.t3_train_iterations_min))
-    n_max = max(n_min, int(args.train.t3_train_iterations))
-    n_center = n_min + (n_max - n_min) * progress
-    n_gate = int(args.train.t3_n_iter_gate)
-    if n_gate > 0:
-        # integer uniform in [round(center) - gate, round(center) + gate]
-        c = int(round(n_center))
-        lo, hi = c - n_gate, c + n_gate
-        n_sample = int(torch.randint(lo, hi + 1, (1,)).item())
-    else:
-        n_sample = int(round(n_center))
-    n_sample = max(1, min(7, n_sample))
-
-    return {
-        "sigma_center": sigma_center, "sigma_sample": sigma_sample,
-        "rollout_center": rollout_center, "rollout_sample": rollout_sample,
-        "n_center": n_center, "n_sample": n_sample,
-    }
 
 
 # T3-D ADDED: between-iteration reveal helpers (A4 multi-iter training).
