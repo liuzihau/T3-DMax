@@ -42,7 +42,10 @@ run_pytest() {
     local tmpfile
     tmpfile="$(mktemp)"
     set +e
-    pytest "$@" --tb=short 2>&1 | tee "$tmpfile"
+    # Use `python -m pytest` (not bare `pytest`) so we run in the same interpreter
+    # whose `import` we're testing -- avoids the case where pytest's shebang env
+    # has different installed packages than the conda env the user activated.
+    python3 -m pytest "$@" --tb=short 2>&1 | tee "$tmpfile"
     local rc="${PIPESTATUS[0]}"
     set -e
     case "$rc" in
