@@ -607,27 +607,37 @@ def _run_validation(
             clean_region = (original_noisy_flat != mask_token_id) & valid_flat
 
             current_input_ids = full_ids
-            for iter_idx in range(n_iter_max):
-                kwargs = {
-                    "input_ids": current_input_ids,
-                    "attention_mask": attn_mask_2L,
-                    "position_ids": pos_2L,
-                    "use_cache": False,
-                    "output_router_logits": False,
-                }
-                if attn_mask_3L is not None:
-                    kwargs["attention_mask_3L"] = attn_mask_3L
-                    kwargs["position_ids_3L"] = torch.cat(
-                        [noisy_pos, noisy_pos, clean_pos], dim=0,
-                    ).unsqueeze(0)
-                if attn_mask_L is not None:
-                    kwargs["attention_mask_L"] = attn_mask_L
-                    kwargs["position_ids_L"] = pos_L
-                    kwargs["cross_attention_mask"] = cross_attn_mask
-                    kwargs["cross_position_ids"] = cross_pos
 
-                out = model(**kwargs)
-                logits = out.logits
+            # T3-D v2 FIX (2026-05-31): validation must mirror training/inference's
+            # anchor-once pattern -- compute anchor on the ORIGINAL masked input via
+            # run_think_and_anchor, then loop with run_talk reusing the cached anchor.
+            # Previously this loop called model(**kwargs) at every iter, which recomputes
+            # the anchor from the modified input. The frozen LLaDA think backbone wasn't
+            # trained on partially-revealed noisy inputs -> OOD -> garbage anchor ->
+            # near-uniform logits at iter >= 1 (CE explodes to ~log(V) = ~11.96).
+            anchor_cached = model.run_think_and_anchor(
+                input_ids=full_ids,
+                attention_mask=attn_mask_2L,
+                position_ids=pos_2L,
+            )
+            position_ids_3L = (
+                torch.cat([noisy_pos, noisy_pos, clean_pos], dim=0).unsqueeze(0)
+                if attn_mask_3L is not None else None
+            )
+
+            for iter_idx in range(n_iter_max):
+                logits = model.run_talk(
+                    input_ids=current_input_ids,
+                    anchor=anchor_cached,
+                    attention_mask=attn_mask_2L,
+                    position_ids=pos_2L,
+                    attention_mask_3L=attn_mask_3L,
+                    position_ids_3L=position_ids_3L,
+                    attention_mask_L=attn_mask_L,
+                    position_ids_L=pos_L if attn_mask_L is not None else None,
+                    cross_attention_mask=cross_attn_mask,
+                    cross_position_ids=cross_pos if attn_mask_L is not None else None,
+                )
                 noisy_logits = logits[:, :L]
 
                 per_pos = torch.nn.functional.cross_entropy(
