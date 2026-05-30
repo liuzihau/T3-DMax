@@ -401,9 +401,11 @@ def print_convergence_summary(
     print(f"[conv] position-level agreement (decode region): {n_agree}/{n_decode} = {agreement:.1%}")
 
     # Per-position KL averaged over decode region.
+    # base/t3d_logits_final are [1, block_length, V]; squeeze the batch dim so the
+    # [block_length] decode_region_mask can index cleanly.
     base_logp = F.log_softmax(base_logits_final.float(), dim=-1)
     t3d_logp = F.log_softmax(t3d_logits_final.float(), dim=-1)
-    kl_per_pos = (base_logp.exp() * (base_logp - t3d_logp)).sum(dim=-1)
+    kl_per_pos = (base_logp.exp() * (base_logp - t3d_logp)).sum(dim=-1).squeeze(0)  # [L]
     kl_decode = kl_per_pos[decode_region_mask]
     if kl_decode.numel() > 0:
         print(f"[conv] mean KL(BASE || T3D) over decode region: {float(kl_decode.mean().item()):.4f}")
