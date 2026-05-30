@@ -85,6 +85,7 @@ train:
   save_epochs: 0
   empty_cache_steps: 10
   t3_val_every: 0                       # skip validation during smoke
+  t3_val_sigmas: "0.80,0.95"            # match training sigma range (was "0.5,0.75")
   # ======================
 
   # Distributed -- single GPU, DDP wrap is a no-op
