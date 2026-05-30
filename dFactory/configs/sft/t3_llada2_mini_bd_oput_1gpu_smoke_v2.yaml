@@ -23,9 +23,10 @@
 #   - t3_val_every: 0 (skip validation during smoke)
 #   - empty_cache_steps: 10
 #   - output_dir + wandb_name: marked _v2_smoke
-#   - data.noise_range: 0.65/0.95 -> 0.75/0.95 (v2 endpoints; bumped up after the
-#     first smoke run revealed LLaDA already gives ~94% confidence at sigma=0.50
-#     on this in-distribution SFT data, leaving talk no learning headroom)
+#   - data.noise_range: 0.65/0.95 -> 0.80/1.00 (v2 endpoints; iterated upward from
+#     0.50/0.90 because LLaDA already gives ~94% confidence at sigma=0.50 on this
+#     in-distribution SFT data. 0.75/0.95 gave loss 0.3-0.6, still easy. 0.80/1.00
+#     targets a harder regime where talk has real iter-conditional refinement work.)
 #   - train.t3_rollout_ratio: 0.65/0.95 -> 0.20/0.60 (v2 endpoints)
 #   - train.t3_train_iterations_min: 2 (NEW; v6e was fixed N=5)
 #   - train.t3_sigma_gate: 0.10 (NEW)
@@ -63,12 +64,16 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75                 # v2 ramp start (was 0.50; bumped up because
-                                        # LLaDA already solves >94% at sigma=0.5 on this
-                                        # SFT distribution -- no learning headroom for talk.
-                                        # 0.75 puts iter 0 closer to LLaDA's failure mode
-                                        # where talk + delta_head can do meaningful work.)
-  noise_range_high: 0.95                # v2 ramp end (was 0.90)
+  noise_range_low: 0.80                 # v2 ramp start. Bumped up over iterations:
+                                        # 0.50 -> 94% LLaDA confidence (no headroom)
+                                        # 0.75 -> loss 0.3-0.6 (some headroom, still easy)
+                                        # 0.80 -> targeting harder regime where talk has
+                                        #         room to learn iter-conditional refinement.
+  noise_range_high: 1.00                # v2 ramp end. At sigma=1.0 every maskable position
+                                        # is masked -> matches inference's iter-0 input
+                                        # distribution; talk has to do real work to denoise.
+                                        # With t3_sigma_gate=0.10, samples late in training
+                                        # range over [0.90, 1.10] clipped to [0.90, 1.00].
   num_workers: 16
 
 train:
