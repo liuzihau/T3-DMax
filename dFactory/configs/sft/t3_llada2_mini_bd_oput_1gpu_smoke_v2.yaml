@@ -1,0 +1,153 @@
+# T3-D v2 SMOKE (post leak-fix + redesign).
+#
+# Purpose: 20-step end-to-end validation of the v2 training redesign before
+# committing to a long run. Exercises:
+#   - line-48 SFT-label leak fix (data_transform.py:48)
+#   - iter-0 gated no-grad rollout (talk runs twice on flag=True only)
+#   - iter-1+ mask path teacher-forcing reveal + labels = -100 step
+#   - iter-1+ rollout path full-argmax reveal (labels intact)
+#   - 3-dim curriculum (sigma, rollout_ratio, N) with stochastic gates
+#   - per-token mean reporting (training/loss) + legacy mean-of-mean alongside
+#   - D1/D2 region-split tripwires (loss_clean_region_LEAK_TRIPWIRE must stay absent/NaN)
+#   - D3 delta_head_weight_norm logged each step
+#
+# Do NOT use the resulting checkpoint for eval -- it's 20 steps; the model
+# hasn't learned anything yet. The point is "does the pipeline run".
+#
+# Architecture = v6e (hybrid_xattn + 4-layer talk + frozen lm_head + zero-init
+# delta head). Comes from the same model_config dir as v6e.
+#
+# Differences from t3_llada2_mini_bd_oput_1gpu.yaml:
+#   - max_steps: 20
+#   - save_steps: 1000 (skip checkpoint save during smoke)
+#   - t3_val_every: 0 (skip validation during smoke)
+#   - empty_cache_steps: 10
+#   - output_dir + wandb_name: marked _v2_smoke
+#   - data.noise_range: 0.65/0.95 -> 0.50/0.90 (v2 redesign endpoints)
+#   - train.t3_rollout_ratio: 0.65/0.95 -> 0.20/0.60 (v2 endpoints)
+#   - train.t3_train_iterations_min: 2 (NEW; v6e was fixed N=5)
+#   - train.t3_sigma_gate: 0.10 (NEW)
+#   - train.t3_rollout_ratio_gate: 0.10 (NEW)
+#   - train.t3_n_iter_gate: 1 (NEW)
+#
+# Everything else identical to t3_llada2_mini_bd_oput_1gpu.yaml.
+
+model:
+  config_path: ./configs/model_configs/think_talk_llada2_mini_frozen_think_xattn_talk4
+  model_path: ../LLaDA2.0-mini-moe-merge
+  tokenizer_path: ../LLaDA2.0-mini-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+  # Visibility only -- model_config dir is the source of truth (VeOmni argparse drops these).
+  talk_num_layers: 4
+  talk_hidden_size: -1
+  talk_num_attention_heads: -1
+  talk_num_key_value_heads: -1
+  talk_intermediate_size: -1
+  anchor_fuser_type: last_only
+  anchor_layers: "last"
+  anchor_conditioning: gated_residual
+  anchor_gate_init: -2.0
+  prune_think_last_n_layer: 0
+  train_think: false
+  train_talk: true
+  train_lm_head: false
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.50                 # v2 ramp start
+  noise_range_high: 0.90                # v2 ramp end (capped below 1.0)
+  num_workers: 16
+
+train:
+  output_dir: ./outputs/t3d_1gpu_v2_smoke_20step
+
+  # === SMOKE-SPECIFIC ===
+  max_steps: 20                         # tight cap; ~3-5 min at v6e rate
+  save_steps: 1000                      # effectively skip checkpoint save
+  save_epochs: 0
+  empty_cache_steps: 10
+  t3_val_every: 0                       # skip validation during smoke
+  # ======================
+
+  # Distributed -- single GPU, DDP wrap is a no-op
+  data_parallel_mode: ddp
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1                   # max_steps preempts
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+
+  # Optimiser
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.005
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Memory -- single-GPU
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  broadcast_model_weights_from_rank0: false
+  enable_full_determinism: false
+
+  # Checkpointing
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_hf_weights: true
+
+  # Block diffusion (matches DMax)
+  block_diffusion_mode: true
+  block_size: 32
+  same_token_labels: true
+
+  # === T3-D v2 CURRICULUM ===
+  # 3-dim ramp with stochastic gates. See training_redesign_plan.md §1.3.
+  t3_rollout_mode: dmax_oput
+  t3_rollout_target: talk_only          # think runs ONCE per step (anchor cached)
+  t3_rollout_replace: all_masked
+  t3_reveal_threshold: 0.5              # teacher-force confidence gate (mask path)
+  mask_token_id: 156895
+
+  # N curriculum: per-step N sampled from {center-1, center, center+1}, clipped
+  # to [1, 7]. Center linearly ramps n_min -> max across training.
+  t3_train_iterations: 5                # curriculum ceiling
+  t3_train_iterations_min: 2            # curriculum start
+  t3_n_iter_gate: 1                     # +/- 1 per step
+
+  # Sigma curriculum: center ramps noise_range_low -> high; per-sample sigma
+  # drawn uniformly from [center - sigma_gate, center + sigma_gate], clipped to [0,1].
+  t3_sigma_gate: 0.10
+
+  # Rollout-ratio curriculum: Bernoulli p ramps low -> high; per-step p drawn
+  # uniformly from [center - rollout_ratio_gate, center + rollout_ratio_gate].
+  t3_rollout_ratio_low: 0.20
+  t3_rollout_ratio_high: 0.60
+  t3_rollout_ratio_gate: 0.10
+  # =========================
+
+  # Logging
+  use_wandb: true
+  wandb_project: T3-DMax
+  wandb_name: t3d_v2_smoke_20step
+  log_steps: 1
