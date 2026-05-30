@@ -107,22 +107,25 @@ def baseline_forward(model, input_ids, attn_mask):
 
 
 @torch.no_grad()
-def t3d_forward(model, input_ids, attn_mask, anchor_cached=None):
-    """T3-D path on single-L input. Returns (logits, anchor).
+def t3d_forward(model, input_ids, attn_mask, block_start, block_end, anchor_cached=None):
+    """T3-D path. Returns (logits_for_current_block, anchor).
 
-    If anchor_cached is None: compute fresh anchor from think on this input
-    (with the block-causal `attn_mask`).
-    Otherwise: skip think; use the provided cached anchor and only run talk.
+    Think runs over the FULL sequence (once per block at inference). Anchor is
+    therefore [1, L, D] covering every position. Talk re-embeds ONLY the
+    current block [block_start:block_end), its query position_ids are
+    [block_start..block_end), and its cross-attn K/V is anchor[:, :block_end]
+    (the prefix-plus-current-block anchor that block-b queries are allowed to
+    see under block-causal).
 
-    Talk's self-attn at inference is block-diagonal (within-block bidirectional)
-    -- matches the L self-attn mask used at training. We rebuild it here.
-    Cross-attn from talk noisy-q to the (single-L) anchor uses block-causal
-    too -- at inference there's no clean half, so the L-by-2L training mask
-    collapses to the same block-causal L-by-L pattern.
+    Returned logits have shape [1, block_length, V] -- predictions for the
+    current block only. Caller maps them back to absolute positions for the
+    argmax-update step.
     """
     L = input_ids.shape[1]
+    block_length = block_end - block_start
     device = input_ids.device
 
+    # ---- 1. Anchor (full sequence) -----------------------------------------
     if anchor_cached is None:
         think_out = model.model(
             input_ids=input_ids,
@@ -133,51 +136,76 @@ def t3d_forward(model, input_ids, attn_mask, anchor_cached=None):
             output_router_logits=False,
             return_dict=True,
         )
-        anchor = model.anchor_fuser(think_out.hidden_states)
+        anchor = model.anchor_fuser(think_out.hidden_states)   # [1, L, D]
     else:
         anchor = anchor_cached
 
-    pos = torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)
-    talk_embeds = model.model.word_embeddings(input_ids)
+    # ---- 2. Talk on current block ONLY -------------------------------------
+    block_ids = input_ids[:, block_start:block_end]            # [1, block_length]
+    talk_embeds = model.model.word_embeddings(block_ids)
 
-    # Talk self-attn mask: block-diagonal (each block sees only itself,
-    # bidirectional within). Cross-attn mask: block-causal (block b sees
-    # anchor positions at blocks <= b). We derive both from `attn_mask`
-    # (which is the block-causal mask the caller built for think).
-    if attn_mask is not None:
-        allowed_bc = attn_mask[0, 0].eq(0)                  # [L, L] bool, True=allowed
-        block_diag = allowed_bc & allowed_bc.T              # symmetric closure = block-diag
-        self_attn_mask = torch.zeros(1, 1, L, L, dtype=attn_mask.dtype, device=device)
-        self_attn_mask.masked_fill_(~block_diag, float("-inf"))
-    else:
-        self_attn_mask = None
+    # Query position_ids = absolute positions of the current block (same as
+    # think used for those positions; "retrieve from think" => share absolute pos).
+    pos_self = torch.arange(
+        block_start, block_end, device=device, dtype=torch.long,
+    ).unsqueeze(0)
 
+    # Anchor for gated residual at layer 0: only this block's anchor slice.
+    anchor_block = anchor[:, block_start:block_end, :].contiguous()
+
+    # Cross-attn K/V: anchor over [0, block_end). Block-causal at the block
+    # level: queries in block b can see anchor at blocks [0..b], so for a
+    # single-block query the visible K/V is exactly the prefix-plus-current
+    # range and no further masking is needed.
+    anchor_kv = anchor[:, :block_end, :].contiguous()
+    pos_cross_kv = torch.arange(
+        0, block_end, device=device, dtype=torch.long,
+    ).unsqueeze(0)
+
+    # Talk self-attn within block: full attention (block-diagonal trivially
+    # holds when the input is exactly one block long).
     talk_hidden = model.talk_model(
         inputs_embeds=talk_embeds,
-        anchor=anchor,
-        attention_mask=self_attn_mask,
-        position_ids=pos,
-        anchor_kv=anchor,
-        cross_attention_mask=attn_mask,    # block-causal L-by-L
-        cross_position_ids=pos,
+        anchor=anchor_block,
+        attention_mask=None,
+        position_ids=pos_self,
+        anchor_kv=anchor_kv,
+        cross_attention_mask=None,
+        cross_position_ids=pos_cross_kv,
     )
 
     if model.delta_head is not None:
-        talk_hidden = anchor + model.delta_head(talk_hidden)
+        talk_hidden = anchor_block + model.delta_head(talk_hidden)
     elif getattr(model.config, "add_anchor_skip_residual", False):
-        talk_hidden = talk_hidden + anchor
+        talk_hidden = talk_hidden + anchor_block
 
     return model.lm_head(talk_hidden), anchor
 
 
-def print_compare(label, base_ids, t3d_ids, tokenizer, n_show=32):
-    n_diff = int((base_ids != t3d_ids).sum().item())
-    n_total = base_ids.shape[0]
-    print(f"[{label}] divergence: {n_diff}/{n_total} positions differ between baseline and t3d")
-    print(f"[{label}] baseline IDs[:{n_show}]: {base_ids[:n_show].tolist()}")
-    print(f"[{label}]      t3d IDs[:{n_show}]: {t3d_ids[:n_show].tolist()}")
-    base_text = tokenizer.decode(base_ids, skip_special_tokens=False)
-    t3d_text = tokenizer.decode(t3d_ids, skip_special_tokens=False)
+def print_compare(label, base_block_ids, t3d_block_ids, mask_positions_in_block,
+                  block_input_ids, tokenizer):
+    """Compare baseline vs t3d at the current block.
+
+    base_block_ids / t3d_block_ids: [block_length] argmax over the block's positions.
+    mask_positions_in_block: bool [block_length], True at positions that are still
+                              [MASK] in this iteration (i.e., the decode region).
+    block_input_ids: [block_length] the actual input the model just saw at the block
+                      (prompt tokens + current mask/committed state).
+    """
+    bl = base_block_ids.shape[0]
+    n_diff_all = int((base_block_ids != t3d_block_ids).sum().item())
+    n_mask = int(mask_positions_in_block.sum().item())
+    if n_mask > 0:
+        n_diff_mask = int(((base_block_ids != t3d_block_ids) & mask_positions_in_block).sum().item())
+    else:
+        n_diff_mask = 0
+    print(f"[{label}] block_input:    {block_input_ids.tolist()}")
+    print(f"[{label}] mask positions: {mask_positions_in_block.long().tolist()}")
+    print(f"[{label}] baseline argmax:{base_block_ids.tolist()}")
+    print(f"[{label}]      t3d argmax:{t3d_block_ids.tolist()}")
+    print(f"[{label}] divergence: {n_diff_all}/{bl} all positions, {n_diff_mask}/{n_mask} at originally-mask positions")
+    base_text = tokenizer.decode(base_block_ids, skip_special_tokens=False)
+    t3d_text  = tokenizer.decode(t3d_block_ids, skip_special_tokens=False)
     print(f"[{label}] baseline decoded: {base_text!r}")
     print(f"[{label}]      t3d decoded: {t3d_text!r}")
 
@@ -217,7 +245,15 @@ def main():
     raw_L = P + args.gen_length
     L = ((raw_L + args.block_length - 1) // args.block_length) * args.block_length
 
-    # Initial sequence: prompt + MASK * (L - prompt_length).
+    # Block-aligned first decode block (DMax convention,
+    # generate_uniform.py:196-200 / utils.py:_get_first_block_start with
+    # start_block_align=True). The first decode block can OVERLAP with the
+    # prompt tail; those overlapping positions are NOT part of the decode
+    # region -- only the [MASK] positions inside the block get committed.
+    block_start = (P // args.block_length) * args.block_length
+    block_end = block_start + args.block_length
+
+    # Initial sequence: prompt + MASK * (L - P).
     x = torch.full((1, L), MASK_ID, dtype=torch.long, device=args.device)
     x[:, :P] = prompt_ids
 
@@ -225,44 +261,70 @@ def main():
 
     print(f"[diag] mask_id={MASK_ID}  prompt_length={P}  gen_length={args.gen_length}  block_length={args.block_length}  L_total={L}")
     print(f"[diag] prompt: {tokenizer.decode(prompt_ids[0], skip_special_tokens=False)!r}")
+    print(f"[diag] first decode block: [{block_start}, {block_end})  -- contains {block_end - max(P, block_start)} mask positions and {max(P, block_start) - block_start} prompt-tail tokens")
     print(f"[diag] delta_head present: {model.delta_head is not None}")
     print(f"[diag] add_anchor_skip_residual: {getattr(model.config, 'add_anchor_skip_residual', False)}")
     print(f"[diag] attn_mask: block-causal at block_length={args.block_length}  (matches training)")
 
+    # Decode-region mask within the block: positions that started as [MASK] in iter 0.
+    mask_positions_in_block = (x[0, block_start:block_end] == MASK_ID)
+
+    current_input = x.clone()
+
     # ------------------------------------------------------------------ iter 0
     print("\n" + "=" * 80)
-    print("ITER 0  |  input = prompt + MASK*gen_length  (anchor is computed FRESH here)")
+    print("ITER 0  |  block input = prompt-tail + MASKs  (anchor computed FRESH here)")
     print("=" * 80)
 
-    base_logits = baseline_forward(model, x, attn_mask)
-    base_ids_iter0 = base_logits[0, P:].argmax(dim=-1)
+    base_logits = baseline_forward(model, current_input, attn_mask)
+    base_block_ids_iter0 = base_logits[0, block_start:block_end].argmax(dim=-1)
 
-    t3d_logits, anchor_cached = t3d_forward(model, x, attn_mask, anchor_cached=None)
-    t3d_ids_iter0 = t3d_logits[0, P:].argmax(dim=-1)
+    t3d_block_logits, anchor_cached = t3d_forward(
+        model, current_input, attn_mask, block_start, block_end, anchor_cached=None,
+    )
+    t3d_block_ids_iter0 = t3d_block_logits[0].argmax(dim=-1)
 
-    print_compare("iter 0", base_ids_iter0, t3d_ids_iter0, tokenizer)
+    print_compare(
+        "iter 0", base_block_ids_iter0, t3d_block_ids_iter0,
+        mask_positions_in_block, current_input[0, block_start:block_end],
+        tokenizer,
+    )
+
+    # Advance: at the originally-mask positions, write baseline's iter-0
+    # argmax into the input. Prompt-tail positions stay untouched.
+    next_block = current_input[0, block_start:block_end].clone()
+    next_block[mask_positions_in_block] = base_block_ids_iter0[mask_positions_in_block]
+    current_input[0, block_start:block_end] = next_block
 
     # ------------------------------------------------------------------ iters 1..N
-    # The next iter's input is the BASELINE's previous argmax — same input for
-    # both paths so divergence at iter k > 0 is attributable to talk/delta_head.
-    current_input = x.clone()
-    current_input[0, P:] = base_ids_iter0
-
+    # Each iter uses baseline's previous argmax (at the decode-region positions)
+    # as the new block input. Anchor stays cached from iter 0 (matches the
+    # T3-D design: think runs ONCE per block, talk runs N iters with the cached
+    # anchor and the progressively-revealed input).
     for k in range(1, args.n_iters + 1):
         print("\n" + "=" * 80)
-        print(f"ITER {k}  |  input = prompt + baseline_iter{k-1}_argmax  (anchor REUSED from iter 0)")
+        print(f"ITER {k}  |  block input updated with baseline_iter{k-1}_argmax at mask positions  (anchor REUSED from iter 0)")
         print("=" * 80)
 
         base_logits = baseline_forward(model, current_input, attn_mask)
-        base_ids = base_logits[0, P:].argmax(dim=-1)
+        base_block_ids = base_logits[0, block_start:block_end].argmax(dim=-1)
 
-        t3d_logits, _ = t3d_forward(model, current_input, attn_mask, anchor_cached=anchor_cached)
-        t3d_ids = t3d_logits[0, P:].argmax(dim=-1)
+        t3d_block_logits, _ = t3d_forward(
+            model, current_input, attn_mask, block_start, block_end,
+            anchor_cached=anchor_cached,
+        )
+        t3d_block_ids = t3d_block_logits[0].argmax(dim=-1)
 
-        print_compare(f"iter {k}", base_ids, t3d_ids, tokenizer)
+        print_compare(
+            f"iter {k}", base_block_ids, t3d_block_ids,
+            mask_positions_in_block, current_input[0, block_start:block_end],
+            tokenizer,
+        )
 
-        # Advance: use this iter's baseline argmax for the next iter
-        current_input[0, P:] = base_ids
+        # Advance for next iter.
+        next_block = current_input[0, block_start:block_end].clone()
+        next_block[mask_positions_in_block] = base_block_ids[mask_positions_in_block]
+        current_input[0, block_start:block_end] = next_block
 
 
 if __name__ == "__main__":
