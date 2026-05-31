@@ -5,20 +5,18 @@
 #
 # Asks the fair question for T3-D: given the static anchor + REVEALED NEIGHBORS,
 # can a LIGHTWEIGHT block-level model recover the converged tokens (the flips)?
+# We train a small transformer (masked denoising of the converged block,
+# conditioned on the anchor), and a NO-anchor control (tokens only).
 #
-# We train a small transformer that takes embed(current token) [+ proj(anchor)]
-# and predicts the converged block via masked denoising: reveal a random fraction
-# of decode positions with their CORRECT converged token, mask the rest, predict
-# the masked ones (leak-free; targets are MASK in the input).
-#
-# CRITICAL CONTROL: we train TWO models -- with-anchor and NO-anchor (tokens
-# only). The no-anchor model is the sanity check + the real answer:
-#   - if no-anchor acc RISES with reveal, the pipeline genuinely uses neighbors;
-#   - its flip_recovery vs the per-position anchor-only baseline (~10%) tells us
-#     whether the flips live in within-block neighbors at all.
-#   The with-anchor model is prone to "anchor laziness" (ignoring the variably-
-#   present reveals because the anchor is always there) -> flat acc across reveal
-#   is that artifact, NOT evidence that the static anchor is bounded.
+# DIAGNOSTIC INSTRUMENTATION: we report per-epoch TRAIN ce + TRAIN acc, and a
+# side-by-side TRAIN-vs-VAL acc / flip_recovery table at each reveal level. The
+# key tell:
+#   - TRAIN acc RISES with reveal but VAL flat  -> model DOES learn to use
+#     neighbors, just overfits (1222 blocks) -> the fix is MORE DATA, and it
+#     means neighbors genuinely carry the flips (relevant for T3-D).
+#   - TRAIN acc ALSO flat with reveal           -> model ignores neighbors even
+#     on train (anchor is a sufficient shortcut, or tokens-only can't learn the
+#     neighbor function from this little data) -> deeper issue, not just data.
 
 import argparse
 
@@ -59,8 +57,21 @@ class AnchorRefiner(nn.Module):
         return self.head(self.encoder(h))
 
 
+EVAL_MS = [1.0, 0.75, 0.5, 0.25]
+
+
+def build_fixed_masks(dm, blk, dev, seed):
+    """Per reveal-level m, a fixed bernoulli(m) mask over decode positions."""
+    g = torch.Generator(device=dev).manual_seed(seed)
+    B = dm.shape[0]
+    masks = {}
+    for m in EVAL_MS:
+        masks[m] = (torch.rand(B, blk, device=dev, generator=g) < m) & dm
+    return masks
+
+
 def main():
-    p = argparse.ArgumentParser(description="Premise probe Variant B — block refiner + no-anchor control")
+    p = argparse.ArgumentParser(description="Premise probe Variant B — fit + train/val diagnostics")
     p.add_argument("--data", required=True)
     p.add_argument("--val_frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
@@ -92,17 +103,28 @@ def main():
     A_tr, A_va = anchor[tr].to(dev), anchor[va].to(dev)
     y_tr, y_va = yc[tr].to(dev), yc[va].to(dev)
     dm_tr, dm_va = decode_mask[tr].to(dev), decode_mask[va].to(dev)
-    arg0_va = arg0c[va].to(dev)
+    arg0_tr, arg0_va = arg0c[tr].to(dev), arg0c[va].to(dev)
     print(f"[probe-b] train={int(tr.sum())} blocks  val={int(va.sum())} blocks  "
           f"({len(torch.unique(group[tr]))}/{len(torch.unique(group[va]))} prompts)")
 
-    EVAL_MS = [1.0, 0.75, 0.5, 0.25]
-    eval_gen = torch.Generator(device=dev).manual_seed(args.seed + 1)
-    eval_masks = {}   # m -> mask_sel for val blocks (shared across both models)
-    Bv = A_va.shape[0]
-    for m in EVAL_MS:
-        rho = torch.full((Bv, 1), m, device=dev)
-        eval_masks[m] = (torch.rand(Bv, blk, device=dev, generator=eval_gen) < rho) & dm_va
+    masks_tr = build_fixed_masks(dm_tr, blk, dev, args.seed + 2)
+    masks_va = build_fixed_masks(dm_va, blk, dev, args.seed + 1)
+
+    @torch.no_grad()
+    def metrics(model, A, y_, arg0_, masks):
+        """Returns {m: (acc, flip_recovery)} over the given dataset + fixed masks."""
+        model.eval()
+        out = {}
+        for m in EVAL_MS:
+            ms = masks[m]
+            inp = y_.clone(); inp[ms] = MASKc
+            pred = model(inp, A).argmax(-1)
+            corr = (pred == y_) & ms
+            acc = corr.sum().item() / max(ms.sum().item(), 1)
+            flip = ms & (arg0_ != y_)
+            fr = ((pred == y_) & flip).sum().item() / max(flip.sum().item(), 1)
+            out[m] = (acc, fr)
+        return out
 
     def train_model(use_anchor):
         torch.manual_seed(args.seed)
@@ -110,9 +132,11 @@ def main():
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
         gen = torch.Generator(device=dev).manual_seed(args.seed + (0 if use_anchor else 7))
         n = A_tr.shape[0]
+        tag = "anchor" if use_anchor else "tokens"
         for ep in range(args.epochs):
             model.train()
             perm = torch.randperm(n, device=dev)
+            ce_sum, corr_sum, tok_sum = 0.0, 0, 0
             for i in range(0, n, args.batch_size):
                 idx = perm[i:i + args.batch_size]
                 rho = torch.rand(idx.numel(), 1, device=dev, generator=gen) * 0.85 + 0.10
@@ -122,70 +146,62 @@ def main():
                 tgt = y_tr[idx].clone(); tgt[~mask_sel] = -100
                 loss = F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1), ignore_index=-100)
                 opt.zero_grad(); loss.backward(); opt.step()
-            if (ep + 1) % 20 == 0:
-                model.eval()
-                with torch.no_grad():
-                    ms = eval_masks[0.5]
-                    inp = y_va.clone(); inp[ms] = MASKc
-                    pred = model(inp, A_va).argmax(-1)
-                    acc = ((pred == y_va) & ms).sum().item() / max(ms.sum().item(), 1)
-                print(f"    [{'anchor' if use_anchor else 'tokens-only'}] epoch {ep+1}/{args.epochs}  val_acc@m0.5={acc:.3f}")
+                nmask = int(mask_sel.sum().item())
+                ce_sum += loss.item() * nmask; tok_sum += nmask
+                corr_sum += int(((logits.argmax(-1) == y_tr[idx]) & mask_sel).sum().item())
+            if (ep + 1) % 10 == 0 or ep == 0:
+                tr_ce = ce_sum / max(tok_sum, 1)
+                tr_acc = corr_sum / max(tok_sum, 1)
+                print(f"    [{tag}] epoch {ep+1:>3}/{args.epochs}  train_ce={tr_ce:.3f}  "
+                      f"train_acc@randmask={tr_acc:.3f}")
         return model
 
-    @torch.no_grad()
-    def eval_curve(model, label):
-        model.eval()
-        print(f"\n  {label}:   {'mask m':>7} {'revealed':>9} {'acc':>8} {'flip_recovery':>14}")
-        out = {}
+    def print_table(model, label):
+        mt = metrics(model, A_tr, y_tr, arg0_tr, masks_tr)
+        mv = metrics(model, A_va, y_va, arg0_va, masks_va)
+        print(f"\n  {label}:")
+        print(f"    {'m':>5} {'revealed':>9} {'TRAIN_acc':>10} {'VAL_acc':>9} {'TRAIN_flipR':>12} {'VAL_flipR':>10}")
         for m in EVAL_MS:
-            ms = eval_masks[m]
-            inp = y_va.clone(); inp[ms] = MASKc
-            pred = model(inp, A_va).argmax(-1)
-            acc = ((pred == y_va) & ms).sum().item() / max(ms.sum().item(), 1)
-            flip = ms & (arg0_va != y_va)
-            fr = ((pred == y_va) & flip).sum().item() / max(flip.sum().item(), 1)
-            out[m] = (acc, fr)
-            print(f"  {'':>{len(label)}}    {m:>7.2f} {1-m:>9.2f} {acc:>8.1%} {fr:>14.1%}")
-        return out
+            print(f"    {m:>5.2f} {1-m:>9.2f} {mt[m][0]:>10.1%} {mv[m][0]:>9.1%} "
+                  f"{mt[m][1]:>12.1%} {mv[m][1]:>10.1%}")
+        return mt, mv
 
     print("\n[probe-b] training WITH-anchor model ...")
     m_anchor = train_model(True)
     print("[probe-b] training NO-anchor (tokens-only) CONTROL ...")
     m_tokens = train_model(False)
 
-    print("\n" + "=" * 76)
-    print("PREMISE PROBE — VARIANT B  (per-position anchor-only baseline flip_recovery ~10%)")
-    print("=" * 76)
-    res_a = eval_curve(m_anchor, "with-anchor")
-    res_t = eval_curve(m_tokens, "tokens-only")
-    print("=" * 76)
+    print("\n" + "=" * 78)
+    print("VARIANT B — TRAIN vs VAL  (per-position anchor-only baseline flip_recovery ~10%)")
+    print("=" * 78)
+    at_tr, at_va = print_table(m_anchor, "with-anchor")
+    tt_tr, tt_va = print_table(m_tokens, "tokens-only")
+    print("=" * 78)
 
-    # ---- verdict (centered on the tokens-only control) ----
-    na_acc_lift = res_t[0.25][0] - res_t[1.0][0]     # does revealing neighbors raise acc?
-    na_flip_hi = res_t[0.25][1]                       # flips recoverable with 75% neighbors?
-    a_acc_lift = res_a[0.25][0] - res_a[1.0][0]
+    # ---- verdict using the TRAIN-vs-reveal tell ----
+    def lift(d):
+        return d[0.25][0] - d[1.0][0]          # acc gain from revealing 75% vs 0%
     print("VERDICT")
-    print(f"  tokens-only acc lift (m=1.0 -> 0.25): {na_acc_lift:+.1%}   "
-          f"with-anchor acc lift: {a_acc_lift:+.1%}")
-    if na_acc_lift < 0.05:
-        print("  ⚠️ PIPELINE WARNING: even the tokens-only control barely uses revealed neighbors")
-        print("  (acc ~flat across reveal). The masking/attention path is suspect — investigate the")
-        print("  probe before drawing ANY conclusion about the anchor.")
-    elif na_flip_hi >= 0.40:
-        print(f"  NEIGHBORS CARRY THE FLIPS: tokens-only recovers {na_flip_hi:.0%} of flips at 75%")
-        print("  reveal (vs ~10% anchor-only per-position). So the flips ARE within-block recoverable")
-        print("  -> a properly-trained talk CAN get them -> v2's 0% is a TRAINING/instantiation")
-        print("  problem, not a static-anchor bound. Do NOT pivot to anchor-refresh yet; fix talk.")
-        if a_acc_lift < 0.05:
-            print("  (The with-anchor model went anchor-lazy — flat acc — so ignore its flatness.)")
-    elif na_flip_hi <= 0.20:
-        print(f"  FLIPS NOT IN NEIGHBORS: even tokens-only with 75% of the correct block revealed")
-        print(f"  recovers only {na_flip_hi:.0%} of flips. They need cross-block / global info the")
-        print("  static block lacks -> the think-once anchor is genuinely bounded -> anchor-refresh.")
+    print(f"  TRAIN acc lift (m1.0->0.25): anchor={lift(at_tr):+.1%}  tokens-only={lift(tt_tr):+.1%}")
+    print(f"  VAL   acc lift (m1.0->0.25): anchor={lift(at_va):+.1%}  tokens-only={lift(tt_va):+.1%}")
+    tok_train_uses_nbrs = lift(tt_tr) >= 0.10
+    tok_val_uses_nbrs = lift(tt_va) >= 0.05
+    if tok_train_uses_nbrs and not tok_val_uses_nbrs:
+        print("  -> TOKENS-ONLY learns to use neighbors on TRAIN but not VAL = OVERFIT (1222 blocks).")
+        print("     The mechanism works; neighbors DO carry signal. Scale the data (more prompts)")
+        print("     and/or init token embeddings from the frozen model, then the val curve should")
+        print(f"     move. TRAIN flip_recovery@m0.25={tt_tr[0.25][1]:.0%} is the optimistic ceiling.")
+    elif not tok_train_uses_nbrs:
+        print("  -> TOKENS-ONLY doesn't use neighbors even on TRAIN (flat train acc across reveal).")
+        print("     A from-scratch transformer can't learn the neighbor function from ~39k tokens.")
+        print("     This probe is too small to answer the question -> need much more data, OR pivot")
+        print("     to the parameter-free refresh probe / the real retrain.")
     else:
-        print(f"  MIDDLING: tokens-only recovers {na_flip_hi:.0%} of flips at 75% reveal. Neighbors")
-        print("  help partially; anchor-refresh likely still needed for the hard flips. Prototype it.")
-    print("=" * 76)
+        print("  -> TOKENS-ONLY uses neighbors on BOTH train and val. Read its VAL flip_recovery@m0.25")
+        print(f"     = {tt_va[0.25][1]:.0%} vs anchor-only ~10%: that's the real recoverability signal.")
+    print(f"  (with-anchor TRAIN acc lift {lift(at_tr):+.1%}: near-zero => the anchor is a sufficient")
+    print("   per-position shortcut, so that model never needs neighbors — expected, not a bug.)")
+    print("=" * 78)
 
 
 if __name__ == "__main__":
