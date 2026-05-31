@@ -69,8 +69,7 @@ def main():
     args = p.parse_args()
 
     tok_path = args.tokenizer_path or args.model_path
-    if os.path.isdir(tok_path):
-        tok_path = os.path.abspath(tok_path)
+    tok_path = os.path.abspath(tok_path)   # HF rejects '..' paths; normalize unconditionally
     tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     model = load_t3d_model(args.model_path, args.device)
     print(f"[gsm8k-t3d] delta_head present: {model.delta_head is not None}  "

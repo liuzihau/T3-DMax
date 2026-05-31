@@ -27,7 +27,7 @@ DINFER_PYTHON="${T3DMAX_ROOT}/dInfer/python"
 DFACTORY_ROOT="${T3DMAX_ROOT}/dFactory"
 
 MODEL_PATH="${MODEL_PATH:-${DFACTORY_ROOT}/outputs/${RUN_NAME}/checkpoints/global_step_${STEP}/hf_ckpt}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-${T3DMAX_ROOT}/../LLaDA2.0-mini-moe-merge}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${T3DMAX_ROOT}/LLaDA2.0-mini-moe-merge}"
 OUTPUT_DIR="${OUTPUT_DIR:-${EVAL_DIR}/outputs/gsm8k_t3d/${RUN_NAME}_step${STEP}}"
 
 GEN_LENGTH="${GEN_LENGTH:-256}"

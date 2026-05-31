@@ -49,8 +49,7 @@ GSM8K_USER_TEMPLATE = "Question: {question}\nLet's think step by step\nAnswer:"
 def load_full_model(path, device):
     """Plain LLaDA2/DMax CausalLM exposing `.model` (-> last_hidden_state) and
     `.lm_head`. AutoModelForCausalLM first; falls back to dFactory LLaDA2MoeModelLM."""
-    if os.path.isdir(path):
-        path = os.path.abspath(path)
+    path = os.path.abspath(path)   # HF rejects '..' paths; normalize unconditionally
     try:
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
@@ -170,8 +169,7 @@ def main():
     args = p.parse_args()
 
     tok_path = args.tokenizer_path or args.model_path
-    if os.path.isdir(tok_path):
-        tok_path = os.path.abspath(tok_path)
+    tok_path = os.path.abspath(tok_path)   # HF rejects '..' paths; normalize unconditionally
     tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     model = load_full_model(args.model_path, args.device)
 

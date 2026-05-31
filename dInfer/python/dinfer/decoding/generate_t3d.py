@@ -158,8 +158,9 @@ def load_t3d_model(model_path, device="cuda"):
     from models.think_talk_llada2.configuration_think_talk_llada2 import ThinkTalkLLaDA2Config
     from models.think_talk_llada2.modeling_think_talk_llada2 import ThinkTalkLLaDA2ForCausalLM
 
-    if os.path.isdir(model_path):
-        model_path = os.path.abspath(model_path)
+    # Always normalize: HF rejects any path containing '..' (it treats it as a
+    # repo id -> HFValidationError). abspath collapses '..' lexically.
+    model_path = os.path.abspath(model_path)
     config = ThinkTalkLLaDA2Config.from_pretrained(model_path)
     if not str(config.model_type).endswith("_veomni"):
         config.model_type = str(config.model_type) + "_veomni"
