@@ -1,6 +1,15 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
+# ⚠️ DEPRECATED (2026-06-01). Superseded by the standalone DMax-style path:
+#   eval_t3d_gsm8k.py (decode) + val_gsm8k.py (grade), driven by eval_t3d_mini.sh.
+# This lm-eval wrapper drove the OLD generate_t3d signature (the inference-shim /
+# hard-token / prompt-relative decode). generate_t3d is now the canonical
+# soft-embedding decode_uniform and takes the RAW model, not the shim — so this
+# file will NOT run as-is. Kept only as the lm-eval-harness integration sketch
+# for when the vllm port lands; port the generate_until call to
+# `generate_t3d(self.inference.model, prompt_ids, ...)` before reviving it.
+#
 # lm-evaluation-harness wrapper for T3-D. Mirrors the role of DMax's
 # `eval_dinfer.py` / `eval_dinfer_sglang.py` but stays single-process and
 # single-GPU -- no vllm/sglang, no CUDA graphs, no tensor parallel.
