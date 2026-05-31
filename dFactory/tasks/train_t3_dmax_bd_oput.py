@@ -173,6 +173,16 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
                           "argmax reveal that mirrors inference behavior. DMax's "
                           "released inference code uses 0.3; training default 0.5."},
     )
+    t3_single_step: bool = field(
+        default=False,
+        metadata={"help": "T3-D v3 SINGLE-STEP mode. Per block: think decodes iter-0 "
+                          "(left-to-right DMax-uniform commit at t3_reveal_threshold), then "
+                          "talk runs ONCE to predict ground truth at ALL originally-masked "
+                          "positions (committed + still-masked, so talk can fix think's "
+                          "errors). No multi-iter, no OPUT rollout. Use sigma fixed at 1.0 "
+                          "(noise_range_low=high=1.0). Diagnostic: does train loss drop and "
+                          "val acc (esp. val/acc_still_masked) hold for the real talk."},
+    )
     mask_token_id: int = field(
         default=156895,
         metadata={"help": "LLaDA-2.0-mini's [MASK] token id."},
@@ -515,6 +525,134 @@ def reveal_teacher_force(
 # iter_{1..N-1} are post-reveal: input has talk's argmax committed at high-confidence
 # positions. These tell us whether multi-iter is actually producing iter-conditional
 # refinement (iter_last_CE < iter_0_CE) or just stuck at iter-0 behavior.
+@torch.no_grad()
+def _run_validation_single_step(
+    model,
+    val_raw_examples,
+    val_indices,
+    sigmas,
+    *,
+    tokenizer,
+    max_seq_len,
+    block_size,
+    mask_token_id,
+    text_keys,
+    reveal_threshold,
+    block_diffusion_attn_mask_prototype,
+    block_diffusion_attn_mask_prototype_3L,
+    talk_self_attn_mask_prototype_L,
+    talk_cross_attn_mask_prototype,
+    device,
+):
+    """T3-D v3 SINGLE-STEP validation: think iter-0 decode_uniform commit -> talk ONCE.
+    Mirrors the single-step training step. Reports CE + accuracy split into:
+      - committed   : positions think decoded at iter 0 (partly identity-copy; watch acc)
+      - still_masked: positions talk must fill from anchor + committed context -- talk's
+                      LEAK-FREE job; `val/acc_still_masked` is the number that matters.
+    Plus `val/think_commit_*` so you can see how much / how well think pre-decoded."""
+    model.eval()
+    L = max_seq_len
+    noisy_pos = torch.arange(L, dtype=torch.long, device=device)
+    clean_pos = torch.arange(L, dtype=torch.long, device=device)
+    pos_2L = torch.cat([noisy_pos, clean_pos], dim=0).unsqueeze(0)
+    pos_L = noisy_pos.unsqueeze(0)
+    cross_pos = torch.cat([noisy_pos, clean_pos], dim=0).unsqueeze(0)
+
+    attn_mask_2L = block_diffusion_attn_mask_prototype.to(device, non_blocking=True)
+    attn_mask_3L = (
+        block_diffusion_attn_mask_prototype_3L.to(device, non_blocking=True)
+        if block_diffusion_attn_mask_prototype_3L is not None else None
+    )
+    attn_mask_L = (
+        talk_self_attn_mask_prototype_L.to(device, non_blocking=True)
+        if talk_self_attn_mask_prototype_L is not None else None
+    )
+    cross_attn_mask = (
+        talk_cross_attn_mask_prototype.to(device, non_blocking=True)
+        if talk_cross_attn_mask_prototype is not None else None
+    )
+    position_ids_3L = (
+        torch.cat([noisy_pos, noisy_pos, clean_pos], dim=0).unsqueeze(0)
+        if attn_mask_3L is not None else None
+    )
+
+    metrics = {}
+    for sigma in sigmas:
+        transform = partial(
+            process_mdm_sft_example,
+            tokenizer=tokenizer, max_seq_len=max_seq_len, text_keys=text_keys,
+            noise_range=(sigma, sigma), mask_token_id=mask_token_id, progress_state=None,
+        )
+        ce_comm, n_comm, corr_comm = 0.0, 0, 0
+        ce_still, n_still, corr_still = 0.0, 0, 0
+        think_committed, think_correct = 0, 0
+        for idx in val_indices:
+            try:
+                transformed = transform(val_raw_examples[idx])[0]
+            except Exception:
+                continue
+            noisy = transformed["noisy_input_ids"]
+            clean = transformed["input_ids"]
+            labels = transformed["labels"]
+            full_ids = torch.cat([noisy, clean], dim=0).unsqueeze(0).to(device)
+            labels_dev = labels.unsqueeze(0).to(device)          # [1, L]
+            pre_commit = noisy.unsqueeze(0).to(device)            # [1, L]
+
+            anchor = model.run_think_and_anchor(
+                input_ids=full_ids, attention_mask=attn_mask_2L, position_ids=pos_2L,
+            )
+            # think iter-0 commit (last_only fuser -> lm_head(anchor) = think logits).
+            think_logits = model.lm_head(anchor[:, :L])
+            committed = reveal_dmax_uniform(
+                logits=think_logits, current_noisy=pre_commit,
+                mask_token_id=mask_token_id, block_size=block_size, threshold=reveal_threshold,
+            )
+            new_full = full_ids.clone()
+            new_full[:, :L] = committed
+            logits = model.run_talk(
+                input_ids=new_full, anchor=anchor,
+                attention_mask=attn_mask_2L, position_ids=pos_2L,
+                attention_mask_3L=attn_mask_3L, position_ids_3L=position_ids_3L,
+                attention_mask_L=attn_mask_L, position_ids_L=pos_L if attn_mask_L is not None else None,
+                cross_attention_mask=cross_attn_mask,
+                cross_position_ids=cross_pos if attn_mask_L is not None else None,
+            )
+            noisy_logits = logits[:, :L]
+            per_pos = torch.nn.functional.cross_entropy(
+                noisy_logits.reshape(-1, noisy_logits.shape[-1]), labels_dev.reshape(-1),
+                reduction="none", ignore_index=-100,
+            ).view(1, L)
+            pred = noisy_logits.argmax(dim=-1)                    # [1, L]
+            valid = labels_dev != -100
+            committed_pos = (committed != mask_token_id) & (pre_commit == mask_token_id)
+            still_pos = (committed == mask_token_id) & valid
+            comm_valid = committed_pos & valid
+
+            ce_comm += float(per_pos[comm_valid].sum().item()); n_comm += int(comm_valid.sum().item())
+            ce_still += float(per_pos[still_pos].sum().item()); n_still += int(still_pos.sum().item())
+            corr_comm += int(((pred == labels_dev) & comm_valid).sum().item())
+            corr_still += int(((pred == labels_dev) & still_pos).sum().item())
+            think_committed += int(committed_pos.sum().item())
+            think_correct += int(((committed == labels_dev) & committed_pos).sum().item())
+
+        key = f"sigma_{sigma:.2f}"
+        if n_still > 0:
+            metrics[f"val/ce_still_masked_{key}"] = ce_still / n_still
+            metrics[f"val/acc_still_masked_{key}"] = corr_still / n_still
+        if n_comm > 0:
+            metrics[f"val/ce_committed_{key}"] = ce_comm / n_comm
+            metrics[f"val/acc_committed_{key}"] = corr_comm / n_comm
+        n_all = n_still + n_comm
+        if n_all > 0:
+            metrics[f"val/ce_overall_{key}"] = (ce_still + ce_comm) / n_all
+            metrics[f"val/acc_overall_{key}"] = (corr_still + corr_comm) / n_all
+        if think_committed > 0:
+            metrics[f"val/think_commit_acc_{key}"] = think_correct / think_committed
+            metrics[f"val/think_commit_frac_{key}"] = think_committed / max(n_all, 1)
+    model.train()
+    return metrics
+
+
 @torch.no_grad()
 def _run_validation(
     model,
@@ -1156,21 +1294,37 @@ def main():
     # Baseline validation (step 0, before any training).
     if val_enabled:
         logger.info_rank0("[T3-D val] Running baseline validation (step 0)...")
-        _val_metrics = _run_validation(
-            model, val_raw_examples, val_indices, val_sigmas,
-            tokenizer=tokenizer,
-            max_seq_len=args.data.max_seq_len,
-            block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
-            mask_token_id=args.train.mask_token_id,
-            text_keys=args.data.text_keys,
-            n_iters=args.train.t3_train_iterations,
-            reveal_threshold=args.train.t3_reveal_threshold,
-            block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
-            block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
-            talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
-            talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
-            device=get_device_type(),
-        )
+        if args.train.t3_single_step:
+            _val_metrics = _run_validation_single_step(
+                model, val_raw_examples, val_indices, val_sigmas,
+                tokenizer=tokenizer,
+                max_seq_len=args.data.max_seq_len,
+                block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+                mask_token_id=args.train.mask_token_id,
+                text_keys=args.data.text_keys,
+                reveal_threshold=args.train.t3_reveal_threshold,
+                block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+                block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+                talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+                talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+                device=get_device_type(),
+            )
+        else:
+            _val_metrics = _run_validation(
+                model, val_raw_examples, val_indices, val_sigmas,
+                tokenizer=tokenizer,
+                max_seq_len=args.data.max_seq_len,
+                block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+                mask_token_id=args.train.mask_token_id,
+                text_keys=args.data.text_keys,
+                n_iters=args.train.t3_train_iterations,
+                reveal_threshold=args.train.t3_reveal_threshold,
+                block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+                block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+                talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+                talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+                device=get_device_type(),
+            )
         logger.info_rank0(f"[T3-D val] step 0: {_val_metrics}")
         if args.train.use_wandb:
             wandb.log(_val_metrics, step=0)
@@ -1251,6 +1405,11 @@ def main():
             # any point => leak regressed. D1 should trend toward LLaDA's baseline.
             ce_mask_region_sum, mask_region_count = 0.0, 0
             ce_clean_region_sum, clean_region_count = 0.0, 0
+            # T3-D v3 single-step accumulators (only populated when t3_single_step). Reuses
+            # ce_mask_region_* for still-masked CE; these add the committed split + think/talk acc.
+            ce_committed_sum, committed_count = 0.0, 0
+            think_commit_total, think_correct_total = 0, 0
+            talk_correct_still_total, talk_still_total = 0, 0
             # Legacy "mean of mean" accumulators kept for the all_reduce / tqdm postfix path.
             loss_mask_path_sum = 0.0
             loss_mask_path_n = 0
@@ -1330,6 +1489,85 @@ def main():
                 else:
                     flag_bool = bool(flag.item()) if flag is not None else False
                 noisy_len = noisy_input_ids.shape[1] if args.train.block_diffusion_mode else micro_batch["input_ids"].shape[1]
+
+                # =====================================================================
+                # T3-D v3 SINGLE-STEP: think decodes iter-0 (left-to-right DMax-uniform
+                # commit at t3_reveal_threshold), then talk runs ONCE to predict ground
+                # truth at ALL originally-masked positions (committed + still-masked).
+                # No multi-iter, no OPUT rollout. Self-contained -> `continue` past the v2
+                # path. sigma is expected fixed at 1.0 via config.
+                # =====================================================================
+                if args.train.t3_single_step:
+                    model.eval()
+                    with torch.no_grad():
+                        anchor_cached = model.run_think_and_anchor(
+                            input_ids=micro_batch["input_ids"],
+                            attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"],
+                        )
+                        # think iter-0 logits (last_only fuser => lm_head(anchor) = think pred).
+                        think_logits_noisy = model.lm_head(anchor_cached[:, :noisy_len])
+                        pre_commit_noisy = micro_batch["input_ids"][:, :noisy_len].clone()
+                        committed_noisy = reveal_dmax_uniform(
+                            logits=think_logits_noisy,
+                            current_noisy=pre_commit_noisy,
+                            mask_token_id=args.train.mask_token_id,
+                            block_size=args.train.block_size,
+                            threshold=args.train.t3_reveal_threshold,
+                        )
+                        new_input = micro_batch["input_ids"].clone()
+                        new_input[:, :noisy_len] = committed_noisy
+                        micro_batch["input_ids"] = new_input
+                    model.train()
+
+                    with model_fwd_context:
+                        logits = model.run_talk(
+                            input_ids=micro_batch["input_ids"],
+                            anchor=anchor_cached.detach(),
+                            attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"],
+                            attention_mask_3L=micro_batch.get("attention_mask_3L"),
+                            position_ids_3L=micro_batch.get("position_ids_3L"),
+                            attention_mask_L=micro_batch.get("attention_mask_L"),
+                            position_ids_L=micro_batch.get("position_ids_L"),
+                            cross_attention_mask=micro_batch.get("cross_attention_mask"),
+                            cross_position_ids=micro_batch.get("cross_position_ids"),
+                        )
+                        noisy_logits = logits[:, :noisy_len].contiguous()
+                        unscaled_loss = torch.nn.functional.cross_entropy(
+                            noisy_logits.view(-1, noisy_logits.shape[-1]),
+                            labels.view(-1),
+                            reduction="none",
+                        )
+                        valid_mask_tensor = labels != -100
+                        valid = valid_mask_tensor.sum().clamp_min(1)
+                        ce_iter = unscaled_loss.sum() / valid
+                        loss_scaled = ce_iter / len(micro_batches)
+                    with model_bwd_context:
+                        loss_scaled.backward()
+
+                    # Metrics: per-token mean (training/loss) + committed/still-masked split.
+                    total_ce_sum += float(unscaled_loss.sum().item())
+                    total_valid_count += int(valid_mask_tensor.sum().item())
+                    total_loss += float(loss_scaled.item())
+                    with torch.no_grad():
+                        per_pos = unscaled_loss.view(noisy_logits.shape[0], noisy_logits.shape[1])
+                        committed_pos = (committed_noisy != args.train.mask_token_id) & (
+                            pre_commit_noisy == args.train.mask_token_id)
+                        still_pos = (committed_noisy == args.train.mask_token_id) & valid_mask_tensor
+                        comm_valid = committed_pos & valid_mask_tensor
+                        # ce_mask_region_* reused for STILL-MASKED CE (-> training/loss_mask_region).
+                        ce_mask_region_sum += float(per_pos[still_pos].sum().item())
+                        mask_region_count += int(still_pos.sum().item())
+                        ce_committed_sum += float(per_pos[comm_valid].sum().item())
+                        committed_count += int(comm_valid.sum().item())
+                        think_commit_total += int(committed_pos.sum().item())
+                        think_correct_total += int(((committed_noisy == labels) & committed_pos).sum().item())
+                        talk_pred = noisy_logits.argmax(dim=-1)
+                        talk_correct_still_total += int(((talk_pred == labels) & still_pos).sum().item())
+                        talk_still_total += int(still_pos.sum().item())
+                    del micro_batch
+                    continue
 
                 # =====================================================================
                 # T3-D v2 -- MULTI-ITER TRAINING with split iter-1+ reveal.
@@ -1615,9 +1853,18 @@ def main():
                 # the line-48 leak fix (clean-region labels are all -100). If it ever
                 # reports a finite value, the SFT-label leak has regressed -- HALT.
                 if mask_region_count > 0:
+                    # In single-step mode this is the STILL-MASKED CE (talk's leak-free job).
                     train_metrics["training/loss_mask_region"] = (
                         ce_mask_region_sum / mask_region_count
                     )
+                # T3-D v3 single-step splits (only populated when t3_single_step).
+                if committed_count > 0:
+                    train_metrics["training/loss_committed"] = ce_committed_sum / committed_count
+                if think_commit_total > 0:
+                    train_metrics["t3/think_commit_frac"] = think_commit_total / max(total_valid_count, 1)
+                    train_metrics["t3/think_commit_acc"] = think_correct_total / think_commit_total
+                if talk_still_total > 0:
+                    train_metrics["t3/talk_acc_still_masked"] = talk_correct_still_total / talk_still_total
                 if clean_region_count > 0:
                     # Non-zero here = leak regressed. Diagnostic tripwire.
                     train_metrics["training/loss_clean_region_LEAK_TRIPWIRE"] = (
@@ -1651,21 +1898,37 @@ def main():
             # Always logs as `val/ce_*` on the same step as training metrics so wandb
             # plots them together.
             if val_enabled and global_step % args.train.t3_val_every == 0:
-                _val_metrics = _run_validation(
-                    model, val_raw_examples, val_indices, val_sigmas,
-                    tokenizer=tokenizer,
-                    max_seq_len=args.data.max_seq_len,
-                    block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
-                    mask_token_id=args.train.mask_token_id,
-                    text_keys=args.data.text_keys,
-                    n_iters=args.train.t3_train_iterations,
-                    reveal_threshold=args.train.t3_reveal_threshold,
-                    block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
-                    block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
-                    talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
-                    talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
-                    device=get_device_type(),
-                )
+                if args.train.t3_single_step:
+                    _val_metrics = _run_validation_single_step(
+                        model, val_raw_examples, val_indices, val_sigmas,
+                        tokenizer=tokenizer,
+                        max_seq_len=args.data.max_seq_len,
+                        block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+                        mask_token_id=args.train.mask_token_id,
+                        text_keys=args.data.text_keys,
+                        reveal_threshold=args.train.t3_reveal_threshold,
+                        block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+                        block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+                        talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+                        talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+                        device=get_device_type(),
+                    )
+                else:
+                    _val_metrics = _run_validation(
+                        model, val_raw_examples, val_indices, val_sigmas,
+                        tokenizer=tokenizer,
+                        max_seq_len=args.data.max_seq_len,
+                        block_size=args.train.block_size if args.train.block_diffusion_mode else 32,
+                        mask_token_id=args.train.mask_token_id,
+                        text_keys=args.data.text_keys,
+                        n_iters=args.train.t3_train_iterations,
+                        reveal_threshold=args.train.t3_reveal_threshold,
+                        block_diffusion_attn_mask_prototype=block_diffusion_attn_mask_prototype,
+                        block_diffusion_attn_mask_prototype_3L=block_diffusion_attn_mask_prototype_3L,
+                        talk_self_attn_mask_prototype_L=talk_self_attn_mask_prototype_L,
+                        talk_cross_attn_mask_prototype=talk_cross_attn_mask_prototype,
+                        device=get_device_type(),
+                    )
                 logger.info_rank0(f"[T3-D val] step {global_step}: {_val_metrics}")
                 if args.train.use_wandb and args.train.global_rank == 0:
                     wandb.log(_val_metrics, step=global_step)
