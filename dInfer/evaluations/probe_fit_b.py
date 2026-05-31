@@ -38,7 +38,7 @@ def split_by_group(group, val_frac, seed):
 class AnchorRefiner(nn.Module):
     """Lightweight block-level refiner. use_anchor=False -> tokens-only control."""
 
-    def __init__(self, vocab, d_model, d_anchor, block_len, n_layers, n_heads, use_anchor=True):
+    def __init__(self, vocab, d_model, d_anchor, block_len, n_layers, n_heads, use_anchor=True, dropout=0.1):
         super().__init__()
         self.use_anchor = use_anchor
         self.tok_embed = nn.Embedding(vocab, d_model)
@@ -46,7 +46,7 @@ class AnchorRefiner(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, block_len, d_model))
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
-            batch_first=True, activation="gelu", norm_first=True)
+            dropout=dropout, batch_first=True, activation="gelu", norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.head = nn.Linear(d_model, vocab)
 
@@ -81,6 +81,8 @@ def main():
     p.add_argument("--d_model", type=int, default=1024)
     p.add_argument("--n_layers", type=int, default=4)
     p.add_argument("--n_heads", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.1,
+                   help="bump (e.g. 0.3) + shrink --d_model/--n_layers to fight overfit cheaply")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -128,7 +130,8 @@ def main():
 
     def train_model(use_anchor):
         torch.manual_seed(args.seed)
-        model = AnchorRefiner(V, args.d_model, D, blk, args.n_layers, args.n_heads, use_anchor).to(dev)
+        model = AnchorRefiner(V, args.d_model, D, blk, args.n_layers, args.n_heads,
+                              use_anchor, dropout=args.dropout).to(dev)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
         gen = torch.Generator(device=dev).manual_seed(args.seed + (0 if use_anchor else 7))
         n = A_tr.shape[0]
@@ -152,8 +155,16 @@ def main():
             if (ep + 1) % 10 == 0 or ep == 0:
                 tr_ce = ce_sum / max(tok_sum, 1)
                 tr_acc = corr_sum / max(tok_sum, 1)
-                print(f"    [{tag}] epoch {ep+1:>3}/{args.epochs}  train_ce={tr_ce:.3f}  "
-                      f"train_acc@randmask={tr_acc:.3f}")
+                model.eval()
+                with torch.no_grad():
+                    ms = masks_va[0.5]
+                    inp = y_va.clone(); inp[ms] = MASKc
+                    pred = model(inp, A_va).argmax(-1)
+                    va_acc = ((pred == y_va) & ms).sum().item() / max(ms.sum().item(), 1)
+                    flip = ms & (arg0_va != y_va)
+                    va_fr = ((pred == y_va) & flip).sum().item() / max(flip.sum().item(), 1)
+                print(f"    [{tag}] ep {ep+1:>3}/{args.epochs}  train_ce={tr_ce:.3f} train_acc={tr_acc:.3f}  "
+                      f"VAL_acc@m0.5={va_acc:.3f} VAL_flipR@m0.5={va_fr:.3f}")
         return model
 
     def print_table(model, label):
