@@ -183,6 +183,22 @@ class T3TrainingArguments(LLaDA2TrainingArguments):
                           "(noise_range_low=high=1.0). Diagnostic: does train loss drop and "
                           "val acc (esp. val/acc_still_masked) hold for the real talk."},
     )
+    t3_think_iters_start: int = field(
+        default=1,
+        metadata={"help": "T3-D v3 progressive-distillation curriculum (single-step only). "
+                          "Number of think iterations at the START of training; anneals down "
+                          "to 1 (one step down per t3_think_iters_anneal_frac of training). "
+                          "Talk ALWAYS does 1 forward, on the LATEST anchor + the K-committed "
+                          "input. =1 disables the curriculum (plain single-step). E.g. 3 -> "
+                          "think 3/2/1 over the first 50% of steps then 1. Inference is always "
+                          "think-1/talk-1; intermediate K>1 is training scaffolding only."},
+    )
+    t3_think_iters_anneal_frac: float = field(
+        default=0.25,
+        metadata={"help": "Fraction of training between each think-iteration step-down "
+                          "(start -> start-1 -> ... -> 1). 0.25 with start=3 gives 3/2/1 over "
+                          "0-25%/25-50%/50-100%."},
+    )
     mask_token_id: int = field(
         default=156895,
         metadata={"help": "LLaDA-2.0-mini's [MASK] token id."},
@@ -525,6 +541,18 @@ def reveal_teacher_force(
 # iter_{1..N-1} are post-reveal: input has talk's argmax committed at high-confidence
 # positions. These tell us whether multi-iter is actually producing iter-conditional
 # refinement (iter_last_CE < iter_0_CE) or just stuck at iter-0 behavior.
+def _think_iters_schedule(progress: float, args) -> int:
+    """T3-D v3 progressive-distillation curriculum: how many think iterations this
+    step. Anneals from t3_think_iters_start down to 1 -- one step down every
+    t3_think_iters_anneal_frac of training. Returns 1 (plain single-step) when
+    start <= 1. E.g. start=3, frac=0.25 -> 3 (0-25%), 2 (25-50%), 1 (>=50%)."""
+    start = int(getattr(args.train, "t3_think_iters_start", 1))
+    frac = float(getattr(args.train, "t3_think_iters_anneal_frac", 0.25))
+    if start <= 1 or frac <= 0:
+        return 1
+    return max(1, start - int(progress / frac))
+
+
 @torch.no_grad()
 def _run_validation_single_step(
     model,
@@ -586,6 +614,7 @@ def _run_validation_single_step(
         ce_comm, n_comm, corr_comm = 0.0, 0, 0
         ce_still, n_still, corr_still = 0.0, 0, 0
         think_committed, think_correct = 0, 0
+        per_block_still = []   # per decode block: count of response positions still MASK ("X" in X/32)
         for idx in val_indices:
             try:
                 transformed = transform(val_raw_examples[idx])[0]
@@ -634,6 +663,13 @@ def _run_validation_single_step(
             corr_still += int(((pred == labels_dev) & still_pos).sum().item())
             think_committed += int(committed_pos.sum().item())
             think_correct += int(((committed == labels_dev) & committed_pos).sum().item())
+            # T3-D v3: per-block still-mask count (response positions left MASK after think).
+            still_resp = (committed[0] == mask_token_id) & (pre_commit[0] == mask_token_id)   # [L]
+            orig_resp = (pre_commit[0] == mask_token_id)
+            nb = L // block_size
+            still_pb = still_resp.view(nb, block_size).sum(dim=-1)   # [nb] still-masked per block
+            orig_pb = orig_resp.view(nb, block_size).sum(dim=-1)     # [nb] originally-masked per block
+            per_block_still.extend(still_pb[orig_pb > 0].cpu().tolist())
 
         key = f"sigma_{sigma:.2f}"
         if n_still > 0:
@@ -649,6 +685,15 @@ def _run_validation_single_step(
         if think_committed > 0:
             metrics[f"val/think_commit_acc_{key}"] = think_correct / think_committed
             metrics[f"val/think_commit_frac_{key}"] = think_committed / max(n_all, 1)
+        # T3-D v3: still-mask ratio -- how much of the block talk must fill (vs think committed).
+        if n_all > 0:
+            metrics[f"val/still_mask_frac_{key}"] = n_still / n_all
+        if per_block_still:
+            metrics[f"val/still_mask_per_block_{key}"] = float(sum(per_block_still) / len(per_block_still))
+            try:
+                metrics[f"val/still_mask_per_block_hist_{key}"] = wandb.Histogram(per_block_still)
+            except Exception:
+                pass
     model.train()
     return metrics
 
@@ -1371,6 +1416,13 @@ def main():
             # T3-D v2: per-step N (iter count). Used as the ceiling for the iter loop.
             n_iters_step = int(curriculum["n_sample"])
 
+            # T3-D v3: think-iteration count for the single-step progressive-distillation
+            # curriculum (anneals start -> 1). 1 when not single-step / curriculum disabled.
+            k_think_step = (
+                _think_iters_schedule(step_progress, args)
+                if args.train.t3_single_step else 1
+            )
+
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
@@ -1498,27 +1550,39 @@ def main():
                 # path. sigma is expected fixed at 1.0 via config.
                 # =====================================================================
                 if args.train.t3_single_step:
+                    # think runs k_think_step iterations (progressive-distillation
+                    # curriculum, anneals start->1). Each iter: think forward -> commit
+                    # the next confident prefix (hard-token reveal). Talk then runs once
+                    # on the LATEST anchor + the fully-committed input. k=1 == plain
+                    # single-step. pre_commit_noisy keeps the original all-MASK snapshot
+                    # so the committed/still-masked metric split is over all k commits.
                     model.eval()
                     with torch.no_grad():
-                        anchor_cached = model.run_think_and_anchor(
-                            input_ids=micro_batch["input_ids"],
-                            attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"],
-                        )
-                        # think iter-0 logits (last_only fuser => lm_head(anchor) = think pred).
-                        think_logits_noisy = model.lm_head(anchor_cached[:, :noisy_len])
                         pre_commit_noisy = micro_batch["input_ids"][:, :noisy_len].clone()
-                        committed_noisy = reveal_dmax_uniform(
-                            logits=think_logits_noisy,
-                            current_noisy=pre_commit_noisy,
-                            mask_token_id=args.train.mask_token_id,
-                            block_size=args.train.block_size,
-                            threshold=args.train.t3_reveal_threshold,
-                        )
-                        new_input = micro_batch["input_ids"].clone()
-                        new_input[:, :noisy_len] = committed_noisy
-                        micro_batch["input_ids"] = new_input
+                        anchor_cached = None
+                        committed_noisy = None
+                        for _ki in range(max(int(k_think_step), 1)):
+                            anchor_cached = model.run_think_and_anchor(
+                                input_ids=micro_batch["input_ids"],
+                                attention_mask=micro_batch["attention_mask"],
+                                position_ids=micro_batch["position_ids"],
+                            )
+                            # last_only fuser => lm_head(anchor) = think's logits this iter.
+                            think_logits_noisy = model.lm_head(anchor_cached[:, :noisy_len])
+                            committed_noisy = reveal_dmax_uniform(
+                                logits=think_logits_noisy,
+                                current_noisy=micro_batch["input_ids"][:, :noisy_len],
+                                mask_token_id=args.train.mask_token_id,
+                                block_size=args.train.block_size,
+                                threshold=args.train.t3_reveal_threshold,
+                            )
+                            new_input = micro_batch["input_ids"].clone()
+                            new_input[:, :noisy_len] = committed_noisy
+                            micro_batch["input_ids"] = new_input
                     model.train()
+                    # anchor_cached now = think's LATEST (k-th) anchor; micro_batch input
+                    # = k-committed; committed_noisy = its noisy half. Downstream talk +
+                    # loss + metrics are unchanged.
 
                     with model_fwd_context:
                         logits = model.run_talk(
@@ -1821,6 +1885,9 @@ def main():
                 train_metrics["t3/rollout_sampled"] = curriculum["rollout_sample"]
                 train_metrics["t3/n_iters_sampled"] = curriculum["n_sample"]
                 train_metrics["t3/n_iters_center"] = curriculum["n_center"]
+                # T3-D v3: current think-iteration count (progressive-distillation curriculum).
+                if args.train.t3_single_step:
+                    train_metrics["t3/think_iters_curriculum"] = k_think_step
                 if noise_progress is not None:
                     progress = float(noise_progress.value)
                     train_metrics["t3/noise_ramp_progress"] = progress
@@ -1865,6 +1932,12 @@ def main():
                     train_metrics["t3/think_commit_acc"] = think_correct_total / think_commit_total
                 if talk_still_total > 0:
                     train_metrics["t3/talk_acc_still_masked"] = talk_correct_still_total / talk_still_total
+                # T3-D v3: still-mask ratio (talk's share of the decode positions vs think's).
+                _dec_total = talk_still_total + committed_count
+                if _dec_total > 0:
+                    _still_frac = talk_still_total / _dec_total
+                    train_metrics["t3/still_mask_frac"] = _still_frac
+                    train_metrics["t3/still_mask_per_block"] = _still_frac * args.train.block_size
                 if clean_region_count > 0:
                     # Non-zero here = leak regressed. Diagnostic tripwire.
                     train_metrics["training/loss_clean_region_LEAK_TRIPWIRE"] = (
