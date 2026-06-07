@@ -1,0 +1,89 @@
+# T3-D top-K talk — anchor-free, MERGED-ONLY trainable scope.
+#
+# The `model` here is the TALK = the 10-layer merge_layers checkpoint; the frozen full
+# think (train.think_path) supplies per-position top-K candidates that the talk consumes
+# as its input embedding at masked positions (build_talk_inputs_embeds). Only the 2
+# merged-representative layers (stack idx 6,8) train; everything else (incl. embed/head)
+# is frozen — see set_talk_trainable. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
+#
+# Launch (from dFactory/):
+#   PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
+#   sh train.sh tasks/train_t3_topk_talk.py configs/sft/t3_topk_talk_merged_only.yaml
+# Set NPROC_PER_NODE in train.sh to your GPU count.
+
+model:
+  config_path: ../merged_10L          # the talk's config.json (num_hidden_layers=10)
+  model_path: ../merged_10L           # the talk's weights (merge_layers --save_hf)
+  tokenizer_path: ../merged_10L
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl   # build_dataset_oput output (Zigeng/DMax-…-Trajectories)
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./t3_topk_talk_merged_only_outputs
+
+  # T3-D top-K talk -------------------------------------------------------------
+  think_path: ../DMax-Math-16B-moe-merge   # FROZEN full think (replicated per rank, no FSDP)
+  t3_top_k: 10
+  t3_train_layers: "6,8"                    # merged-only: the 2 rep layers (~1.64B)
+  t3_mask_token_id: 156895
+
+  # Distributed — FSDP2
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 2
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+
+  # Optimiser — only the 2 merged layers train; start at the DMax lr, bump if slow.
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 2.0e-6
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Memory — merged-only is light (think 32GB replicated + talk sharded + opt on 1.64B)
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false          # flip true only if OOM
+  enable_activation_offload: false
+  init_device: meta
+  broadcast_model_weights_from_rank0: true
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+  # Checkpointing
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+
+  # Block diffusion (matches DMax — REQUIRED: the doubled [noisy,clean] sequence)
+  block_diffusion_mode: true
+  block_size: 32
+  same_token_labels: true
+
+  use_wandb: false
+  log_steps: 1
