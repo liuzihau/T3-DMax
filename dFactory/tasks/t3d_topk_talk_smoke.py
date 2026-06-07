@@ -33,7 +33,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from tasks.t3d_topk_talk import build_talk_inputs_embeds, predict_loss
+from tasks.t3d_topk_talk import build_talk_inputs_embeds, predict_loss, topk_talk_train_step
 
 
 def _load_causal_lm(path, device, dtype):
@@ -122,32 +122,30 @@ def main():
     attn = _block_bidirectional_mask(B, L, args.device, dtype)
     pos = torch.arange(L, device=args.device).unsqueeze(0).expand(B, -1)
 
-    # 1) THINK once (frozen) -> top-K candidates. ForCausalLM(...).logits applies the
-    #    head internally (matches probe_runner's proven call pattern).
+    # Sanity: build_talk_inputs_embeds injects think's top-K at masked positions only.
     with torch.no_grad():
         think_logits = think(inputs_embeds=emb(noisy), attention_mask=attn,
                              position_ids=pos, use_cache=False, return_dict=True).logits
     print(f"[smoke] think_logits {tuple(think_logits.shape)}")
-
-    # 2) build the talk input (top-K at masked positions, training variant: no mask residual)
-    talk_embeds = build_talk_inputs_embeds(
-        noisy, think_logits, emb, args.mask_id, mode="topk_soft",
-        top_k=args.top_k, keep_mask_residual=False)
+    talk_embeds = build_talk_inputs_embeds(noisy, think_logits, emb, args.mask_id,
+                                           mode="topk_soft", top_k=args.top_k, keep_mask_residual=False)
     plain = emb(noisy)
     assert not torch.allclose(talk_embeds[still_masked], plain[still_masked])
     assert torch.allclose(talk_embeds[~still_masked], plain[~still_masked])
-    print(f"[smoke] talk_embeds {tuple(talk_embeds.shape)}  (top-K injected at "
-          f"{int(still_masked.sum())} masked / {int((~still_masked).sum())} committed)")
+    print(f"[smoke] top-K injected at {int(still_masked.sum())} masked / "
+          f"{int((~still_masked).sum())} committed positions")
 
-    # 3) TALK forward (ANCHOR-FREE) -> logits (talk's frozen head == think's) -> CE
+    # THE training step (the exact function Block 2's loop calls). Test both paths.
     talk.train()
-    talk_logits = talk(inputs_embeds=talk_embeds.to(dtype), attention_mask=attn,
-                       position_ids=pos, use_cache=False, return_dict=True).logits
-    loss = predict_loss(talk_logits.float(), labels_for_ce, predict_mask=still_masked)
-    print(f"[smoke] loss = {loss.item():.4f}  (finite={torch.isfinite(loss).item()})")
-    assert torch.isfinite(loss)
+    loss_false = topk_talk_train_step(think, talk, emb, args.mask_id, noisy, labels_for_ce,
+                                      attn, pos, flag=False, top_k=args.top_k)   # Path A ([MASK])
+    loss = topk_talk_train_step(think, talk, emb, args.mask_id, noisy, labels_for_ce,
+                                attn, pos, flag=True, top_k=args.top_k)          # Path B (top-K)
+    print(f"[smoke] train-step loss: flag=False(mask)={loss_false.item():.4f}  "
+          f"flag=True(top-K)={loss.item():.4f}  (finite={torch.isfinite(loss).item()})")
+    assert torch.isfinite(loss) and torch.isfinite(loss_false)
 
-    # 4) backward: grads only on talk layers; think/emb/head get none
+    # backward (on the Path-B loss): grads only on talk layers; think/emb/head get none
     loss.backward()
     talk_layer_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                           for p in talk.parameters() if p.requires_grad)

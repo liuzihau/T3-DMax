@@ -76,6 +76,30 @@ def predict_loss(talk_logits: torch.Tensor, labels: torch.Tensor,
     return F.cross_entropy(talk_logits.view(-1, V), lbl.view(-1), ignore_index=ignore_index)
 
 
+def topk_talk_train_step(think, talk, embedding, mask_id, noisy_input_ids, labels,
+                         attention_mask, position_ids, flag, *, top_k: int = 10):
+    """One anchor-free top-K training step's forward+loss. THE reusable core of the
+    training loop (Block 2): the caller (a fork of train_t3_dmax_bd_oput.py) supplies
+    a batch + the block-causal `attention_mask` and calls this per micro-batch.
+
+    think: frozen full LLaDA2-Moe (ForCausalLM); talk: trainable 10-layer LLaDA2-Moe.
+    `labels` already carries -100 at non-predict positions (the data transform sets
+    that), so CE(ignore_index=-100) scores exactly the masked predict positions.
+    `flag` (per micro-batch): True → Path B (think's top-K input); False → Path A ([MASK]).
+    """
+    with torch.no_grad():                                       # think frozen
+        think_logits = think(inputs_embeds=embedding(noisy_input_ids),
+                             attention_mask=attention_mask, position_ids=position_ids,
+                             use_cache=False, return_dict=True).logits
+    mode = "topk_soft" if bool(flag) else "mask"
+    talk_embeds = build_talk_inputs_embeds(noisy_input_ids, think_logits, embedding, mask_id,
+                                           mode=mode, top_k=top_k, keep_mask_residual=False)
+    talk_logits = talk(inputs_embeds=talk_embeds, attention_mask=attention_mask,
+                       position_ids=position_ids, use_cache=False, return_dict=True).logits
+    V = talk_logits.shape[-1]
+    return F.cross_entropy(talk_logits.view(-1, V).float(), labels.view(-1), ignore_index=-100)
+
+
 # ---- reference training step (pseudocode; uses the model parts directly) -----
 # Wire this into a fork of train_t3_dmax_bd_oput.py's main loop. Think is frozen and
 # called under no_grad; the talk runs ANCHOR-FREE on the top-K-injected embeds.
