@@ -37,6 +37,31 @@ def _embed(embedding, ids):
     return embedding(ids)
 
 
+def load_causal_lm(path, device, dtype=torch.bfloat16, attn_implementation="sdpa"):
+    """Load an LLaDA2-Moe causal LM. Mirrors probe_runner.load_llada2's recipe:
+    dFactory-class fallback + `moe_implementation='fused'` + `_veomni` model_type —
+    WITHOUT which HF re-inits all ~16B params per-expert (the slow `normal_` hang).
+    Used for the FROZEN think model in the top-K talk training (the trainable talk is
+    still built by VeOmni's build_foundation_model)."""
+    from transformers import AutoModelForCausalLM, AutoConfig
+    try:
+        m = AutoModelForCausalLM.from_pretrained(
+            path, trust_remote_code=True, torch_dtype=dtype, attn_implementation=attn_implementation)
+    except Exception as exc:
+        print(f"[t3d] AutoModelForCausalLM failed ({type(exc).__name__}); dFactory class fallback")
+        from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM  # type: ignore
+        cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
+        if not str(getattr(cfg, "model_type", "")).endswith("_veomni"):
+            cfg.model_type = str(cfg.model_type) + "_veomni"
+        if getattr(cfg, "moe_implementation", None) != "fused":
+            cfg.moe_implementation = "fused"
+        m = LLaDA2MoeModelLM.from_pretrained(
+            path, config=cfg, torch_dtype=dtype, attn_implementation=attn_implementation)
+    if hasattr(getattr(m, "model", None), "gradient_checkpointing"):
+        m.model.gradient_checkpointing = False
+    return m.to(device).eval()
+
+
 def build_talk_inputs_embeds(
     noisy: torch.Tensor,            # [B, L] current token ids (mask_id where undecided)
     think_logits: torch.Tensor,     # [B, L, V] = lm_head(think last hidden), no grad

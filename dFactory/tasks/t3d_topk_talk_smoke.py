@@ -33,31 +33,8 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from tasks.t3d_topk_talk import build_talk_inputs_embeds, predict_loss, topk_talk_train_step
-
-
-def _load_causal_lm(path, device, dtype):
-    """Load an LLaDA2-Moe causal LM. Mirrors probe_runner.load_llada2's proven
-    recipe: the dFactory class fallback + `moe_implementation='fused'` + the
-    `_veomni` model_type — WITHOUT which HF re-inits all ~16B params per-expert
-    (the slow `normal_` hang)."""
-    from transformers import AutoModelForCausalLM, AutoConfig
-    try:
-        m = AutoModelForCausalLM.from_pretrained(
-            path, trust_remote_code=True, torch_dtype=dtype, attn_implementation="sdpa")
-    except Exception as exc:                                   # bundled-code / non-Auto checkpoint
-        print(f"[smoke] AutoModelForCausalLM failed ({type(exc).__name__}); dFactory class fallback")
-        from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM  # type: ignore
-        cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
-        if not str(getattr(cfg, "model_type", "")).endswith("_veomni"):
-            cfg.model_type = str(cfg.model_type) + "_veomni"
-        if getattr(cfg, "moe_implementation", None) != "fused":
-            cfg.moe_implementation = "fused"                   # avoids the per-expert init hang
-        m = LLaDA2MoeModelLM.from_pretrained(
-            path, config=cfg, torch_dtype=dtype, attn_implementation="sdpa")
-    if hasattr(getattr(m, "model", None), "gradient_checkpointing"):
-        m.model.gradient_checkpointing = False
-    return m.to(device).eval()
+from tasks.t3d_topk_talk import (
+    build_talk_inputs_embeds, predict_loss, topk_talk_train_step, load_causal_lm)
 
 
 def _decoder_layers(m):
@@ -86,8 +63,8 @@ def main():
     dtype = torch.bfloat16
 
     print("[smoke] loading think (full) and talk (10-layer merge)…")
-    think = _load_causal_lm(args.think_path, args.device, dtype)
-    talk = _load_causal_lm(args.talk_path, args.device, dtype)
+    think = load_causal_lm(args.think_path, args.device, dtype)
+    talk = load_causal_lm(args.talk_path, args.device, dtype)
     n_think, n_talk = len(_decoder_layers(think)), len(_decoder_layers(talk))
     print(f"[smoke] think layers={n_think}  talk layers={n_talk}")
     assert n_talk < n_think, "talk should be the compressed model"
