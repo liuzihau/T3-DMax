@@ -59,7 +59,8 @@ train:
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 2.0e-6
+  lr: 1.0e-5             # merged-only = just 2 small layers; 5x DMax's full-FT 2e-6 for a
+                         # faster/visible signal in a short run. Lower if grad_norm blows up.
   lr_warmup_ratio: 0.03
   lr_decay_style: cosine
   lr_decay_ratio: 1.0

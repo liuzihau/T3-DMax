@@ -541,9 +541,8 @@ def main():
                 _gn = model.clip_grad_norm_(args.train.max_grad_norm)
                 grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
             else:
-                logger.info_rank0(
-                    "Can NOT find regitsered clip_grad_norm_ method in the model, using PyTorch default implementation.."
-                )
+                # T3-D: DDP/single-GPU has no registered clip_grad_norm_; PyTorch default is
+                # correct here (silenced the per-step info log).
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
 
             optimizer.step()
