@@ -65,10 +65,11 @@ def _decoder_layers(m):
     return [x for x in base.modules() if type(x).__name__ == "LLaDA2MoeDecoderLayer"]
 
 
-def _block_bidirectional_mask(seq_len, device, dtype):
-    """Smoke-only: full bidirectional attention over the single block. The real
-    training uses the block-causal mask (prompt visible, causal across blocks)."""
-    return torch.zeros(1, 1, seq_len, seq_len, device=device, dtype=dtype)
+def _block_bidirectional_mask(batch, seq_len, device, dtype):
+    """Smoke-only: full bidirectional attention over the single block, per-sample
+    [B,1,L,L] additive mask (0 = attend). The real training uses the block-causal
+    mask (prompt visible, causal across blocks)."""
+    return torch.zeros(batch, 1, seq_len, seq_len, device=device, dtype=dtype)
 
 
 def main():
@@ -118,7 +119,7 @@ def main():
     labels_for_ce = labels.clone()
     labels_for_ce[revealed] = -100                              # don't score revealed context
 
-    attn = _block_bidirectional_mask(L, args.device, dtype)
+    attn = _block_bidirectional_mask(B, L, args.device, dtype)
     pos = torch.arange(L, device=args.device).unsqueeze(0).expand(B, -1)
 
     # 1) THINK once (frozen) -> top-K candidates. ForCausalLM(...).logits applies the
