@@ -62,6 +62,29 @@ def load_causal_lm(path, device, dtype=torch.bfloat16, attn_implementation="sdpa
     return m.to(device).eval()
 
 
+def set_talk_trainable(talk, train_layer_idx, *, freeze_embed_head=True):
+    """Freeze the whole talk, then unfreeze only the decoder layers in `train_layer_idx`.
+    For 'merged layers only' on a keep=0-5,12,19 / n_merged=1 talk, the two merged-
+    representative layers are at stack positions **6 and 8** (0-5 = kept layers 0-5,
+    6 = rep(6-11), 7 = layer 12, 8 = rep(13-18), 9 = layer 19). embed/head stay frozen.
+    Returns the number of trainable params."""
+    for p in talk.parameters():
+        p.requires_grad_(False)
+    base = getattr(talk, "model", talk)
+    layers = base.layers
+    for i in train_layer_idx:
+        for p in layers[i].parameters():
+            p.requires_grad_(True)
+    if not freeze_embed_head:
+        for p in talk.get_input_embeddings().parameters():
+            p.requires_grad_(True)
+        head = talk.get_output_embeddings() or getattr(talk, "lm_head", None)
+        if head is not None:
+            for p in head.parameters():
+                p.requires_grad_(True)
+    return sum(p.numel() for p in talk.parameters() if p.requires_grad)
+
+
 def build_talk_inputs_embeds(
     noisy: torch.Tensor,            # [B, L] current token ids (mask_id where undecided)
     think_logits: torch.Tensor,     # [B, L, V] = lm_head(think last hidden), no grad
