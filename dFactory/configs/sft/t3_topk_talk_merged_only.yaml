@@ -38,8 +38,9 @@ train:
   t3_train_layers: "6,8"                    # merged-only: the 2 rep layers (~1.64B)
   t3_mask_token_id: 156895
 
-  # Distributed — FSDP2
-  data_parallel_mode: fsdp2
+  # Distributed — DDP (1 GPU). For multi-GPU, switch to fsdp2 + init_device:meta +
+  # enable_full_shard:true + enable_mixed_precision:true (see the 2gpu config).
+  data_parallel_mode: ddp
   tensor_parallel_size: 1
   ulysses_parallel_size: 1
   expert_parallel_size: 1
@@ -63,14 +64,15 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
 
-  # Memory — merged-only is light (think 32GB replicated + talk sharded + opt on 1.64B)
-  enable_mixed_precision: true
+  # Memory — merged-only on 1 GPU (think 32GB + talk 16GB + ~20GB opt on 1.64B ≈ 70GB)
+  enable_mixed_precision: false       # DDP stays bf16 (fused MoE asserts bf16/fp16); also
+                                      # makes think+talk both bf16 -> no inputs_embeds dtype clash
   enable_gradient_checkpointing: true
-  enable_full_shard: true
-  enable_fsdp_offload: false          # flip true only if OOM
+  enable_full_shard: false            # no FSDP on 1 GPU
+  enable_fsdp_offload: false          # also requires FSDP
   enable_activation_offload: false
-  init_device: meta
-  broadcast_model_weights_from_rank0: true
+  init_device: cuda                   # meta requires FSDP (unreachable on 1 GPU)
+  broadcast_model_weights_from_rank0: false   # no broadcast needed on 1 GPU/DDP
   enable_full_determinism: false
   empty_cache_steps: 500
 
