@@ -47,6 +47,8 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 2
+  max_steps: 2000          # FIRST RUN: cap for a quick loss-drop signal (~10h @ 17s/it on 1 GPU).
+                           # Remove / raise once the curve looks healthy. Full epoch = 174854 steps.
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007

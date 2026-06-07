@@ -283,15 +283,12 @@ def main():
         raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
 
     logger.info_rank0("Prepare model")
-    model = build_foundation_model(
-        config_path=args.model.config_path,
-        weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
-        attn_implementation=args.model.attn_implementation,
-        moe_implementation=args.model.moe_implementation,
-        init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
-    )
+    # T3-D: load the talk with the SAME proven loader as think. build_foundation_model
+    # random-inits merged_10L's MoE experts (key-format mismatch vs merge_layers --save_hf;
+    # the giant "...initialize them" list = lost merge init). load_causal_lm loads them
+    # fully (verified: clean load in the smoke + for think here).
+    model = load_causal_lm(args.model.model_path, get_device_type(),
+                           dtype=torch.bfloat16, attn_implementation=args.model.attn_implementation)
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
