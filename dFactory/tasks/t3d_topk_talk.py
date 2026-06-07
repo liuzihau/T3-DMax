@@ -1,0 +1,145 @@
+"""Anchor-free top-K talk — core input construction (T3-D top-K talk trial).
+
+The new idea (see probe_runner/T3D_TOPK_TALK_PLAN.md + T3D_TOPK_TALK_INTEGRATION.md):
+drop the hidden-state anchor entirely; the talk's ONLY signal from think is the
+**top-K candidate set**, injected as the input embedding at still-masked positions.
+
+This module is the well-defined, testable piece:
+  build_talk_inputs_embeds(noisy, think_logits, embedding, mask_id, mode=...) -> [B,L,D]
+    * committed positions (noisy != mask) -> their token's input embedding (context)
+    * still-masked positions (noisy == mask):
+        mode='mask'      -> the [MASK] embedding            (Path A, base/regularizer)
+        mode='topk_soft' -> think's top-K soft-embedding    (Path B, the new ingredient)
+
+`think_logits = lm_head(think_last_hidden)`. Untied model: the soft-embed is built
+from the INPUT embedding table (handled inside build_topk_soft_embeds).
+
+The talk then runs ANCHOR-FREE on these embeds (talk_model(inputs_embeds=..., anchor=None)),
+which requires a talk config with anchor conditioning + cross-attention DISABLED.
+
+Self-test: `python t3d_topk_talk.py` (CPU, tiny synthetic).
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+try:
+    from .t3d_topk_soft_embed import build_topk_soft_embeds         # package import
+except ImportError:                                                  # standalone `python t3d_topk_talk.py`
+    from t3d_topk_soft_embed import build_topk_soft_embeds
+
+
+def _embed(embedding, ids):
+    if isinstance(embedding, torch.Tensor):
+        return F.embedding(ids, embedding)
+    return embedding(ids)
+
+
+def build_talk_inputs_embeds(
+    noisy: torch.Tensor,            # [B, L] current token ids (mask_id where undecided)
+    think_logits: torch.Tensor,     # [B, L, V] = lm_head(think last hidden), no grad
+    embedding,                      # input-embedding nn.Module or [V, D] weight
+    mask_id: int,
+    *,
+    mode: str = "topk_soft",        # 'mask' (Path A) | 'topk_soft' (Path B)
+    top_k: int = 10,
+    keep_mask_residual: bool = False,  # training: False (renorm in top-K); inference: True
+) -> torch.Tensor:
+    """The talk's inputs_embeds. Committed positions keep their hard token embedding;
+    still-masked positions get either [MASK] (mode='mask') or think's top-K soft-embed
+    (mode='topk_soft'). No anchor anywhere."""
+    base = _embed(embedding, noisy)                       # committed->token, masked->[MASK]
+    if mode == "mask":
+        return base
+    if mode != "topk_soft":
+        raise ValueError(f"unknown mode {mode!r}")
+    masked = (noisy == mask_id)                           # [B, L]
+    if not bool(masked.any()):
+        return base
+    soft = build_topk_soft_embeds(
+        think_logits, embedding, mask_id, top_k=top_k,
+        keep_mask_residual=keep_mask_residual)            # [B, L, D]
+    out = base.clone()
+    out[masked] = soft[masked].to(out.dtype)
+    return out
+
+
+def predict_loss(talk_logits: torch.Tensor, labels: torch.Tensor,
+                 predict_mask: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
+    """Plain CE on the predict positions (the still-masked ~75%). `predict_mask` is
+    bool [B, L]; positions where labels==ignore_index are skipped automatically."""
+    lbl = labels.clone()
+    lbl[~predict_mask] = ignore_index
+    V = talk_logits.shape[-1]
+    return F.cross_entropy(talk_logits.view(-1, V), lbl.view(-1), ignore_index=ignore_index)
+
+
+# ---- reference training step (pseudocode; uses the model parts directly) -----
+# Wire this into a fork of train_t3_dmax_bd_oput.py's main loop. Think is frozen and
+# called under no_grad; the talk runs ANCHOR-FREE on the top-K-injected embeds.
+#
+#   think = model.think_model; talk = model.talk_model; head = model.lm_head
+#   emb   = model.get_input_embeddings()
+#
+#   with torch.no_grad():                                   # think frozen, no grad
+#       th = think(input_ids=full_ids, attention_mask=block_mask,
+#                  output_hidden_states=True, use_cache=False)
+#       think_hidden = th.hidden_states[-1]                 # = old "anchor"
+#       think_logits = head(think_hidden)                   # [B, L, V]
+#
+#   # reveal ~25% from the trajectory's first-step commits (data) -> `noisy`, `labels`
+#   # (labels[revealed] = -100 to avoid the copy-through-embedding identity leak)
+#
+#   mode = "topk_soft" if rollout_flag else "mask"          # Path B vs Path A
+#   talk_embeds = build_talk_inputs_embeds(noisy, think_logits, emb, mask_id,
+#                     mode=mode, top_k=args.t3_topk, keep_mask_residual=False)
+#
+#   talk_hidden = talk(inputs_embeds=talk_embeds, anchor=None,   # ANCHOR-FREE
+#                      attention_mask=block_mask, position_ids=pos, use_cache=False)
+#   talk_logits = head(talk_hidden)
+#   loss = predict_loss(talk_logits, labels, predict_mask=still_masked)
+
+
+# --------------------------------------------------------------------------- test
+def _selftest():
+    torch.manual_seed(0)
+    B, L, V, D, K = 2, 6, 40, 8, 10
+    W = torch.randn(V, D)
+    mask_id = V - 1
+    noisy = torch.randint(0, V - 1, (B, L))          # committed tokens
+    masked = torch.zeros(B, L, dtype=torch.bool)
+    masked[0, 2:5] = True; masked[1, 0:2] = True      # some still-masked
+    noisy[masked] = mask_id
+    think_logits = torch.randn(B, L, V)
+
+    # mask path = plain embedding of noisy (mask at masked positions)
+    base = build_talk_inputs_embeds(noisy, think_logits, W, mask_id, mode="mask")
+    assert torch.allclose(base, F.embedding(noisy, W))
+    assert torch.allclose(base[masked], W[mask_id].expand(masked.sum(), D))   # masked -> [MASK]
+
+    # topk_soft path = think's top-K at masked, token embeds at committed
+    ts = build_talk_inputs_embeds(noisy, think_logits, W, mask_id, mode="topk_soft",
+                                  top_k=K, keep_mask_residual=False)
+    assert torch.allclose(ts[~masked], base[~masked])                 # committed unchanged
+    assert not torch.allclose(ts[masked], base[masked])               # masked changed (top-K)
+    soft = build_topk_soft_embeds(think_logits, W, mask_id, top_k=K, keep_mask_residual=False)
+    assert torch.allclose(ts[masked], soft[masked].to(ts.dtype))      # exactly the top-K blend
+
+    # no masked positions -> returns base untouched
+    full = torch.randint(0, V - 1, (B, L))
+    assert torch.allclose(build_talk_inputs_embeds(full, think_logits, W, mask_id, mode="topk_soft"),
+                          F.embedding(full, W))
+
+    # predict_loss only counts predict positions
+    talk_logits = torch.randn(B, L, V)
+    labels = torch.randint(0, V - 1, (B, L))
+    loss = predict_loss(talk_logits, labels, predict_mask=masked)
+    assert torch.isfinite(loss) and loss > 0
+    # zero predict positions -> nan/ignored (cross_entropy over empty -> nan); guard expectation
+    print("t3d_topk_talk selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

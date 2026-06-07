@@ -661,8 +661,8 @@ def _run_validation_single_step(
             ce_still += float(per_pos[still_pos].sum().item()); n_still += int(still_pos.sum().item())
             corr_comm += int(((pred == labels_dev) & comm_valid).sum().item())
             corr_still += int(((pred == labels_dev) & still_pos).sum().item())
-            think_committed += int(committed_pos.sum().item())
-            think_correct += int(((committed == labels_dev) & committed_pos).sum().item())
+            think_committed += int(comm_valid.sum().item())   # valid-label committed only
+            think_correct += int(((committed == labels_dev) & comm_valid).sum().item())
             # T3-D v3: per-block still-mask count (response positions left MASK after think).
             still_resp = (committed[0] == mask_token_id) & (pre_commit[0] == mask_token_id)   # [L]
             orig_resp = (pre_commit[0] == mask_token_id)
@@ -1625,8 +1625,12 @@ def main():
                         mask_region_count += int(still_pos.sum().item())
                         ce_committed_sum += float(per_pos[comm_valid].sum().item())
                         committed_count += int(comm_valid.sum().item())
-                        think_commit_total += int(committed_pos.sum().item())
-                        think_correct_total += int(((committed_noisy == labels) & committed_pos).sum().item())
+                        # Restrict to comm_valid (committed AND label != -100). committed_pos
+                        # alone leaks masked trailing-pad positions (labels=-100 beyond
+                        # response+32) that think commits as pad/eos -> counting those "wrong"
+                        # dragged think_commit_acc to ~0.2 and inflated think_commit_frac > 1.
+                        think_commit_total += int(comm_valid.sum().item())
+                        think_correct_total += int(((committed_noisy == labels) & comm_valid).sum().item())
                         talk_pred = noisy_logits.argmax(dim=-1)
                         talk_correct_still_total += int(((talk_pred == labels) & still_pos).sum().item())
                         talk_still_total += int(still_pos.sum().item())
