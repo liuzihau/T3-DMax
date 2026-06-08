@@ -224,6 +224,7 @@ def _append_jsonl(path, record):
     if not path:
         return
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
     except Exception as e:
@@ -231,12 +232,20 @@ def _append_jsonl(path, record):
 
 
 @torch.no_grad()
-def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device, top_k):
-    """Quick anchor-free top-K val: one forward per example (Path B), CE + token-match
-    acc on the masked predict positions. Cheap (no decode). Returns wandb-keyed dict."""
+def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
+                  top_k, rollout_frac=0.5):
+    """Quick anchor-free top-K val. Reports TWO sets of CE + token-match acc on the masked
+    predict positions:
+      * `_tf`   : teacher-forced -- clean context (the base rerank ability; looks easy).
+      * `_roll` : rollout -- a `rollout_frac` slice of masked positions is committed with the
+                  talk's OWN argmax (own imperfect commits as context), the rest re-predicted.
+                  This mirrors the on-policy/inference condition and is the metric that should
+                  track GSM8K. The talk's first (TF) forward IS the rollout's first pass, so
+                  this costs 2 talk forwards/example total."""
     was_training = talk.training
     talk.eval()
-    ce_sum, tok_ok, tok_n = 0.0, 0, 0
+    tf_ce = tf_ok = tf_n = 0
+    rl_ce = rl_ok = rl_n = 0
     attn = attn_proto.to(device)
     for ex in val_examples:
         try:
@@ -251,24 +260,43 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         pos = torch.cat([torch.arange(L), torch.arange(L)], 0).unsqueeze(0).to(device)
         think_logits = think(inputs_embeds=embedding(full), attention_mask=attn,
                              position_ids=pos, use_cache=False, return_dict=True).logits
-        talk_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
-                                               mode="topk_soft", top_k=top_k, keep_mask_residual=False)
-        logits = talk(inputs_embeds=talk_embeds, attention_mask=attn, position_ids=pos,
-                      use_cache=False, return_dict=True).logits[:, :L]
         valid = labels != -100
-        n = int(valid.sum())
-        if n == 0:
+        if int(valid.sum()) == 0:
             continue
-        ce_sum += F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(),
-                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
-        tok_ok += int(((logits.argmax(-1) == labels) & valid).sum())
-        tok_n += n
+        # --- teacher-forced (clean context) ---
+        tf_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
+                                             mode="topk_soft", top_k=top_k, keep_mask_residual=False)
+        tf_logits = talk(inputs_embeds=tf_embeds, attention_mask=attn, position_ids=pos,
+                         use_cache=False, return_dict=True).logits[:, :L]
+        tf_ce += F.cross_entropy(tf_logits.reshape(-1, tf_logits.shape[-1]).float(),
+                                 labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+        tf_ok += int(((tf_logits.argmax(-1) == labels) & valid).sum())
+        tf_n += int(valid.sum())
+        # --- rollout (own commits as context) ---
+        argmax_tf = tf_logits.argmax(-1)                                   # talk's own preds
+        committed = valid & (torch.rand_like(argmax_tf.float()) < rollout_frac)
+        still = valid & (~committed)
+        if int(still.sum()) == 0:
+            continue
+        full_roll = full.clone()
+        full_roll[:, :L] = torch.where(committed, argmax_tf, full_roll[:, :L])
+        rl_embeds = build_talk_inputs_embeds(full_roll, think_logits, embedding, mask_id,
+                                             mode="topk_soft", top_k=top_k, keep_mask_residual=False)
+        rl_logits = talk(inputs_embeds=rl_embeds, attention_mask=attn, position_ids=pos,
+                         use_cache=False, return_dict=True).logits[:, :L]
+        labels_still = labels.clone()
+        labels_still[~still] = -100
+        rl_ce += F.cross_entropy(rl_logits.reshape(-1, rl_logits.shape[-1]).float(),
+                                 labels_still.reshape(-1), ignore_index=-100, reduction="sum").item()
+        rl_ok += int(((rl_logits.argmax(-1) == labels) & still).sum())
+        rl_n += int(still.sum())
     if was_training:
         talk.train()
-    if tok_n == 0:
-        return {"val/ce": float("nan"), "val/acc": float("nan")}
-    ce = ce_sum / tok_n
-    return {"val/ce": ce, "val/acc": tok_ok / tok_n, "val/ppl": float(torch.exp(torch.tensor(ce)))}
+    out = {"val/ce_tf": (tf_ce / tf_n if tf_n else float("nan")),
+           "val/acc_tf": (tf_ok / tf_n if tf_n else float("nan")),
+           "val/ce_roll": (rl_ce / rl_n if rl_n else float("nan")),
+           "val/acc_roll": (rl_ok / rl_n if rl_n else float("nan"))}
+    return out
 
 
 def _prune_best_ckpts(saved, keep_n):
@@ -701,11 +729,15 @@ def main():
                                         _val_examples, transform, block_diffusion_attn_mask_prototype,
                                         get_device_type(), args.train.t3_top_k)
                     _rec.update(_vm)
-                    _last_val_ce = _vm["val/ce"]
+                    # retention by the inference-relevant rollout CE (fall back to TF if nan)
+                    _last_val_ce = _vm["val/ce_roll"]
+                    if _last_val_ce != _last_val_ce:  # nan
+                        _last_val_ce = _vm["val/ce_tf"]
                     if args.train.use_wandb:
                         wandb.log(_vm, step=global_step)
                     logger.info_rank0(f"[t3d val] step {global_step} "
-                                      f"ce={_vm['val/ce']:.4f} acc={_vm['val/acc']:.4f}")
+                                      f"ce_tf={_vm['val/ce_tf']:.4f} acc_tf={_vm['val/acc_tf']:.4f} | "
+                                      f"ce_roll={_vm['val/ce_roll']:.4f} acc_roll={_vm['val/acc_roll']:.4f}")
                 _append_jsonl(_metrics_path, _rec)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
