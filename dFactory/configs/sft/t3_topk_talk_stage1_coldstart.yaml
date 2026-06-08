@@ -36,11 +36,14 @@ train:
   t3_mask_token_id: 156895
   t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> pure teacher-forced cold start
   t3_commit_threshold: 0.3
-  t3_full_mask_after_acc: 0.80          # CURRICULUM: hold sigma=0.75 until val/acc_tf>=0.80, then ->1.0 (100% mask)
+  t3_curriculum_step: 0.5               # CURRICULUM: 3-step reveal-ratio ramp 25%->12.5%->0% (sigma 0.75/0.875/1.0).
+                                        #   advance one step each time the talk beats think (acc_tf>acc_think).
+  t3_full_mask_after_acc: 0.5           # acc floor: don't advance on early noise (real gate = talk beats think).
 
   t3_val_every: 200
   t3_val_size: 64
-  t3_keep_best_n: 3
+  t3_keep_best_n: 2        # keep the LATEST 2 ckpt dirs (retention is now keep-latest, not best-ce —
+                           # right under the curriculum). ~2x32GB on disk; set 1 if storage is very tight.
 
   data_parallel_mode: ddp
   tensor_parallel_size: 1
@@ -49,7 +52,8 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 2
-  max_steps: 4000                       # ~2 epochs of the merged-only run reached loss 1.06; match that.
+  max_steps: 10000                      # generous CAP — interrupt on plateau (see below), don't run it all.
+                                        #   (full epoch = 174854 steps ~= 97h; never needed — ce plateaus early.)
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
@@ -80,7 +84,7 @@ train:
 
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_steps: 2000
+  save_steps: 1000                      # frequent saves so interrupting never loses much (best-N kept)
   save_epochs: 1
   save_hf_weights: true
 

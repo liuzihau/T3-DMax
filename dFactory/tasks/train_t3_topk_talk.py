@@ -168,12 +168,19 @@ class LLaDA2TrainingArguments(TrainingArguments):
         metadata={"help": "Confidence threshold for the rollout's per-block left-to-right prefix "
                           "commit (DMax decode_uniform tau; matches inference)."}
     )
+    t3_curriculum_step: float = field(
+        default=0.0,
+        metadata={"help": "Mask-ratio CURRICULUM enable + step. 0 = off (sigma uniform in [noise_range]). "
+                          ">0 enables a multi-step ramp from noise_range_low to high: each time the talk "
+                          "BEATS think's top-1 (acc_tf > acc_think, i.e. positive gain) AND acc_tf >= "
+                          "t3_full_mask_after_acc, the shared sigma-progress advances by this step. "
+                          "0.5 -> low / mid / high (e.g. reveal 25% -> 12.5% -> 0%); 1.0 -> low / high. "
+                          "Requires noise_range_low != noise_range_high."}
+    )
     t3_full_mask_after_acc: float = field(
         default=0.0,
-        metadata={"help": "Mask-ratio CURRICULUM. 0 = off (sigma uniform in [noise_range]). If >0, "
-                          "sigma stays at noise_range_low until val/acc_tf reaches this, then ramps "
-                          "to noise_range_high (set high=1.0 for 100% mask = the inference block-start "
-                          "condition). Requires noise_range_low != noise_range_high."}
+        metadata={"help": "Curriculum acc FLOOR: don't advance the mask-ratio step until val/acc_tf >= "
+                          "this (prevents advancing on early noise). The real gate is 'talk beats think'."}
     )
     t3_keep_mask_residual: bool = field(
         default=False,
@@ -255,7 +262,7 @@ def _append_jsonl(path, record):
 
 @torch.no_grad()
 def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
-                  top_k, rollout_frac=0.5, keep_mask_residual=False):
+                  top_k, rollout_frac=0.5, keep_mask_residual=False, do_rollout=True):
     """Quick anchor-free top-K val. Reports TWO sets of CE + token-match acc on the masked
     predict positions:
       * `_tf`   : teacher-forced -- clean context (the base rerank ability; looks easy).
@@ -266,6 +273,7 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                   this costs 2 talk forwards/example total."""
     was_training = talk.training
     talk.eval()
+    th_ce = th_ok = th_n = 0          # think's own top-1 (the candidate source) — does the talk beat it?
     tf_ce = tf_ok = tf_n = 0
     mk_ce = mk_ok = mk_n = 0
     rl_ce = rl_ok = rl_n = 0
@@ -286,6 +294,12 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         valid = labels != -100
         if int(valid.sum()) == 0:
             continue
+        # --- think's own top-1 (the candidate source; reuse think_logits, no extra forward) ---
+        th_logits = think_logits[:, :L]
+        th_ce += F.cross_entropy(th_logits.reshape(-1, th_logits.shape[-1]).float(),
+                                 labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+        th_ok += int(((th_logits.argmax(-1) == labels) & valid).sum())
+        th_n += int(valid.sum())
         # --- teacher-forced (clean context) ---
         tf_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
                                              mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
@@ -303,27 +317,29 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
         mk_ok += int(((mk_logits.argmax(-1) == labels) & valid).sum())
         mk_n += int(valid.sum())
-        # --- rollout (own commits as context) ---
-        argmax_tf = tf_logits.argmax(-1)                                   # talk's own preds
-        committed = valid & (torch.rand_like(argmax_tf.float()) < rollout_frac)
-        still = valid & (~committed)
-        if int(still.sum()) == 0:
-            continue
-        full_roll = full.clone()
-        full_roll[:, :L] = torch.where(committed, argmax_tf, full_roll[:, :L])
-        rl_embeds = build_talk_inputs_embeds(full_roll, think_logits, embedding, mask_id,
-                                             mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
-        rl_logits = talk(inputs_embeds=rl_embeds, attention_mask=attn, position_ids=pos,
-                         use_cache=False, return_dict=True).logits[:, :L]
-        labels_still = labels.clone()
-        labels_still[~still] = -100
-        rl_ce += F.cross_entropy(rl_logits.reshape(-1, rl_logits.shape[-1]).float(),
-                                 labels_still.reshape(-1), ignore_index=-100, reduction="sum").item()
-        rl_ok += int(((rl_logits.argmax(-1) == labels) & still).sum())
-        rl_n += int(still.sum())
+        # --- rollout (own commits as context) — ONLY when on-policy is active (Stage 2) ---
+        if do_rollout:
+            argmax_tf = tf_logits.argmax(-1)                               # talk's own preds
+            committed = valid & (torch.rand_like(argmax_tf.float()) < rollout_frac)
+            still = valid & (~committed)
+            if int(still.sum()) > 0:
+                full_roll = full.clone()
+                full_roll[:, :L] = torch.where(committed, argmax_tf, full_roll[:, :L])
+                rl_embeds = build_talk_inputs_embeds(full_roll, think_logits, embedding, mask_id,
+                                                     mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
+                rl_logits = talk(inputs_embeds=rl_embeds, attention_mask=attn, position_ids=pos,
+                                 use_cache=False, return_dict=True).logits[:, :L]
+                labels_still = labels.clone()
+                labels_still[~still] = -100
+                rl_ce += F.cross_entropy(rl_logits.reshape(-1, rl_logits.shape[-1]).float(),
+                                         labels_still.reshape(-1), ignore_index=-100, reduction="sum").item()
+                rl_ok += int(((rl_logits.argmax(-1) == labels) & still).sum())
+                rl_n += int(still.sum())
     if was_training:
         talk.train()
-    out = {"val/ce_tf": (tf_ce / tf_n if tf_n else float("nan")),
+    out = {"val/ce_think": (th_ce / th_n if th_n else float("nan")),
+           "val/acc_think": (th_ok / th_n if th_n else float("nan")),
+           "val/ce_tf": (tf_ce / tf_n if tf_n else float("nan")),
            "val/acc_tf": (tf_ok / tf_n if tf_n else float("nan")),
            "val/ce_mask": (mk_ce / mk_n if mk_n else float("nan")),
            "val/acc_mask": (mk_ok / mk_n if mk_n else float("nan")),
@@ -333,15 +349,17 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
 
 
 def _prune_best_ckpts(saved, keep_n):
-    """saved = list of {val_ce, dir}. Keep keep_n lowest-CE dirs; rmtree the rest."""
+    """Keep the LATEST keep_n step dirs; rmtree the rest. (Keep-latest, not best-ce: under a
+    mask-ratio curriculum ce RISES with sigma, so 'best ce' would prune the most-trained ckpt —
+    exactly the one we chain from. Storage-friendly: only keep_n dirs ever on disk.)"""
     import shutil
     if keep_n <= 0 or len(saved) <= keep_n:
         return saved
-    ordered = sorted(saved, key=lambda d: (float("inf") if d["val_ce"] != d["val_ce"] else d["val_ce"]))
+    ordered = sorted(saved, key=lambda d: d["step"], reverse=True)     # latest first
     keep, drop = ordered[:keep_n], ordered[keep_n:]
     for d in drop:
         shutil.rmtree(d["dir"], ignore_errors=True)
-        logger.info_rank0(f"[t3d ckpt] pruned {d['dir']} (val_ce={d['val_ce']:.4f}); keeping best {keep_n}")
+        logger.info_rank0(f"[t3d ckpt] pruned {d['dir']} (step {d['step']}); keeping latest {keep_n}")
     return keep
 
 
@@ -383,7 +401,7 @@ def main():
         # progress value (0 -> noise_range_low, 1 -> noise_range_high). The val loop flips it to
         # 1.0 once val/acc_tf crosses the threshold (sigma low -> high = e.g. 75% -> 100% mask).
         noise_progress = (mp.Value("d", 0.0)
-                          if args.train.t3_full_mask_after_acc > 0
+                          if args.train.t3_curriculum_step > 0
                           and args.data.noise_range_low != args.data.noise_range_high else None)
         transform = partial(
             process_mdm_sft_example,
@@ -777,7 +795,8 @@ def main():
                     _vm = _run_topk_val(think, model, think_emb, args.train.t3_mask_token_id,
                                         _val_examples, transform, block_diffusion_attn_mask_prototype,
                                         get_device_type(), args.train.t3_top_k,
-                                        keep_mask_residual=args.train.t3_keep_mask_residual)
+                                        keep_mask_residual=args.train.t3_keep_mask_residual,
+                                        do_rollout=args.train.t3_rollout_commit_frac > 0)
                     _rec.update(_vm)
                     # retention by the inference-relevant rollout CE (fall back to TF if nan)
                     _last_val_ce = _vm["val/ce_roll"]
@@ -785,25 +804,31 @@ def main():
                         _last_val_ce = _vm["val/ce_tf"]
                     if args.train.use_wandb:
                         wandb.log(_vm, step=global_step)
+                    _roll_str = (f"acc_roll={_vm['val/acc_roll']:.4f} "
+                                 if _vm["val/acc_roll"] == _vm["val/acc_roll"] else "")  # nan => off (Stage 1)
                     logger.info_rank0(f"[t3d val] step {global_step} "
-                                      f"acc_tf={_vm['val/acc_tf']:.4f}(topK) "
-                                      f"acc_mask={_vm['val/acc_mask']:.4f}(mask) "
-                                      f"acc_roll={_vm['val/acc_roll']:.4f} | "
-                                      f"ce_tf={_vm['val/ce_tf']:.3f} ce_mask={_vm['val/ce_mask']:.3f} "
-                                      f"ce_roll={_vm['val/ce_roll']:.3f}  "
-                                      f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}]")
-                    # mask-ratio curriculum gate: once the low-mask task is learned (acc_tf >=
-                    # threshold), flip the shared sigma to noise_range_high (e.g. 100% mask) so
-                    # workers ramp up. One-way (never lowers).
+                                      f"acc_think={_vm['val/acc_think']:.4f}(think top1) "
+                                      f"acc_tf={_vm['val/acc_tf']:.4f}(talk topK) "
+                                      f"acc_mask={_vm['val/acc_mask']:.4f}(mask) {_roll_str}| "
+                                      f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}] "
+                                      f"[talk-vs-think={_vm['val/acc_tf']-_vm['val/acc_think']:+.3f}] "
+                                      f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
+                    # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when the
+                    # talk still BEATS think's top-1 (positive gain) AND clears the acc floor. One-way.
+                    _beats_think = (_vm["val/acc_tf"] == _vm["val/acc_tf"]            # not nan
+                                    and _vm["val/acc_tf"] > _vm["val/acc_think"])     # gain in acc > 0
                     if (noise_progress is not None and noise_progress.value < 1.0
-                            and _vm["val/acc_tf"] == _vm["val/acc_tf"]  # not nan
+                            and _beats_think
                             and _vm["val/acc_tf"] >= args.train.t3_full_mask_after_acc):
-                        noise_progress.value = 1.0
-                        _rec["curriculum"] = f"sigma->{args.data.noise_range_high}"
-                        logger.info_rank0(f"[t3d curriculum] step {global_step} val/acc_tf "
-                                          f"{_vm['val/acc_tf']:.3f} >= {args.train.t3_full_mask_after_acc} "
-                                          f"-> sigma ramps {args.data.noise_range_low}->"
-                                          f"{args.data.noise_range_high} (toward 100% mask)")
+                        noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
+                        _sigma = (args.data.noise_range_low + noise_progress.value
+                                  * (args.data.noise_range_high - args.data.noise_range_low))
+                        _rec["curriculum"] = f"sigma={_sigma:.3f}"
+                        logger.info_rank0(f"[t3d curriculum] step {global_step} talk beats think "
+                                          f"(acc_tf {_vm['val/acc_tf']:.3f} > acc_think "
+                                          f"{_vm['val/acc_think']:.3f}) -> progress "
+                                          f"{noise_progress.value:.2f}, sigma~{_sigma:.3f} "
+                                          f"(reveal~{(1-_sigma)*100:.1f}%)")
                 _append_jsonl(_metrics_path, _rec)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
