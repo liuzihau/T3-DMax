@@ -66,7 +66,7 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
 # ---- the anchor-free top-K decode ---------------------------------------------
 @torch.no_grad()
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
-                     threshold, top_k, max_iters, device, dtype):
+                     threshold, top_k, max_iters, device, dtype, keep_mask_residual=True):
     P = prompt_ids.shape[1]
     L = ((P + gen_length + block_length - 1) // block_length) * block_length
     x = torch.full((1, L), mask_id, dtype=torch.long, device=device)
@@ -84,7 +84,7 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
                              position_ids=p, use_cache=False, return_dict=True).logits
         think_fwd += 1
         think_soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, mask_id,
-                                            top_k=top_k, keep_mask_residual=True)   # [1, blk, D]
+                                            top_k=top_k, keep_mask_residual=keep_mask_residual)   # [1, blk, D]
         # TALK iterates
         for _ in range(max_iters):
             block_x = x[:, bs:be]
@@ -143,6 +143,9 @@ def main():
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--debug_print", action="store_true")
+    ap.add_argument("--no_mask_residual", action="store_true",
+                    help="Feed the talk no-mask top-K (matches training keep_mask_residual=False). "
+                         "Try this first — the mask-residual default is off-distribution for the talk.")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -170,7 +173,8 @@ def main():
         resp, th, tk = decode_topk_talk(think, talk, emb, mask_id, prompt_ids,
                                         gen_length=args.gen_length, block_length=args.block_length,
                                         threshold=args.threshold, top_k=args.top_k,
-                                        max_iters=args.max_iters, device=args.device, dtype=dtype)
+                                        max_iters=args.max_iters, device=args.device, dtype=dtype,
+                                        keep_mask_residual=not args.no_mask_residual)
         text = tok.decode(resp[0], skip_special_tokens=True)
         gold, pred = gold_answer(row["answer"]), pred_answer(text)
         ok = is_correct(pred, gold)
