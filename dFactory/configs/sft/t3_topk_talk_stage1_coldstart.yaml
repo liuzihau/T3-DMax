@@ -22,8 +22,8 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75
-  noise_range_high: 0.75
+  noise_range_low: 0.75            # mask-ratio curriculum: start at 75% ...
+  noise_range_high: 1.0            # ... ramp to 100% (inference block-start condition) once learned
   num_workers: 16
 
 train:
@@ -36,6 +36,7 @@ train:
   t3_mask_token_id: 156895
   t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> pure teacher-forced cold start
   t3_commit_threshold: 0.3
+  t3_full_mask_after_acc: 0.80          # CURRICULUM: hold sigma=0.75 until val/acc_tf>=0.80, then ->1.0 (100% mask)
 
   t3_val_every: 200
   t3_val_size: 64

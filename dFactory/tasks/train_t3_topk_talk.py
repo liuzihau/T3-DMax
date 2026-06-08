@@ -1,4 +1,5 @@
 import json
+import multiprocessing as mp
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -166,6 +167,13 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default=0.3,
         metadata={"help": "Confidence threshold for the rollout's per-block left-to-right prefix "
                           "commit (DMax decode_uniform tau; matches inference)."}
+    )
+    t3_full_mask_after_acc: float = field(
+        default=0.0,
+        metadata={"help": "Mask-ratio CURRICULUM. 0 = off (sigma uniform in [noise_range]). If >0, "
+                          "sigma stays at noise_range_low until val/acc_tf reaches this, then ramps "
+                          "to noise_range_high (set high=1.0 for 100% mask = the inference block-start "
+                          "condition). Requires noise_range_low != noise_range_high."}
     )
 
 
@@ -348,17 +356,25 @@ def main():
 
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
+    noise_progress = None     # mask-ratio curriculum handle (set in the conversation branch)
     if args.data.data_type == "conversation":
         if not tokenizer.chat_template:
             raise ValueError(f"No chat template found in the tokenizer.")
 
+        # T3-D mask-ratio curriculum: when t3_full_mask_after_acc>0, sigma is gated by a shared
+        # progress value (0 -> noise_range_low, 1 -> noise_range_high). The val loop flips it to
+        # 1.0 once val/acc_tf crosses the threshold (sigma low -> high = e.g. 75% -> 100% mask).
+        noise_progress = (mp.Value("d", 0.0)
+                          if args.train.t3_full_mask_after_acc > 0
+                          and args.data.noise_range_low != args.data.noise_range_high else None)
         transform = partial(
             process_mdm_sft_example,
             tokenizer=tokenizer,
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
             noise_range=(args.data.noise_range_low, args.data.noise_range_high),
-            mask_token_id=156895, 
+            mask_token_id=156895,
+            progress_state=noise_progress,
         )
     elif args.data.data_type == "tokenid":
         transform = partial(
@@ -619,41 +635,45 @@ def main():
                 labels = micro_batch.pop("labels", None)
 
 
-                #=============== T3-D top-K injection (+ on-policy rollout) =======================
-                # think (frozen) -> per-position top-K candidates fed to the talk at the noisy
-                # masked positions (both flags use top-K = the inference input).
-                # flag=True adds an ON-POLICY mini-rollout: the talk predicts once, then a
-                # per-batch random fraction of masked positions is committed with the talk's OWN
-                # argmax. The grad forward then sees its own (imperfect) commits as context —
-                # mirroring inference and fixing the exposure-bias collapse (the standalone-merge
-                # / teacher-forced failure mode). flag=False stays teacher-forced (clean context).
+                #=============== T3-D two-path top-K injection (+ on-policy rollout) ==============
+                # TWO PATHS (selected by `flag`, ~50/50 from the data), matching DMax's training
+                # (the talk inherits DMax's merged weights, so keep both):
+                #   Path A (flag=False): masked -> [MASK]  (standard MDM; think NOT needed)
+                #   Path B (flag=True):  masked -> think's top-K soft-embed (the inference input)
+                # flag=True additionally runs an ON-POLICY rollout (if t3_rollout_commit_frac>0):
+                # the talk predicts, the CONFIDENCE-PREFIX of masked positions is committed with
+                # the talk's OWN argmax, and the grad forward then sees its own commits as context
+                # (fixes exposure-bias collapse; mirrors inference).
                 mask_token_id = args.train.t3_mask_token_id
                 flag = bool(micro_batch["flag"].item())
-                with torch.no_grad():
-                    think_logits = think(
-                        inputs_embeds=think_emb(micro_batch["input_ids"]),
-                        attention_mask=micro_batch["attention_mask"],
-                        position_ids=micro_batch["position_ids"],
-                        use_cache=False,
-                    ).logits
-                    if flag and args.train.t3_rollout_commit_frac > 0:
-                        L0 = noisy_input_ids.shape[1]
-                        _roll_in = build_talk_inputs_embeds(
-                            micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                            mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False)
-                        _roll_logits = model(
-                            inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"], use_cache=False,
-                            output_router_logits=False).logits[:, :L0]
-                        _masked = micro_batch["input_ids"][:, :L0] == mask_token_id
-                        # CONFIDENCE-PREFIX commit (inference rule), not a random fraction.
-                        _argmax, _commit = confident_prefix_commit(
-                            _roll_logits, _masked, args.train.block_size, args.train.t3_commit_threshold)
-                        micro_batch["input_ids"][:, :L0] = torch.where(
-                            _commit, _argmax, micro_batch["input_ids"][:, :L0])
+                mode = "topk_soft" if flag else "mask"
+                think_logits = None
+                if flag:                                       # only Path B needs think's top-K
+                    with torch.no_grad():
+                        think_logits = think(
+                            inputs_embeds=think_emb(micro_batch["input_ids"]),
+                            attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"],
+                            use_cache=False,
+                        ).logits
+                        if args.train.t3_rollout_commit_frac > 0:
+                            L0 = noisy_input_ids.shape[1]
+                            _roll_in = build_talk_inputs_embeds(
+                                micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
+                                mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False)
+                            _roll_logits = model(
+                                inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
+                                position_ids=micro_batch["position_ids"], use_cache=False,
+                                output_router_logits=False).logits[:, :L0]
+                            _masked = micro_batch["input_ids"][:, :L0] == mask_token_id
+                            # CONFIDENCE-PREFIX commit (inference rule), not a random fraction.
+                            _argmax, _commit = confident_prefix_commit(
+                                _roll_logits, _masked, args.train.block_size, args.train.t3_commit_threshold)
+                            micro_batch["input_ids"][:, :L0] = torch.where(
+                                _commit, _argmax, micro_batch["input_ids"][:, :L0])
                 talk_embeds = build_talk_inputs_embeds(
                     micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                    mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False,
+                    mode=mode, top_k=args.train.t3_top_k, keep_mask_residual=False,
                 )
                 #======================================================================================
 
@@ -745,6 +765,18 @@ def main():
                     logger.info_rank0(f"[t3d val] step {global_step} "
                                       f"ce_tf={_vm['val/ce_tf']:.4f} acc_tf={_vm['val/acc_tf']:.4f} | "
                                       f"ce_roll={_vm['val/ce_roll']:.4f} acc_roll={_vm['val/acc_roll']:.4f}")
+                    # mask-ratio curriculum gate: once the low-mask task is learned (acc_tf >=
+                    # threshold), flip the shared sigma to noise_range_high (e.g. 100% mask) so
+                    # workers ramp up. One-way (never lowers).
+                    if (noise_progress is not None and noise_progress.value < 1.0
+                            and _vm["val/acc_tf"] == _vm["val/acc_tf"]  # not nan
+                            and _vm["val/acc_tf"] >= args.train.t3_full_mask_after_acc):
+                        noise_progress.value = 1.0
+                        _rec["curriculum"] = f"sigma->{args.data.noise_range_high}"
+                        logger.info_rank0(f"[t3d curriculum] step {global_step} val/acc_tf "
+                                          f"{_vm['val/acc_tf']:.3f} >= {args.train.t3_full_mask_after_acc} "
+                                          f"-> sigma ramps {args.data.noise_range_low}->"
+                                          f"{args.data.noise_range_high} (toward 100% mask)")
                 _append_jsonl(_metrics_path, _rec)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

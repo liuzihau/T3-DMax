@@ -26,8 +26,8 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75
-  noise_range_high: 0.75
+  noise_range_low: 0.75            # mask-ratio curriculum (75% -> 100%)
+  noise_range_high: 1.0
   num_workers: 16
 
 train:
@@ -39,6 +39,7 @@ train:
   t3_mask_token_id: 156895
   t3_rollout_commit_frac: 1.0           # ROLLOUT ON (gate); commit SELECTION = confidence-prefix below
   t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
+  t3_full_mask_after_acc: 0.80          # CURRICULUM: sigma 0.75 -> 1.0 once val/acc_tf>=0.80
 
   t3_val_every: 200                     # watch val/ce_roll vs val/ce_tf — the gap is the exposure bias
   t3_val_size: 64
