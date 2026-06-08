@@ -180,7 +180,14 @@ class LLaDA2TrainingArguments(TrainingArguments):
     t3_full_mask_after_acc: float = field(
         default=0.0,
         metadata={"help": "Curriculum acc FLOOR: don't advance the mask-ratio step until val/acc_tf >= "
-                          "this (prevents advancing on early noise). The real gate is 'talk beats think'."}
+                          "this (prevents advancing on early noise)."}
+    )
+    t3_curriculum_margin: float = field(
+        default=0.03,
+        metadata={"help": "Curriculum advance gate: advance when the talk has CAUGHT UP to think's "
+                          "top-1, i.e. acc_tf >= acc_think - margin. (The talk MATCHES, never beats, "
+                          "think — that's its ceiling — so a strict 'beats think' gate would stall "
+                          "forever. This fires once the talk has learned all it can at the level.)"}
     )
     t3_keep_mask_residual: bool = field(
         default=False,
@@ -814,20 +821,22 @@ def main():
                                       f"[talk-vs-think={_vm['val/acc_tf']-_vm['val/acc_think']:+.3f}] "
                                       f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
                     # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when the
-                    # talk still BEATS think's top-1 (positive gain) AND clears the acc floor. One-way.
-                    _beats_think = (_vm["val/acc_tf"] == _vm["val/acc_tf"]            # not nan
-                                    and _vm["val/acc_tf"] > _vm["val/acc_think"])     # gain in acc > 0
+                    # talk has CAUGHT UP to think's top-1 (acc_tf within margin of acc_think = its ceiling)
+                    # AND clears the acc floor. One-way. (A strict 'beats think' gate never fires since the
+                    # talk matches, not beats, think.)
+                    _caught_up = (_vm["val/acc_tf"] == _vm["val/acc_tf"]              # not nan
+                                  and _vm["val/acc_tf"] >= _vm["val/acc_think"] - args.train.t3_curriculum_margin)
                     if (noise_progress is not None and noise_progress.value < 1.0
-                            and _beats_think
+                            and _caught_up
                             and _vm["val/acc_tf"] >= args.train.t3_full_mask_after_acc):
                         noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
                         _sigma = (args.data.noise_range_low + noise_progress.value
                                   * (args.data.noise_range_high - args.data.noise_range_low))
                         _rec["curriculum"] = f"sigma={_sigma:.3f}"
-                        logger.info_rank0(f"[t3d curriculum] step {global_step} talk beats think "
-                                          f"(acc_tf {_vm['val/acc_tf']:.3f} > acc_think "
-                                          f"{_vm['val/acc_think']:.3f}) -> progress "
-                                          f"{noise_progress.value:.2f}, sigma~{_sigma:.3f} "
+                        logger.info_rank0(f"[t3d curriculum] step {global_step} talk caught up to think "
+                                          f"(acc_tf {_vm['val/acc_tf']:.3f} vs acc_think "
+                                          f"{_vm['val/acc_think']:.3f}, margin {args.train.t3_curriculum_margin}) "
+                                          f"-> progress {noise_progress.value:.2f}, sigma~{_sigma:.3f} "
                                           f"(reveal~{(1-_sigma)*100:.1f}%)")
                 _append_jsonl(_metrics_path, _rec)
 
