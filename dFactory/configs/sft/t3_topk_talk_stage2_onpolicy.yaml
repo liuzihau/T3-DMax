@@ -40,6 +40,9 @@ train:
   t3_rollout_commit_frac: 1.0           # ROLLOUT ON (gate); commit SELECTION = confidence-prefix below
   t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
   t3_full_mask_after_acc: 0.80          # CURRICULUM: sigma 0.75 -> 1.0 once val/acc_tf>=0.80
+  t3_keep_mask_residual: true           # Stage 2 mimics inference EXACTLY: Path B input = top-K +
+                                        # mask-residual + renorm (the decode-time blend). Commits and
+                                        # trained input now match inference. (Stage 1 stays false.)
 
   t3_val_every: 200                     # watch val/ce_roll vs val/ce_tf — the gap is the exposure bias
   t3_val_size: 64

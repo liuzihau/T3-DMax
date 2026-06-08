@@ -175,6 +175,13 @@ class LLaDA2TrainingArguments(TrainingArguments):
                           "to noise_range_high (set high=1.0 for 100% mask = the inference block-start "
                           "condition). Requires noise_range_low != noise_range_high."}
     )
+    t3_keep_mask_residual: bool = field(
+        default=False,
+        metadata={"help": "Path-B top-K input variant. False = no-mask renorm-in-top-K (clean candidate "
+                          "signal; use for the Stage-1 cold start). True = top-K + mask-residual + "
+                          "renormalize = the EXACT inference input -> use for Stage-2 on-policy so "
+                          "the rollout's commits and the trained input match decode time."}
+    )
 
 
 @dataclass
@@ -248,7 +255,7 @@ def _append_jsonl(path, record):
 
 @torch.no_grad()
 def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
-                  top_k, rollout_frac=0.5):
+                  top_k, rollout_frac=0.5, keep_mask_residual=False):
     """Quick anchor-free top-K val. Reports TWO sets of CE + token-match acc on the masked
     predict positions:
       * `_tf`   : teacher-forced -- clean context (the base rerank ability; looks easy).
@@ -260,6 +267,7 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
     was_training = talk.training
     talk.eval()
     tf_ce = tf_ok = tf_n = 0
+    mk_ce = mk_ok = mk_n = 0
     rl_ce = rl_ok = rl_n = 0
     attn = attn_proto.to(device)
     for ex in val_examples:
@@ -280,13 +288,21 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
             continue
         # --- teacher-forced (clean context) ---
         tf_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
-                                             mode="topk_soft", top_k=top_k, keep_mask_residual=False)
+                                             mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
         tf_logits = talk(inputs_embeds=tf_embeds, attention_mask=attn, position_ids=pos,
                          use_cache=False, return_dict=True).logits[:, :L]
         tf_ce += F.cross_entropy(tf_logits.reshape(-1, tf_logits.shape[-1]).float(),
                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
         tf_ok += int(((tf_logits.argmax(-1) == labels) & valid).sum())
         tf_n += int(valid.sum())
+        # --- PURE MASK path (no think) — the baseline: does top-K beat [MASK]? ---
+        mk_embeds = build_talk_inputs_embeds(full, None, embedding, mask_id, mode="mask")
+        mk_logits = talk(inputs_embeds=mk_embeds, attention_mask=attn, position_ids=pos,
+                         use_cache=False, return_dict=True).logits[:, :L]
+        mk_ce += F.cross_entropy(mk_logits.reshape(-1, mk_logits.shape[-1]).float(),
+                                 labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+        mk_ok += int(((mk_logits.argmax(-1) == labels) & valid).sum())
+        mk_n += int(valid.sum())
         # --- rollout (own commits as context) ---
         argmax_tf = tf_logits.argmax(-1)                                   # talk's own preds
         committed = valid & (torch.rand_like(argmax_tf.float()) < rollout_frac)
@@ -296,7 +312,7 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         full_roll = full.clone()
         full_roll[:, :L] = torch.where(committed, argmax_tf, full_roll[:, :L])
         rl_embeds = build_talk_inputs_embeds(full_roll, think_logits, embedding, mask_id,
-                                             mode="topk_soft", top_k=top_k, keep_mask_residual=False)
+                                             mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
         rl_logits = talk(inputs_embeds=rl_embeds, attention_mask=attn, position_ids=pos,
                          use_cache=False, return_dict=True).logits[:, :L]
         labels_still = labels.clone()
@@ -309,6 +325,8 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         talk.train()
     out = {"val/ce_tf": (tf_ce / tf_n if tf_n else float("nan")),
            "val/acc_tf": (tf_ok / tf_n if tf_n else float("nan")),
+           "val/ce_mask": (mk_ce / mk_n if mk_n else float("nan")),
+           "val/acc_mask": (mk_ok / mk_n if mk_n else float("nan")),
            "val/ce_roll": (rl_ce / rl_n if rl_n else float("nan")),
            "val/acc_roll": (rl_ok / rl_n if rl_n else float("nan"))}
     return out
@@ -658,9 +676,12 @@ def main():
                         ).logits
                         if args.train.t3_rollout_commit_frac > 0:
                             L0 = noisy_input_ids.shape[1]
+                            # commit-deciding forward uses the EXACT inference input (mask-residual
+                            # when t3_keep_mask_residual), so the commits match decode time.
                             _roll_in = build_talk_inputs_embeds(
                                 micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                                mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False)
+                                mode="topk_soft", top_k=args.train.t3_top_k,
+                                keep_mask_residual=args.train.t3_keep_mask_residual)
                             _roll_logits = model(
                                 inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
                                 position_ids=micro_batch["position_ids"], use_cache=False,
@@ -673,7 +694,8 @@ def main():
                                 _commit, _argmax, micro_batch["input_ids"][:, :L0])
                 talk_embeds = build_talk_inputs_embeds(
                     micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                    mode=mode, top_k=args.train.t3_top_k, keep_mask_residual=False,
+                    mode=mode, top_k=args.train.t3_top_k,
+                    keep_mask_residual=args.train.t3_keep_mask_residual,
                 )
                 #======================================================================================
 
@@ -754,7 +776,8 @@ def main():
                 if _do_val:
                     _vm = _run_topk_val(think, model, think_emb, args.train.t3_mask_token_id,
                                         _val_examples, transform, block_diffusion_attn_mask_prototype,
-                                        get_device_type(), args.train.t3_top_k)
+                                        get_device_type(), args.train.t3_top_k,
+                                        keep_mask_residual=args.train.t3_keep_mask_residual)
                     _rec.update(_vm)
                     # retention by the inference-relevant rollout CE (fall back to TF if nan)
                     _last_val_ce = _vm["val/ce_roll"]
@@ -763,8 +786,12 @@ def main():
                     if args.train.use_wandb:
                         wandb.log(_vm, step=global_step)
                     logger.info_rank0(f"[t3d val] step {global_step} "
-                                      f"ce_tf={_vm['val/ce_tf']:.4f} acc_tf={_vm['val/acc_tf']:.4f} | "
-                                      f"ce_roll={_vm['val/ce_roll']:.4f} acc_roll={_vm['val/acc_roll']:.4f}")
+                                      f"acc_tf={_vm['val/acc_tf']:.4f}(topK) "
+                                      f"acc_mask={_vm['val/acc_mask']:.4f}(mask) "
+                                      f"acc_roll={_vm['val/acc_roll']:.4f} | "
+                                      f"ce_tf={_vm['val/ce_tf']:.3f} ce_mask={_vm['val/ce_mask']:.3f} "
+                                      f"ce_roll={_vm['val/ce_roll']:.3f}  "
+                                      f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}]")
                     # mask-ratio curriculum gate: once the low-mask task is learned (acc_tf >=
                     # threshold), flip the shared sigma to noise_range_high (e.g. 100% mask) so
                     # workers ramp up. One-way (never lowers).
