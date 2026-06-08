@@ -153,6 +153,13 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default=3,
         metadata={"help": "Keep only the N best hf checkpoints by val CE (0=keep all)."}
     )
+    t3_rollout_commit_frac: float = field(
+        default=1.0,
+        metadata={"help": "On-policy rollout (flag=True): commit a per-batch uniform-random "
+                          "fraction in [0, this] of masked positions with the talk's OWN argmax "
+                          "before the grad forward, so it trains on its own commits (fixes "
+                          "exposure-bias collapse). 0 disables on-policy (pure teacher-forced)."}
+    )
 
 
 @dataclass
@@ -577,14 +584,16 @@ def main():
                 labels = micro_batch.pop("labels", None)
 
 
-                #============================ T3-D top-K injection ===============================
-                # Replaces DMax's argmax OPUT rollout. The FROZEN think produces per-position
-                # top-K candidates; we feed them to the talk as the input embedding at the noisy
-                # masked positions (Path B, flag=True) or leave [MASK] (Path A, flag=False).
-                # build_talk_inputs_embeds injects only at ==mask_token_id positions (the noisy
-                # half); the clean half of the doubled sequence is embedded normally.
+                #=============== T3-D top-K injection (+ on-policy rollout) =======================
+                # think (frozen) -> per-position top-K candidates fed to the talk at the noisy
+                # masked positions (both flags use top-K = the inference input).
+                # flag=True adds an ON-POLICY mini-rollout: the talk predicts once, then a
+                # per-batch random fraction of masked positions is committed with the talk's OWN
+                # argmax. The grad forward then sees its own (imperfect) commits as context —
+                # mirroring inference and fixing the exposure-bias collapse (the standalone-merge
+                # / teacher-forced failure mode). flag=False stays teacher-forced (clean context).
                 mask_token_id = args.train.t3_mask_token_id
-                mode = "topk_soft" if micro_batch["flag"].item() else "mask"
+                flag = bool(micro_batch["flag"].item())
                 with torch.no_grad():
                     think_logits = think(
                         inputs_embeds=think_emb(micro_batch["input_ids"]),
@@ -592,9 +601,24 @@ def main():
                         position_ids=micro_batch["position_ids"],
                         use_cache=False,
                     ).logits
+                    if flag and args.train.t3_rollout_commit_frac > 0:
+                        L0 = noisy_input_ids.shape[1]
+                        _roll_in = build_talk_inputs_embeds(
+                            micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
+                            mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False)
+                        _roll_logits = model(
+                            inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"], use_cache=False,
+                            output_router_logits=False).logits[:, :L0]
+                        _argmax = _roll_logits.argmax(dim=-1)
+                        _masked = micro_batch["input_ids"][:, :L0] == mask_token_id
+                        _frac = float(torch.rand(1).item()) * args.train.t3_rollout_commit_frac
+                        _commit = _masked & (torch.rand_like(_argmax.float()) < _frac)
+                        micro_batch["input_ids"][:, :L0] = torch.where(
+                            _commit, _argmax, micro_batch["input_ids"][:, :L0])
                 talk_embeds = build_talk_inputs_embeds(
                     micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                    mode=mode, top_k=args.train.t3_top_k, keep_mask_residual=False,
+                    mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=False,
                 )
                 #======================================================================================
 
