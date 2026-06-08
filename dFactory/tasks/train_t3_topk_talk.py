@@ -40,7 +40,8 @@ import random
 # T3-D top-K talk: anchor-free think/talk. The frozen full think provides per-position
 # top-K candidates; the talk (this trainer's `model`, = merged_10L) consumes them as the
 # input embedding at masked positions. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
-from tasks.t3d_topk_talk import build_talk_inputs_embeds, load_causal_lm, set_talk_trainable
+from tasks.t3d_topk_talk import (build_talk_inputs_embeds, load_causal_lm, set_talk_trainable,
+                                 confident_prefix_commit)
 
 
 logger = helper.create_logger(__name__)
@@ -155,10 +156,16 @@ class LLaDA2TrainingArguments(TrainingArguments):
     )
     t3_rollout_commit_frac: float = field(
         default=1.0,
-        metadata={"help": "On-policy rollout (flag=True): commit a per-batch uniform-random "
-                          "fraction in [0, this] of masked positions with the talk's OWN argmax "
-                          "before the grad forward, so it trains on its own commits (fixes "
-                          "exposure-bias collapse). 0 disables on-policy (pure teacher-forced)."}
+        metadata={"help": "On-policy rollout gate (flag=True): >0 enables the rollout (commit the "
+                          "talk's own argmax before the grad forward, so it trains on its own "
+                          "commits — fixes exposure-bias collapse); 0 = pure teacher-forced. "
+                          "Commit SELECTION is the confidence-prefix rule (t3_commit_threshold), "
+                          "matching inference (not a random fraction)."}
+    )
+    t3_commit_threshold: float = field(
+        default=0.3,
+        metadata={"help": "Confidence threshold for the rollout's per-block left-to-right prefix "
+                          "commit (DMax decode_uniform tau; matches inference)."}
     )
 
 
@@ -638,10 +645,10 @@ def main():
                             inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
                             position_ids=micro_batch["position_ids"], use_cache=False,
                             output_router_logits=False).logits[:, :L0]
-                        _argmax = _roll_logits.argmax(dim=-1)
                         _masked = micro_batch["input_ids"][:, :L0] == mask_token_id
-                        _frac = float(torch.rand(1).item()) * args.train.t3_rollout_commit_frac
-                        _commit = _masked & (torch.rand_like(_argmax.float()) < _frac)
+                        # CONFIDENCE-PREFIX commit (inference rule), not a random fraction.
+                        _argmax, _commit = confident_prefix_commit(
+                            _roll_logits, _masked, args.train.block_size, args.train.t3_commit_threshold)
                         micro_batch["input_ids"][:, :L0] = torch.where(
                             _commit, _argmax, micro_batch["input_ids"][:, :L0])
                 talk_embeds = build_talk_inputs_embeds(

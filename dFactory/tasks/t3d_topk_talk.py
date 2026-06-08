@@ -124,6 +124,26 @@ def predict_loss(talk_logits: torch.Tensor, labels: torch.Tensor,
     return F.cross_entropy(talk_logits.view(-1, V), lbl.view(-1), ignore_index=ignore_index)
 
 
+def confident_prefix_commit(logits, mask_index, block_size, threshold):
+    """Per-block confident LEFT-TO-RIGHT prefix commit — the DMax decode_uniform rule,
+    generalized from one block to the whole noisy half [B, L]. Commits the contiguous
+    prefix of masked positions whose softmax peak > threshold within each block (non-mask
+    positions never break the cutoff). Matches the inference commit pattern, so the talk
+    trains on the same own-commit contexts it faces at decode time.
+
+    Returns (argmax [B, L], commit_mask [B, L] bool)."""
+    B, L, V = logits.shape
+    argmax = logits.argmax(dim=-1)                                   # [B, L]
+    probs = F.softmax(logits.float(), dim=-1)
+    max_probs = probs.gather(-1, argmax.unsqueeze(-1)).squeeze(-1)   # [B, L]
+    # masked positions gate the cutoff; non-masked positions (=1.0) never break the prefix
+    conf = torch.where(mask_index, max_probs, torch.ones_like(max_probs))
+    nb = L // block_size
+    confident = (conf > threshold).view(B, nb, block_size).long()
+    prefix = torch.cumprod(confident, dim=-1).bool().view(B, L)      # 1 until first low-conf in block
+    return argmax, (mask_index & prefix)
+
+
 def topk_talk_train_step(think, talk, embedding, mask_id, noisy_input_ids, labels,
                          attention_mask, position_ids, flag, *, top_k: int = 10):
     """One anchor-free top-K training step's forward+loss. THE reusable core of the

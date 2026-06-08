@@ -1,0 +1,93 @@
+# T3-D top-K talk — STAGE 2: on-policy OPD, initialised from the Stage-1 cold start.
+#
+# CRITICAL (THUNLP §5.1): model_path MUST point at the Stage-1 checkpoint, NOT ../merged_10L.
+# Running Stage 2 from scratch is the documented FAILURE mode ("Only OPD"). The rollout
+# now commits the CONFIDENCE-PREFIX (matches inference), not a random fraction.
+# See probe_runner/T3D_TOPK_TALK_METHOD.md §4.2-4.3.
+#
+# Before launching: set model.{config,model,tokenizer}_path below to the Stage-1 hf_ckpt
+# (e.g. ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt).
+#
+# Launch:  PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
+#          sh train.sh tasks/train_t3_topk_talk.py configs/sft/t3_topk_talk_stage2_onpolicy.yaml
+
+model:
+  # <<< EDIT: point at the STAGE-1 checkpoint (the cold-start init), not merged_10L >>>
+  config_path: ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt
+  model_path:  ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt
+  tokenizer_path: ../merged_10L
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./t3_topk_stage2_onpolicy_outputs
+
+  think_path: ../DMax-Math-16B-moe-merge
+  t3_top_k: 10
+  t3_train_layers: "5,6,7,8,9"          # same capacity scope as Stage 1
+  t3_mask_token_id: 156895
+  t3_rollout_commit_frac: 1.0           # ROLLOUT ON (gate); commit SELECTION = confidence-prefix below
+  t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
+
+  t3_val_every: 200                     # watch val/ce_roll vs val/ce_tf — the gap is the exposure bias
+  t3_val_size: 64
+  t3_keep_best_n: 3
+
+  data_parallel_mode: ddp
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 2
+  max_steps: 4000
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 5.0e-6                            # lower than Stage 1 (continuing from a trained ckpt; on-policy is harder)
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Memory note: Stage 2 does an extra (no-grad) rollout forward per flag=True batch (~1.5x talk compute).
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  broadcast_model_weights_from_rank0: false
+  enable_full_determinism: false
+  empty_cache_steps: 500
+
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_steps: 2000
+  save_epochs: 1
+  save_hf_weights: true
+
+  block_diffusion_mode: true
+  block_size: 32
+  same_token_labels: true
+
+  use_wandb: false
+  log_steps: 1
