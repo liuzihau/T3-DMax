@@ -38,6 +38,12 @@ train:
   t3_train_layers: "6,8"                    # merged-only: the 2 rep layers (~1.64B)
   t3_mask_token_id: 156895
 
+  # Quick val (CE + token-match acc) + local metrics + best-N ckpt retention
+  t3_val_every: 200        # run the cheap CE/acc val every 200 steps (also runs at each save_steps)
+  t3_val_size: 64          # val = tail of the train jsonl (proxy; GSM8K eval is the held-out metric)
+  t3_keep_best_n: 3        # keep only the 3 lowest-val-CE hf checkpoints
+  # t3_metrics_jsonl: defaults to <output_dir>/metrics.jsonl  -> plot train_loss / val/ce / val/acc yourself
+
   # Distributed — DDP (1 GPU). For multi-GPU, switch to fsdp2 + init_device:meta +
   # enable_full_shard:true + enable_mixed_precision:true (see the 2gpu config).
   data_parallel_mode: ddp
@@ -82,6 +88,7 @@ train:
   # Checkpointing
   ckpt_manager: dcp
   load_checkpoint_path: ""
+  save_steps: 1000        # save at 1000 & 2000 — max_steps(2000) < 1 epoch, so save_epochs never fires
   save_epochs: 1
   save_hf_weights: true
 

@@ -136,6 +136,23 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default=156895,
         metadata={"help": "LLaDA-2.0-mini's [MASK] token id."}
     )
+    t3_val_every: int = field(
+        default=0,
+        metadata={"help": "Run quick anchor-free top-K val (CE + token-match acc) every N "
+                          "steps (0=off). Val also runs at every save_steps for ckpt retention."}
+    )
+    t3_val_size: int = field(
+        default=64,
+        metadata={"help": "Number of val examples (tail of the train jsonl)."}
+    )
+    t3_metrics_jsonl: str = field(
+        default="",
+        metadata={"help": "Local metrics jsonl for self-plotting (default: <output_dir>/metrics.jsonl)."}
+    )
+    t3_keep_best_n: int = field(
+        default=3,
+        metadata={"help": "Keep only the N best hf checkpoints by val CE (0=keep all)."}
+    )
 
 
 @dataclass
@@ -190,6 +207,74 @@ def block_diffusion_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
 
     # **4. Combine Masks **
     return block_diagonal | offset_block_causal | block_causal
+
+
+# ============================================================================
+# T3-D top-K: quick validation + local metric logging + best-N ckpt retention
+# ============================================================================
+def _append_jsonl(path, record):
+    """Append one metric row to a local jsonl (for self-plotting). Rank-0 only."""
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logger.warning_rank0(f"[t3d metrics] write failed {path}: {e}")
+
+
+@torch.no_grad()
+def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device, top_k):
+    """Quick anchor-free top-K val: one forward per example (Path B), CE + token-match
+    acc on the masked predict positions. Cheap (no decode). Returns wandb-keyed dict."""
+    was_training = talk.training
+    talk.eval()
+    ce_sum, tok_ok, tok_n = 0.0, 0, 0
+    attn = attn_proto.to(device)
+    for ex in val_examples:
+        try:
+            t = transform(ex)
+            t = t[0] if isinstance(t, (list, tuple)) else t
+        except Exception:
+            continue
+        noisy, clean, labels = t["noisy_input_ids"], t["input_ids"], t["labels"]
+        L = noisy.shape[0]
+        full = torch.cat([noisy, clean], 0).unsqueeze(0).to(device)
+        labels = labels.unsqueeze(0).to(device)
+        pos = torch.cat([torch.arange(L), torch.arange(L)], 0).unsqueeze(0).to(device)
+        think_logits = think(inputs_embeds=embedding(full), attention_mask=attn,
+                             position_ids=pos, use_cache=False, return_dict=True).logits
+        talk_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
+                                               mode="topk_soft", top_k=top_k, keep_mask_residual=False)
+        logits = talk(inputs_embeds=talk_embeds, attention_mask=attn, position_ids=pos,
+                      use_cache=False, return_dict=True).logits[:, :L]
+        valid = labels != -100
+        n = int(valid.sum())
+        if n == 0:
+            continue
+        ce_sum += F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(),
+                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+        tok_ok += int(((logits.argmax(-1) == labels) & valid).sum())
+        tok_n += n
+    if was_training:
+        talk.train()
+    if tok_n == 0:
+        return {"val/ce": float("nan"), "val/acc": float("nan")}
+    ce = ce_sum / tok_n
+    return {"val/ce": ce, "val/acc": tok_ok / tok_n, "val/ppl": float(torch.exp(torch.tensor(ce)))}
+
+
+def _prune_best_ckpts(saved, keep_n):
+    """saved = list of {val_ce, dir}. Keep keep_n lowest-CE dirs; rmtree the rest."""
+    import shutil
+    if keep_n <= 0 or len(saved) <= keep_n:
+        return saved
+    ordered = sorted(saved, key=lambda d: (float("inf") if d["val_ce"] != d["val_ce"] else d["val_ce"]))
+    keep, drop = ordered[:keep_n], ordered[keep_n:]
+    for d in drop:
+        shutil.rmtree(d["dir"], ignore_errors=True)
+        logger.info_rank0(f"[t3d ckpt] pruned {d['dir']} (val_ce={d['val_ce']:.4f}); keeping best {keep_n}")
+    return keep
 
 
 def main():
@@ -318,6 +403,20 @@ def main():
     _n_tr = set_talk_trainable(model, _train_idx, freeze_embed_head=True)
     logger.info_rank0(f"[T3-D top-K] frozen think loaded; trainable talk layers "
                       f"{_train_idx} -> {_n_tr:,} params (merged-only)")
+
+    # T3-D top-K: val set (tail of the train jsonl) + local metrics + best-N ckpt tracking.
+    _val_examples = []
+    if args.train.t3_val_every > 0 or args.train.t3_keep_best_n > 0:
+        try:
+            with open(args.data.train_path, "r", encoding="utf-8") as _fh:
+                _tail = _fh.readlines()[-args.train.t3_val_size:]
+            _val_examples = [json.loads(s) for s in (l.strip() for l in _tail) if s]
+            logger.info_rank0(f"[t3d val] {len(_val_examples)} val examples (tail of train jsonl)")
+        except Exception as _e:
+            logger.warning_rank0(f"[t3d val] could not load val set: {_e}; val/retention disabled")
+    _metrics_path = args.train.t3_metrics_jsonl or os.path.join(args.train.output_dir, "metrics.jsonl")
+    _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
+    _last_val_ce = float("nan")
 
     optimizer = build_optimizer(
         model,
@@ -568,6 +667,23 @@ def main():
                     )
                     wandb.log(train_metrics, step=global_step)
 
+                # T3-D: local metrics row (+ quick val at val_every / save_steps) for self-plotting.
+                _rec = {"step": global_step, "train_loss": total_loss, "grad_norm": grad_norm, "lr": lr}
+                _do_val = bool(_val_examples) and (
+                    (args.train.t3_val_every and global_step % args.train.t3_val_every == 0)
+                    or (args.train.save_steps and global_step % args.train.save_steps == 0))
+                if _do_val:
+                    _vm = _run_topk_val(think, model, think_emb, args.train.t3_mask_token_id,
+                                        _val_examples, transform, block_diffusion_attn_mask_prototype,
+                                        get_device_type(), args.train.t3_top_k)
+                    _rec.update(_vm)
+                    _last_val_ce = _vm["val/ce"]
+                    if args.train.use_wandb:
+                        wandb.log(_vm, step=global_step)
+                    logger.info_rank0(f"[t3d val] step {global_step} "
+                                      f"ce={_vm['val/ce']:.4f} acc={_vm['val/acc']:.4f}")
+                _append_jsonl(_metrics_path, _rec)
+
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
                 if global_step == args.train.profile_end_step:
@@ -616,11 +732,21 @@ def main():
                         # Delete large objects immediately after use to free up memory for the next training epoch
                         del model_state_dict
                         helper.empty_cache()
-                        
+
+                        # T3-D: best-N retention. _last_val_ce was refreshed by the val that
+                        # runs at every save_steps above. Keep the N lowest-CE step dirs.
+                        if args.train.t3_keep_best_n > 0:
+                            _saved_ckpts.append({"val_ce": _last_val_ce, "dir": save_checkpoint_path,
+                                                 "step": global_step})
+                            _saved_ckpts = _prune_best_ckpts(_saved_ckpts, args.train.t3_keep_best_n)
+                            _append_jsonl(_metrics_path, {"step": global_step, "event": "save",
+                                                          "val_ce": _last_val_ce, "dir": save_checkpoint_path,
+                                                          "kept": [d["step"] for d in _saved_ckpts]})
+
                     except Exception as e:
                         logger.info_rank0(f"Failed to save HF checkpoint: {e}")
 
-                # Barrier is recommended here to prevent other ranks from starting the next epoch 
+                # Barrier is recommended here to prevent other ranks from starting the next epoch
                 # while Rank 0 is still converting weights, avoiding desync or resource contention
                 dist.barrier()
 
