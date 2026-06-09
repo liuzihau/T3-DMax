@@ -145,8 +145,28 @@ def dmax_ref_decode(think, emb_layer, x, bs, be, m, p, answer_index, init_block_
 
 
 def _decode_committed(tok, ids_row):
+    """Gap-stripped: drop MASK positions and glue the rest. Used for GRADING (clean
+    number extraction)."""
     keep = [int(t) for t in ids_row.tolist() if int(t) != MASK_ID]
     return tok.decode(keep, skip_special_tokens=True)
+
+
+def _decode_gaps(tok, ids_row, gap="·"):
+    """Display variant: decode each contiguous COMMITTED run, mark every masked gap
+    with a single `gap`. Shows partial-decode holes so glued anchors aren't mistaken
+    for duplicate words. (Don't grade on this — the gap marker can split numbers.)"""
+    out, run = [], []
+    for t in ids_row.tolist():
+        if int(t) == MASK_ID:
+            if run:
+                out.append(tok.decode(run, skip_special_tokens=True)); run = []
+            if not out or out[-1] != gap:
+                out.append(gap)
+        else:
+            run.append(int(t))
+    if run:
+        out.append(tok.decode(run, skip_special_tokens=True))
+    return " ".join(out)
 
 
 @torch.no_grad()
@@ -257,7 +277,7 @@ def main():
                             ref_max_iters=ref_max_iters, device=args.device, dtype=dtype,
                             keep_mask_residual=not args.no_mask_residual)
         gold = gold_answer(row["answer"])
-        texts = {k: _decode_committed(tok, out[k][0]) for k in ("ref", "A", "B")}
+        texts = {k: _decode_committed(tok, out[k][0]) for k in ("ref", "A", "B")}   # graded
         preds = {k: pred_answer(texts[k]) for k in texts}
         res = {k: is_correct(preds[k], gold) for k in preds}
         for k in ok:
@@ -273,8 +293,9 @@ def main():
                   f"A={'OK' if res['A'] else 'XX'}({preds['A']}) "
                   f"B={'OK' if res['B'] else 'XX'}({preds['B']}) ===")
             print(f"  Q: {row['question'][:140]!r}")
+            disp = {k: _decode_gaps(tok, out[k][0]) for k in ("ref", "A", "B")}   # '·' = uncommitted gap
             for k in ("ref", "A", "B"):
-                print(f"  {k:>3}: …{texts[k][-args.tail:]!r}")
+                print(f"  {k:>3}: …{disp[k][-args.tail:]!r}")
 
     n = len(rows)
     print("\n" + "=" * 78)
