@@ -4,28 +4,31 @@ Goal: with NO cascade contamination, compare two minimal-compute decode probes o
 each answer block against the fully-converged DMax tokens, and expose block bias.
 
 Per GSM8K example we sweep blocks left-to-right. At each block b the prefix (blocks
-< b) is already the FULL-DMax-CONVERGED tokens (clean), and block b is all-MASK. On
-that block we run three things, then commit the reference to form the next prefix:
+< b) is already the FULL-DMax-CONVERGED tokens (clean), and block b is all-MASK. We
+run ONE shared THINK forward on the all-mask block, then:
 
-  A) T3-D one-shot   : THINK once -> feed top-K to TALK once -> commit the confident
-                       left-to-right prefix (argmax until first below threshold).
-                       Cost = 1 think + 1 talk.
-  B) DMax 2-iter     : THINK only, <=2 passes, each commits argmax>threshold (DMax
-                       decode_uniform). Cost = up to 2 think.
-  REF) DMax converged: THINK only to convergence (<= ref_max_iters). The "final
-                       converged tokens"; also becomes the clean prefix for block b+1.
+  A) T3-D one-shot   : feed THINK's top-K to TALK once -> commit the confident
+                       left-to-right prefix. Cost = 1 think + 1 talk.
+  REF) DMax converged: THINK only, FAITHFUL DMax decode_uniform with soft-embedding
+                       feedback (committed positions fed back as
+                       p*embed(argmax)+(1-p)*embed(MASK), L2-renorm, rebuilt each
+                       iter; mirrors dInfer generate_t3d). Runs to convergence and
+                       becomes the clean prefix for block b+1. The "final converged
+                       tokens" reference.
+  B) DMax 2-iter     : NOT a separate decode — it is REF *snapshotted after 2 think
+                       forwards*. Same procedure, so B's committed positions are a
+                       subset of REF's (and may still shift as REF continues, since
+                       DMax re-argmaxes committed positions each pass).
 
-A and B run on the converged prefix but DO NOT write back (oracle-prefix probe);
-only REF is committed into the running sequence.
+A runs on the converged prefix but does NOT write back (oracle-prefix probe); only
+REF mutates the running sequence. The shared iter-0 THINK forward serves both A's
+top-K hand-off and REF's first commit.
 
 Reported:
   * GSM8K acc for REF (real), A and B (oracle-prefix).
   * Per-block table: coverage (committed / answer positions) and precision
     (committed tokens == REF) for A and B  -> block bias.
   * Uncommitted positions are left masked (decode only what was committed).
-
-Simplifications (toy): hard sticky commits (token embeds, like decode_topk_talk),
-not DMax soft-embed feedback.
 
 Run:
   python -m tasks.t3d_toy_eval_gsm8k \
@@ -41,6 +44,7 @@ import time
 from collections import defaultdict
 
 import torch
+import torch.nn.functional as F
 
 from tasks.t3d_topk_talk import load_causal_lm
 from tasks.t3d_topk_soft_embed import build_topk_soft_embeds
@@ -56,45 +60,88 @@ from tasks.t3d_topk_eval_gsm8k import (
 MASK_ID = 156895
 
 
-@torch.no_grad()
-def _think_logits(model, emb, x, be, m, p):
-    return model(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                 use_cache=False, return_dict=True).logits
+# --- DMax committed soft-embed feedback (copied from dInfer generate_t3d.build_inputs_embeds) ---
+def build_inputs_embeds(logits, max_probs, x0, hard_token_ids, embedding_layer, mask_id,
+                        committed_mask, uncommitted_mask, top_k=1):
+    """Committed -> p*embed(argmax)+(1-p)*embed(MASK), L2-renorm; uncommitted -> embed(MASK).
+    Stateless, rebuilt each iter. Returns block-shaped embeds [1, B, D]."""
+    device = logits.device
+    dtype = embedding_layer.weight.dtype
+    base_embeds = embedding_layer(hard_token_ids).clone()
+    if not bool(committed_mask.any()):
+        return base_embeds
+    if top_k == 1:
+        topk_probs = max_probs.unsqueeze(-1)
+        topk_indices = x0.unsqueeze(-1)
+    else:
+        probs = F.softmax(logits.float(), dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+    residual_probs = (1.0 - topk_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
+    topk_embeds = embedding_layer(topk_indices).to(torch.float32)
+    mask_embed = embedding_layer(torch.tensor([mask_id], device=device, dtype=torch.long)).to(torch.float32)
+    mask_norm = mask_embed.norm(p=2)
+    topk_weighted = (topk_embeds * topk_probs.unsqueeze(-1)).sum(dim=2)
+    soft_embeds = topk_weighted + mask_embed.view(1, 1, -1) * residual_probs
+    current_norm = soft_embeds.norm(p=2, dim=-1, keepdim=True)
+    topk_norms = topk_embeds.norm(p=2, dim=-1)
+    target_norm = (topk_norms * topk_probs).sum(dim=-1, keepdim=True) + mask_norm * residual_probs
+    soft_embeds = (soft_embeds * (target_norm / (current_norm + 1e-6))).to(dtype)
+    base_embeds[committed_mask] = soft_embeds[committed_mask]
+    return base_embeds
 
 
 @torch.no_grad()
-def dmax_decode_block(think, emb, x, bs, be, m, p, threshold, max_iters):
-    """Run THINK as a DMax (decode_uniform) decode on block b, IN PLACE on x, up to
-    max_iters passes. Returns (#think forwards used)."""
-    n = 0
-    for _ in range(max_iters):
-        block_x = x[:, bs:be]
-        mask_index = (block_x == MASK_ID)
-        if not bool(mask_index.any()):
-            break
-        logits = _think_logits(think, emb, x, be, m, p)[:, bs:be]
-        n += 1
-        x0, high_conf, _, breakflag = dmax_commit_uniform(logits, mask_index, mask_index, threshold)
-        x[:, bs:be] = torch.where(high_conf, x0, block_x)
-        if breakflag:
-            break
-    return n
+def _dmax_commit_step(block_logits, x, bs, be, answer_index, emb_layer, threshold, soft_top_k):
+    """One DMax decode_uniform commit step on the current block logits. Mutates x[block].
+    Returns (done, soft_block_embeds, committed_mask). Mirrors generate_t3d._commit_and_build_embeds
+    (think-only; no anchor)."""
+    mask_idx = (x[:, bs:be] == MASK_ID)
+    x0, high_conf, max_probs, breakflag = dmax_commit_uniform(block_logits, mask_idx, answer_index, threshold)
+    update_mask = high_conf | (answer_index & ~mask_idx)          # re-argmax committed too (DMax)
+    changed = update_mask & (x0 != x[:, bs:be])
+    if bool(update_mask.any()):
+        nb = x[0, bs:be].clone(); nb[update_mask[0]] = x0[0][update_mask[0]]; x[0, bs:be] = nb
+    new_mask = (x[:, bs:be] == MASK_ID)
+    committed = answer_index & (~new_mask)
+    uncommitted = answer_index & new_mask
+    soft = build_inputs_embeds(block_logits, max_probs, x0, x[:, bs:be], emb_layer, MASK_ID,
+                               committed, uncommitted, top_k=soft_top_k)
+    done = bool(breakflag) or (not bool(changed.any())) or (not bool(new_mask.any()))
+    return done, soft, committed
 
 
 @torch.no_grad()
-def t3d_oneshot_block(think, talk, emb, x, bs, be, m, p, threshold, top_k, keep_mask_residual):
-    """A: one THINK + one TALK on block b (reads x, does NOT write). Returns
-    (argmax tokens [1,B], committed mask [1,B] over the block)."""
-    mask_index = (x[:, bs:be] == MASK_ID)
-    think_logits = _think_logits(think, emb, x, be, m, p)
-    soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, MASK_ID,
-                                  top_k=top_k, keep_mask_residual=keep_mask_residual)
-    inp = emb(x[:, :be]).clone()                       # committed prefix -> token embed
-    inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)   # masked -> think top-K
-    talk_logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
+def dmax_ref_decode(think, emb_layer, x, bs, be, m, p, answer_index, init_block_logits, *,
+                    threshold, max_iters, soft_top_k, snapshot_after):
+    """Faithful DMax decode of block b (THINK only, soft-embed feedback), IN PLACE on x,
+    starting from init_block_logits (the shared iter-0 forward). Returns
+    (extra_think_forwards, snap_tok [1,B], snap_committed [1,B]); snap_* = the block state
+    after `snapshot_after` total think forwards (or convergence, whichever first) = method B."""
+    fwd = 1                                                       # the shared iter-0 forward
+    done, soft, committed = _dmax_commit_step(init_block_logits, x, bs, be, answer_index,
+                                              emb_layer, threshold, soft_top_k)
+    snap_tok = snap_comm = None
+    if fwd >= snapshot_after or done:
+        snap_tok, snap_comm = x[:, bs:be].clone(), committed.clone()
+    extra = 0
+    logits = init_block_logits
+    while not done and fwd < max_iters:
+        inp = emb_layer(x[:, :be]).clone()
+        inp[:, bs:be] = soft.to(inp.dtype)
+        logits = think(inputs_embeds=inp, attention_mask=m, position_ids=p,
                        use_cache=False, return_dict=True).logits[:, bs:be]
-    x0, high_conf, _, _ = dmax_commit_uniform(talk_logits, mask_index, mask_index, threshold)
-    return x0, high_conf
+        fwd += 1; extra += 1
+        done, soft, committed = _dmax_commit_step(logits, x, bs, be, answer_index,
+                                                  emb_layer, threshold, soft_top_k)
+        if snap_tok is None and (fwd >= snapshot_after or done):
+            snap_tok, snap_comm = x[:, bs:be].clone(), committed.clone()
+    still = (x[:, bs:be] == MASK_ID)                             # safety: never leak a MASK
+    if bool(still.any()):
+        fill = logits[0].argmax(-1)
+        nb = x[0, bs:be].clone(); nb[still[0]] = fill[still[0]]; x[0, bs:be] = nb
+    if snap_tok is None:
+        snap_tok, snap_comm = x[:, bs:be].clone(), (answer_index & (x[:, bs:be] != MASK_ID))
+    return extra, snap_tok, snap_comm
 
 
 def _decode_committed(tok, ids_row):
@@ -116,32 +163,38 @@ def sweep_example(think, talk, emb, prompt_ids, *, gen_length, block_length, thr
 
     ansA = torch.full((1, L), MASK_ID, dtype=torch.long, device=device)
     ansB = torch.full((1, L), MASK_ID, dtype=torch.long, device=device)
-    per_block = []   # list of (block_idx, statsA, statsB); stats = (committed, correct, total)
+    per_block = []
     th_fwd = tk_fwd = 0
 
     for b in range(first_b, num_b):
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
-        answer_pos = (x[:, bs:be] == MASK_ID)              # masked answer positions in this block
+        answer_pos = (x[:, bs:be] == MASK_ID)
         if not bool(answer_pos.any()):
             continue
 
-        # ---- A: 1 think + 1 talk (oracle prefix, no write-back) ----
-        a_tok, a_comm = t3d_oneshot_block(think, talk, emb, x, bs, be, m, p,
-                                          threshold, top_k, keep_mask_residual)
-        th_fwd += 1; tk_fwd += 1
+        # ---- shared iter-0 THINK forward on the all-mask block ----
+        think_logits0 = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+                              use_cache=False, return_dict=True).logits[:, bs:be]
+        th_fwd += 1
 
-        # ---- B: <=2 DMax think iters (on a copy) ----
-        xB = x.clone()
-        th_fwd += dmax_decode_block(think, emb, xB, bs, be, m, p, threshold, max_iters=2)
-        b_tok = xB[:, bs:be]
-        b_comm = answer_pos & (b_tok != MASK_ID)
+        # ---- A: 1 talk on think's top-K (oracle prefix, no write-back) ----
+        soft = build_topk_soft_embeds(think_logits0, emb, MASK_ID, top_k=top_k,
+                                      keep_mask_residual=keep_mask_residual)
+        inp = emb(x[:, :be]).clone()
+        inp[:, bs:be][answer_pos] = soft[answer_pos].to(inp.dtype)
+        talk_logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
+                           use_cache=False, return_dict=True).logits[:, bs:be]
+        tk_fwd += 1
+        a_tok, a_comm, _, _ = dmax_commit_uniform(talk_logits, answer_pos, answer_pos, threshold)
 
-        # ---- REF: full DMax convergence (writes into x -> clean prefix for b+1) ----
-        th_fwd += dmax_decode_block(think, emb, x, bs, be, m, p, threshold, max_iters=ref_max_iters)
+        # ---- REF (faithful DMax) + B snapshot (writes x -> clean prefix for b+1) ----
+        extra, b_tok, b_comm = dmax_ref_decode(think, emb, x, bs, be, m, p, answer_pos, think_logits0,
+                                               threshold=threshold, max_iters=ref_max_iters,
+                                               soft_top_k=1, snapshot_after=2)
+        th_fwd += extra
         ref_tok = x[:, bs:be]
 
-        # ---- assemble committed answers + per-block stats vs converged REF ----
         ansA[:, bs:be] = torch.where(a_comm, a_tok, torch.full_like(a_tok, MASK_ID))
         ansB[:, bs:be] = torch.where(b_comm, b_tok, torch.full_like(b_tok, MASK_ID))
         total = int(answer_pos.sum())
@@ -165,7 +218,7 @@ def main():
     ap.add_argument("--block_length", type=int, default=32)
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--top_k", type=int, default=10)
-    ap.add_argument("--ref_max_iters", type=int, default=0, help="REF convergence cap; 0 => block_length")
+    ap.add_argument("--ref_max_iters", type=int, default=0, help="REF convergence cap (forwards); 0 => block_length")
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quiet", action="store_true", help="suppress per-sample text print")
@@ -190,7 +243,7 @@ def main():
           f"top_k={args.top_k} thr={args.threshold} keep_mask_residual={not args.no_mask_residual}")
 
     ok = {"ref": 0, "A": 0, "B": 0}
-    blk = defaultdict(lambda: {"A": [0, 0, 0], "B": [0, 0, 0]})   # block_idx -> committed/correct/total
+    blk = defaultdict(lambda: {"A": [0, 0, 0], "B": [0, 0, 0]})
     tot_think = tot_talk = 0
     t0 = time.time()
 
@@ -230,7 +283,6 @@ def main():
           f"B(DMax-2iter)={ok['B']}/{n}={ok['B']/n:.3f}   (oracle-prefix for A/B)")
     print(f"[toy] mean think/ex={tot_think/n:.1f}  talk/ex={tot_talk/n:.1f}")
 
-    # per-block bias table (committed-token agreement vs converged REF)
     print("\n[toy] per-block committed-vs-converged  (cov=committed/answer, prec=correct/committed)")
     print(f"  {'blk':>4} | {'A cov':>6} {'A prec':>7} | {'B cov':>6} {'B prec':>7}")
     aggA = [0, 0, 0]; aggB = [0, 0, 0]
