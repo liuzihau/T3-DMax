@@ -7,8 +7,10 @@ Per GSM8K example we sweep blocks left-to-right. At each block b the prefix (blo
 < b) is already the FULL-DMax-CONVERGED tokens (clean), and block b is all-MASK. We
 run ONE shared THINK forward on the all-mask block, then:
 
-  A) T3-D one-shot   : feed THINK's top-K to TALK once -> commit the confident
-                       left-to-right prefix. Cost = 1 think + 1 talk.
+  A) T3-D one-shot   : feed TALK a HYBRID of THINK's first pass, then commit once.
+                       THINK-committed positions (its own DMax prefix) -> top-1 soft
+                       (argmax*p + MASK*(1-p), renorm; = REF feedback); the rest ->
+                       top-K (=10) soft blend. Cost = 1 think + 1 talk.
   REF) DMax converged: THINK only, FAITHFUL DMax decode_uniform with soft-embedding
                        feedback (committed positions fed back as
                        p*embed(argmax)+(1-p)*embed(MASK), L2-renorm, rebuilt each
@@ -198,11 +200,21 @@ def sweep_example(think, talk, emb, prompt_ids, *, gen_length, block_length, thr
                               use_cache=False, return_dict=True).logits[:, bs:be]
         th_fwd += 1
 
-        # ---- A: 1 talk on think's top-K (oracle prefix, no write-back) ----
-        soft = build_topk_soft_embeds(think_logits0, emb, MASK_ID, top_k=top_k,
-                                      keep_mask_residual=keep_mask_residual)
+        # ---- A: 1 talk on a HYBRID think input (oracle prefix, no write-back) ----
+        # split the block by think's OWN DMax commit on this all-mask block:
+        #   think-committed positions -> top-1 soft (argmax*p + MASK*(1-p), renorm; = REF feedback)
+        #   the rest                  -> top-K (=10) soft blend
+        th_x0, th_hi, th_mp, _ = dmax_commit_uniform(think_logits0, answer_pos, answer_pos, threshold)
+        th_comm = answer_pos & th_hi
+        soft_top1 = build_inputs_embeds(think_logits0, th_mp, th_x0, x[:, bs:be], emb, MASK_ID,
+                                        committed_mask=th_comm, uncommitted_mask=answer_pos & ~th_hi,
+                                        top_k=1)
+        soft_topk = build_topk_soft_embeds(think_logits0, emb, MASK_ID, top_k=top_k,
+                                           keep_mask_residual=keep_mask_residual)
+        blk_embeds = soft_topk.clone()                       # uncommitted -> top-K
+        blk_embeds[th_comm] = soft_top1[th_comm].to(blk_embeds.dtype)   # think-committed -> top-1
         inp = emb(x[:, :be]).clone()
-        inp[:, bs:be][answer_pos] = soft[answer_pos].to(inp.dtype)
+        inp[:, bs:be][answer_pos] = blk_embeds[answer_pos].to(inp.dtype)
         talk_logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
                            use_cache=False, return_dict=True).logits[:, bs:be]
         tk_fwd += 1
