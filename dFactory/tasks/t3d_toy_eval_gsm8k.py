@@ -220,7 +220,7 @@ def sweep_example(think, talk, emb, prompt_ids, *, gen_length, block_length, thr
         total = int(answer_pos.sum())
         sA = (int(a_comm.sum()), int(((a_tok == ref_tok) & a_comm).sum()), total)
         sB = (int(b_comm.sum()), int(((b_tok == ref_tok) & b_comm).sum()), total)
-        per_block.append((b, sA, sB))
+        per_block.append((b, sA, sB, ansA[0, bs:be].clone(), ansB[0, bs:be].clone(), ref_tok[0].clone()))
 
     return {
         "ref": x[:, P:P + gen_length], "A": ansA[:, P:P + gen_length],
@@ -282,7 +282,7 @@ def main():
         res = {k: is_correct(preds[k], gold) for k in preds}
         for k in ok:
             ok[k] += res[k]
-        for b, sA, sB in out["per_block"]:
+        for b, sA, sB, *_ in out["per_block"]:
             for j in range(3):
                 blk[b]["A"][j] += sA[j]; blk[b]["B"][j] += sB[j]
         tot_think += out["think_fwd"]; tot_talk += out["talk_fwd"]
@@ -293,9 +293,15 @@ def main():
                   f"A={'OK' if res['A'] else 'XX'}({preds['A']}) "
                   f"B={'OK' if res['B'] else 'XX'}({preds['B']}) ===")
             print(f"  Q: {row['question'][:140]!r}")
-            disp = {k: _decode_gaps(tok, out[k][0]) for k in ("ref", "A", "B")}   # '·' = uncommitted gap
-            for k in ("ref", "A", "B"):
-                print(f"  {k:>3}: …{disp[k][-args.tail:]!r}")
+            # per-block committed tokens: A (1 think+1 talk) vs B (2 think), both 2 forwards,
+            # with committed counts + per-block accuracy vs the REF-converged tokens. '·' = gap.
+            for b, sA, sB, a_ids, b_ids, ref_ids in out["per_block"]:
+                cA, kA, tA = sA; cB, kB, tB = sB
+                print(f"  blk {b:>2}  N={tA:<3} | A commit={cA:<3} acc={kA}/{cA} "
+                      f"| B commit={cB:<3} acc={kB}/{cB}")
+                print(f"      A: {_decode_gaps(tok, a_ids)!r}")
+                print(f"      B: {_decode_gaps(tok, b_ids)!r}")
+                print(f"    ref: {_decode_gaps(tok, ref_ids)!r}")
 
     n = len(rows)
     print("\n" + "=" * 78)
