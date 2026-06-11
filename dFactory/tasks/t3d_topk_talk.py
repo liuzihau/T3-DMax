@@ -26,9 +26,9 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from .t3d_topk_soft_embed import build_topk_soft_embeds         # package import
+    from .t3d_topk_soft_embed import build_topk_soft_embeds, inject_soft_embeds   # package import
 except ImportError:                                                  # standalone `python t3d_topk_talk.py`
-    from t3d_topk_soft_embed import build_topk_soft_embeds
+    from t3d_topk_soft_embed import build_topk_soft_embeds, inject_soft_embeds
 
 
 def _embed(embedding, ids):
@@ -114,16 +114,6 @@ def build_talk_inputs_embeds(
     return out
 
 
-def predict_loss(talk_logits: torch.Tensor, labels: torch.Tensor,
-                 predict_mask: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
-    """Plain CE on the predict positions (the still-masked ~75%). `predict_mask` is
-    bool [B, L]; positions where labels==ignore_index are skipped automatically."""
-    lbl = labels.clone()
-    lbl[~predict_mask] = ignore_index
-    V = talk_logits.shape[-1]
-    return F.cross_entropy(talk_logits.view(-1, V), lbl.view(-1), ignore_index=ignore_index)
-
-
 def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
                        labels: torch.Tensor, *, temperature: float = 1.0,
                        ignore_index: int = -100, eps: float = 1e-8) -> torch.Tensor:
@@ -171,54 +161,44 @@ def confident_prefix_commit(logits, mask_index, block_size, threshold):
     return argmax, (mask_index & prefix)
 
 
-def topk_talk_train_step(think, talk, embedding, mask_id, noisy_input_ids, labels,
-                         attention_mask, position_ids, flag, *, top_k: int = 10):
-    """One anchor-free top-K training step's forward+loss. THE reusable core of the
-    training loop (Block 2): the caller (a fork of train_t3_dmax_bd_oput.py) supplies
-    a batch + the block-causal `attention_mask` and calls this per micro-batch.
+def build_think_next_teacher(think, think_emb, full_input_ids, think_s1_logits, noisy_len,
+                             mask_id, *, block_size, threshold, top_k=10,
+                             attention_mask=None, position_ids=None):
+    """The think_{s+2} teacher for the Path-B (stage-1) KL.
 
-    think: frozen full LLaDA2-Moe (ForCausalLM); talk: trainable 10-layer LLaDA2-Moe.
-    `labels` already carries -100 at non-predict positions (the data transform sets
-    that), so CE(ignore_index=-100) scores exactly the masked predict positions.
-    `flag` (per micro-batch): True → Path B (think's top-K input); False → Path A ([MASK]).
-    """
-    with torch.no_grad():                                       # think frozen
-        think_logits = think(inputs_embeds=embedding(noisy_input_ids),
-                             attention_mask=attention_mask, position_ids=position_ids,
-                             use_cache=False, return_dict=True).logits
-    mode = "topk_soft" if bool(flag) else "mask"
-    talk_embeds = build_talk_inputs_embeds(noisy_input_ids, think_logits, embedding, mask_id,
-                                           mode=mode, top_k=top_k, keep_mask_residual=False)
-    talk_logits = talk(inputs_embeds=talk_embeds, attention_mask=attention_mask,
-                       position_ids=position_ids, use_cache=False, return_dict=True).logits
-    V = talk_logits.shape[-1]
-    return F.cross_entropy(talk_logits.view(-1, V).float(), labels.view(-1), ignore_index=-100)
+    Advances the FROZEN think ONE DMax decode step from its s+1 state and returns the
+    resulting next-iteration logits (the distillation target). Steps, on the noisy half:
+      1. DMax decode of think's s+1 logits -> `confident_prefix_commit` (left-to-right,
+         threshold-gated) -> (argmax, commit_mask).
+      2. Rebuild think's next input the `decode_uniform` way: newly-committed positions get
+         the SOFT mix (top-K of s+1 logits blended with [MASK], renormalized -- exactly
+         build_topk_soft_embeds(keep_mask_residual=True)); the reveal/earlier-committed stay
+         their token embedding; still-masked stay bare [MASK]. The clean half is untouched.
+      3. Re-forward think -> s+2 logits.
 
+    Returns (s2_logits[:, :noisy_len], argmax, commit_mask). The caller reuses the SAME
+    (argmax, commit_mask) to hard-commit Portion 1 into the talk's input, so one decode
+    decision drives both the teacher and the talk's committed context. All under no_grad
+    (think frozen). Build the teacher BEFORE writing Portion 1 into `full_input_ids`, so the
+    commit is computed from the original s+1 (masked) state."""
+    L = noisy_len
+    noisy_ids = full_input_ids[:, :L]
+    s1_noisy = think_s1_logits[:, :L]
+    mask_index = (noisy_ids == mask_id)
+    argmax, commit_mask = confident_prefix_commit(s1_noisy, mask_index, block_size, threshold)
 
-# ---- reference training step (pseudocode; uses the model parts directly) -----
-# Wire this into a fork of train_t3_dmax_bd_oput.py's main loop. Think is frozen and
-# called under no_grad; the talk runs ANCHOR-FREE on the top-K-injected embeds.
-#
-#   think = model.think_model; talk = model.talk_model; head = model.lm_head
-#   emb   = model.get_input_embeddings()
-#
-#   with torch.no_grad():                                   # think frozen, no grad
-#       th = think(input_ids=full_ids, attention_mask=block_mask,
-#                  output_hidden_states=True, use_cache=False)
-#       think_hidden = th.hidden_states[-1]                 # = old "anchor"
-#       think_logits = head(think_hidden)                   # [B, L, V]
-#
-#   # reveal ~25% from the trajectory's first-step commits (data) -> `noisy`, `labels`
-#   # (labels[revealed] = -100 to avoid the copy-through-embedding identity leak)
-#
-#   mode = "topk_soft" if rollout_flag else "mask"          # Path B vs Path A
-#   talk_embeds = build_talk_inputs_embeds(noisy, think_logits, emb, mask_id,
-#                     mode=mode, top_k=args.t3_topk, keep_mask_residual=False)
-#
-#   talk_hidden = talk(inputs_embeds=talk_embeds, anchor=None,   # ANCHOR-FREE
-#                      attention_mask=block_mask, position_ids=pos, use_cache=False)
-#   talk_logits = head(talk_hidden)
-#   loss = predict_loss(talk_logits, labels, predict_mask=still_masked)
+    committed_ids = torch.where(commit_mask, argmax, noisy_ids)          # commit -> token, else unchanged
+    noisy_in = _embed(think_emb, committed_ids)                          # reveal/commit -> token, mask -> [MASK]
+    if bool(commit_mask.any()):
+        soft = build_topk_soft_embeds(s1_noisy, think_emb, mask_id, top_k=top_k,
+                                      keep_mask_residual=True)           # decode_uniform soft mix
+        noisy_in = inject_soft_embeds(noisy_in, soft, commit_mask)       # newly-committed -> soft mix
+    clean_in = _embed(think_emb, full_input_ids[:, L:])
+    think_in = torch.cat([noisy_in, clean_in], dim=1).to(noisy_in.dtype)
+
+    logits = think(inputs_embeds=think_in, attention_mask=attention_mask,
+                   position_ids=position_ids, use_cache=False).logits
+    return logits[:, :L], argmax, commit_mask
 
 
 # --------------------------------------------------------------------------- test
@@ -251,12 +231,8 @@ def _selftest():
     assert torch.allclose(build_talk_inputs_embeds(full, think_logits, W, mask_id, mode="topk_soft"),
                           F.embedding(full, W))
 
-    # predict_loss only counts predict positions
     talk_logits = torch.randn(B, L, V)
     labels = torch.randint(0, V - 1, (B, L))
-    loss = predict_loss(talk_logits, labels, predict_mask=masked)
-    assert torch.isfinite(loss) and loss > 0
-    # zero predict positions -> nan/ignored (cross_entropy over empty -> nan); guard expectation
 
     # think_distill_loss: forward KL at predict positions (labels!=-100)
     dl_labels = labels.clone(); dl_labels[~masked] = -100
@@ -269,6 +245,23 @@ def _selftest():
     # no predict positions -> exact 0 (graph-preserving), not nan
     z = think_distill_loss(talk_logits, think_l, torch.full_like(dl_labels, -100))
     assert float(z) == 0.0
+
+    # build_think_next_teacher: shape [B, Ln], finite, reuses one commit decision
+    class _StubLM:                                       # logits = inputs_embeds @ W^T
+        def __init__(self, Wt): self.Wt = Wt
+        def __call__(self, *, inputs_embeds, **kw):
+            class O: pass
+            o = O(); o.logits = inputs_embeds @ self.Wt; return o
+    Ln, Lc = 4, 4                                        # noisy + clean halves; block_size divides Ln
+    full_ids = torch.randint(0, V - 1, (B, Ln + Lc))
+    full_ids[:, :Ln][torch.rand(B, Ln) < 0.7] = mask_id   # some masked in the noisy half
+    s1 = torch.randn(B, Ln + Lc, V)
+    stub = _StubLM(W.t())
+    for thr in (0.0, 0.99):                              # 0.0 commits the whole prefix; 0.99 ~ none
+        s2, am, cm = build_think_next_teacher(stub, W, full_ids.clone(), s1, Ln, mask_id,
+                                              block_size=2, threshold=thr, top_k=K)
+        assert s2.shape == (B, Ln, V) and torch.isfinite(s2).all()
+        assert cm.shape == (B, Ln) and bool((cm <= (full_ids[:, :Ln] == mask_id)).all())  # commits subset of masked
     print("t3d_topk_talk selftest OK")
 
 

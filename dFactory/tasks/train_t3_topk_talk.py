@@ -42,7 +42,8 @@ import random
 # top-K candidates; the talk (this trainer's `model`, = merged_10L) consumes them as the
 # input embedding at masked positions. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
 from tasks.t3d_topk_talk import (build_talk_inputs_embeds, load_causal_lm, set_talk_trainable,
-                                 confident_prefix_commit, think_distill_loss)
+                                 confident_prefix_commit, think_distill_loss,
+                                 build_think_next_teacher)
 
 
 logger = helper.create_logger(__name__)
@@ -217,6 +218,22 @@ class LLaDA2TrainingArguments(TrainingArguments):
         metadata={"help": "Distillation softmax temperature (both think and talk sides); loss scaled "
                           "by T^2. 1.0 = no softening; 2.0 = classic Hinton softening (surfaces think's "
                           "rank 2..K more strongly). Only used when t3_distill_beta>0."}
+    )
+    # Path-B think_{s+2} distillation (Stage-1 cold start) --------------------------
+    t3_pathb_kl_gamma: float = field(
+        default=0.0,
+        metadata={"help": "Path-B (top-K path) s+2 distillation weight. 0 = OFF (legacy: pure gold "
+                          "CE). >0 = DMax-OPUT-style: hard-commit think's s+1 confident prefix into "
+                          "the talk's input (Portion 1, kept in the loss), advance think ONE DMax "
+                          "decode step to think_{s+2}, and add gamma * forward-KL(think_{s+2}||talk) "
+                          "to the gold CE. think-sourced commits = off-policy (stage-1); stage-2 "
+                          "swaps to talk's own commits. Costs a SECOND 16B think forward on Path B."}
+    )
+    t3_pathb_kl_temp: float = field(
+        default=1.0,
+        metadata={"help": "Path-B s+2 distillation softmax temperature (loss scaled by T^2). Only "
+                          "used when t3_pathb_kl_gamma>0. Keep gamma modest so gold (truth) wins the "
+                          "flip decision at stuck-wrong forking positions (KL is a dope, not driver)."}
     )
 
 
@@ -744,6 +761,26 @@ def main():
                                 _roll_logits, _masked, args.train.block_size, args.train.t3_commit_threshold)
                             micro_batch["input_ids"][:, :L0] = torch.where(
                                 _commit, _argmax, micro_batch["input_ids"][:, :L0])
+
+                # ---- Path-B (stage-1) think_{s+2} teacher + Portion-1 hard-commit ----------------
+                # OPUT-style, think-sourced (off-policy): advance think ONE DMax step to think_{s+2}
+                # (the KL teacher), and hard-commit that SAME s+1 confident prefix into the talk's
+                # input as Portion 1. Labels untouched -> Portion 1 stays gold (in CE + KL); the
+                # curriculum reveal stays -100 (no loss). Build the teacher from the ORIGINAL s+1
+                # state, THEN write Portion 1 (one decode decision drives both). Stage-2 will swap
+                # the commit source to the talk's own argmax (on-policy).
+                think_s2_logits = None
+                if flag and args.train.t3_pathb_kl_gamma > 0:
+                    with torch.no_grad():
+                        L0b = noisy_input_ids.shape[1]
+                        think_s2_logits, _b_argmax, _b_commit = build_think_next_teacher(
+                            think, think_emb, micro_batch["input_ids"], think_logits, L0b,
+                            mask_token_id, block_size=args.train.block_size,
+                            threshold=args.train.t3_commit_threshold, top_k=args.train.t3_top_k,
+                            attention_mask=micro_batch["attention_mask"],
+                            position_ids=micro_batch["position_ids"])
+                        micro_batch["input_ids"][:, :L0b] = torch.where(
+                            _b_commit, _b_argmax, micro_batch["input_ids"][:, :L0b])
                 talk_embeds = build_talk_inputs_embeds(
                     micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
                     mode=mode, top_k=args.train.t3_top_k,
@@ -796,6 +833,17 @@ def main():
                                 shifted_labels, temperature=args.train.t3_distill_temp)
                         loss = (args.train.t3_distill_alpha * ce_mean
                                 + args.train.t3_distill_beta * kl) / len(micro_batches)
+                    elif think_s2_logits is not None:
+                        # Path-B s+2 distillation: gold CE + gamma * forward-KL(think_{s+2}||talk),
+                        # both over the predict positions (Portion 1 + still-masked; reveal is -100).
+                        if args.train.same_token_labels:
+                            kl_b = think_distill_loss(noisy_logits, think_s2_logits, labels,
+                                                      temperature=args.train.t3_pathb_kl_temp)
+                        else:
+                            kl_b = think_distill_loss(shifted_noisy_logits,
+                                                      think_s2_logits[:, 1:].contiguous(), shifted_labels,
+                                                      temperature=args.train.t3_pathb_kl_temp)
+                        loss = (ce_mean + args.train.t3_pathb_kl_gamma * kl_b) / len(micro_batches)
                     else:
                         loss = ce_mean / len(micro_batches)
 

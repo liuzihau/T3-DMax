@@ -48,6 +48,13 @@ train:
   t3_distill_alpha: 1.0                  # gold-CE weight on Path A (keep, so think's errors are corrected)
   t3_distill_temp: 1.0                   # softmax temperature (2.0 = classic Hinton softening)
 
+  # Path-B think_{s+2} distillation (NEW; OFF by default = gold-pure Path B). Enable for the
+  # NEXT run to test it vs the gold-pure baseline. Hard-commits think's s+1 confident prefix
+  # (Portion 1, in the loss), advances think one DMax step to think_{s+2}, adds gamma*KL. Costs
+  # a 2nd 16B think forward on Path B. Keep gamma modest so gold wins the flip at stuck-forking.
+  # t3_pathb_kl_gamma: 0.3               # 0 = OFF (gold-pure). 0.3-0.5 = "dope" the gold CE.
+  # t3_pathb_kl_temp: 1.0
+
   t3_val_every: 200
   t3_val_size: 64
   t3_keep_best_n: 2        # keep the LATEST 2 ckpt dirs (retention is now keep-latest, not best-ce —
