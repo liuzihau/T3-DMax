@@ -40,6 +40,14 @@ train:
                                         #   advance one step each time the talk beats think (acc_tf>acc_think).
   t3_full_mask_after_acc: 0.5           # acc floor: don't advance on early noise (real gate = talk beats think).
 
+  # Path-A think->talk distillation (NEW): on the mask path, forward the frozen 16B think and
+  # add forward-KL(think||talk) at the predict positions, so think's dark knowledge (full top-K)
+  # trains the talk instead of one-hot gold alone. Mass-covering -> cold-start alignment to parity.
+  # alpha/beta/temp are PROVISIONAL (pending discussion); beta=0 reverts to legacy pure-gold-CE.
+  t3_distill_beta: 1.0                   # KL(think||talk) weight on Path A
+  t3_distill_alpha: 1.0                  # gold-CE weight on Path A (keep, so think's errors are corrected)
+  t3_distill_temp: 1.0                   # softmax temperature (2.0 = classic Hinton softening)
+
   t3_val_every: 200
   t3_val_size: 64
   t3_keep_best_n: 2        # keep the LATEST 2 ckpt dirs (retention is now keep-latest, not best-ce —

@@ -42,7 +42,7 @@ import random
 # top-K candidates; the talk (this trainer's `model`, = merged_10L) consumes them as the
 # input embedding at masked positions. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
 from tasks.t3d_topk_talk import (build_talk_inputs_embeds, load_causal_lm, set_talk_trainable,
-                                 confident_prefix_commit)
+                                 confident_prefix_commit, think_distill_loss)
 
 
 logger = helper.create_logger(__name__)
@@ -195,6 +195,28 @@ class LLaDA2TrainingArguments(TrainingArguments):
                           "signal; use for the Stage-1 cold start). True = top-K + mask-residual + "
                           "renormalize = the EXACT inference input -> use for Stage-2 on-policy so "
                           "the rollout's commits and the trained input match decode time."}
+    )
+    # Path-A think->talk distillation (Stage-1 cold start) --------------------------
+    t3_distill_beta: float = field(
+        default=0.0,
+        metadata={"help": "Path-A (mask path) think-distillation weight. 0 = OFF (legacy: pure gold "
+                          "CE, think unused on Path A). >0 = forward additionally the FROZEN think on "
+                          "the masked input and add beta * forward-KL(think||talk) at the predict "
+                          "positions, so the 16B think's dark knowledge (full top-K) trains the talk, "
+                          "not just one-hot gold. Mass-covering -> cold-start alignment to parity."}
+    )
+    t3_distill_alpha: float = field(
+        default=1.0,
+        metadata={"help": "Path-A gold-CE weight in the hybrid loss alpha*CE(gold)+beta*KL(think||talk). "
+                          "Keep the gold term so think's errors are corrected and talk retains a path "
+                          "to exceed think (set 0 for pure-distillation ablation). Only used when "
+                          "t3_distill_beta>0; Path B is unaffected (pure gold CE)."}
+    )
+    t3_distill_temp: float = field(
+        default=1.0,
+        metadata={"help": "Distillation softmax temperature (both think and talk sides); loss scaled "
+                          "by T^2. 1.0 = no softening; 2.0 = classic Hinton softening (surfaces think's "
+                          "rank 2..K more strongly). Only used when t3_distill_beta>0."}
     )
 
 
@@ -690,8 +712,13 @@ def main():
                 mask_token_id = args.train.t3_mask_token_id
                 flag = bool(micro_batch["flag"].item())
                 mode = "topk_soft" if flag else "mask"
+                # Path B always needs think (top-K input). Path A forwards think ONLY to
+                # distill (t3_distill_beta>0): the loss matches think's distribution; the
+                # Path-A input stays bare [MASK] (build_talk_inputs_embeds mode='mask'
+                # ignores think_logits), so think is a teacher, not an input, here.
+                _distill_A = (not flag) and args.train.t3_distill_beta > 0
                 think_logits = None
-                if flag:                                       # only Path B needs think's top-K
+                if flag or _distill_A:
                     with torch.no_grad():
                         think_logits = think(
                             inputs_embeds=think_emb(micro_batch["input_ids"]),
@@ -699,7 +726,7 @@ def main():
                             position_ids=micro_batch["position_ids"],
                             use_cache=False,
                         ).logits
-                        if args.train.t3_rollout_commit_frac > 0:
+                        if flag and args.train.t3_rollout_commit_frac > 0:
                             L0 = noisy_input_ids.shape[1]
                             # commit-deciding forward uses the EXACT inference input (mask-residual
                             # when t3_keep_mask_residual), so the commits match decode time.
@@ -744,7 +771,7 @@ def main():
                             labels.view(-1),
                             reduction="none",
                         )
-                        loss = unscaled_loss.sum() / (labels != -100).sum() / len(micro_batches)
+                        ce_mean = unscaled_loss.sum() / (labels != -100).sum()
                     else:
                         shifted_noisy_logits = noisy_logits[:, :-1, :].contiguous()
                         shifted_labels = labels[:, 1:].contiguous()
@@ -753,7 +780,24 @@ def main():
                             shifted_labels.view(-1),
                             reduction="none",
                         ).view(shifted_noisy_logits.shape[0], -1)
-                        loss = unscaled_loss.sum() / (shifted_labels != -100).sum() / len(micro_batches)
+                        ce_mean = unscaled_loss.sum() / (shifted_labels != -100).sum()
+
+                    # Path-A think->talk distillation: hybrid alpha*CE(gold) + beta*KL(think||talk)
+                    # at the predict positions. Path B (flag) and distill-off keep pure gold CE.
+                    if _distill_A:
+                        L_n = noisy_input_ids.shape[1]
+                        if args.train.same_token_labels:
+                            kl = think_distill_loss(
+                                noisy_logits, think_logits[:, :L_n], labels,
+                                temperature=args.train.t3_distill_temp)
+                        else:
+                            kl = think_distill_loss(
+                                shifted_noisy_logits, think_logits[:, :L_n][:, 1:].contiguous(),
+                                shifted_labels, temperature=args.train.t3_distill_temp)
+                        loss = (args.train.t3_distill_alpha * ce_mean
+                                + args.train.t3_distill_beta * kl) / len(micro_batches)
+                    else:
+                        loss = ce_mean / len(micro_batches)
 
                 with model_bwd_context:
                     loss.backward()

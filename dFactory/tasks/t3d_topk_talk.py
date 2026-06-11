@@ -124,6 +124,33 @@ def predict_loss(talk_logits: torch.Tensor, labels: torch.Tensor,
     return F.cross_entropy(talk_logits.view(-1, V), lbl.view(-1), ignore_index=ignore_index)
 
 
+def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
+                       labels: torch.Tensor, *, temperature: float = 1.0,
+                       ignore_index: int = -100, eps: float = 1e-8) -> torch.Tensor:
+    """Path-A think->talk distillation: pull the talk's distribution toward the FROZEN
+    think's distribution at the predict positions (labels != ignore_index, i.e. the still-
+    masked ~75%). Token-decomposed FORWARD KL  D_KL(think || talk)  (== soft cross-entropy
+    up to think's entropy, same gradient) -> MASS-COVERING: the talk is pulled to cover
+    think's full top-K, not just its top-1. That is the right signal for the Stage-1 cold
+    start (reverse KL would be mode-seeking -> collapse onto think's top-1 = the ceiling).
+
+    `temperature` softens both sides (classic distillation T); the loss is scaled by T^2 to
+    keep the gradient magnitude comparable to the gold CE term. Returns a scalar = mean
+    forward-KL over the predict positions (0 at a perfect match -> clean monitor).
+    Computed in fp32. think_logits must be aligned to talk_logits' positions (no shift)."""
+    predict = (labels != ignore_index)                        # [B, L] bool
+    if not bool(predict.any()):
+        return talk_logits.sum() * 0.0                        # keep graph, zero contribution
+    T = float(temperature)
+    th = (think_logits[predict].float() / T)                  # [N, V]
+    tl = (talk_logits[predict].float() / T)                   # [N, V]
+    teacher = F.softmax(th, dim=-1)                           # think's soft target
+    student_logp = F.log_softmax(tl, dim=-1)
+    teacher_logp = F.log_softmax(th, dim=-1)
+    kl = (teacher * (teacher_logp - student_logp)).sum(-1)    # [N] forward KL per position
+    return kl.mean() * (T * T)
+
+
 def confident_prefix_commit(logits, mask_index, block_size, threshold):
     """Per-block confident LEFT-TO-RIGHT prefix commit — the DMax decode_uniform rule,
     generalized from one block to the whole noisy half [B, L]. Commits the contiguous
@@ -230,6 +257,18 @@ def _selftest():
     loss = predict_loss(talk_logits, labels, predict_mask=masked)
     assert torch.isfinite(loss) and loss > 0
     # zero predict positions -> nan/ignored (cross_entropy over empty -> nan); guard expectation
+
+    # think_distill_loss: forward KL at predict positions (labels!=-100)
+    dl_labels = labels.clone(); dl_labels[~masked] = -100
+    think_l = torch.randn(B, L, V)
+    kl = think_distill_loss(talk_logits, think_l, dl_labels)
+    assert torch.isfinite(kl) and kl > 0
+    # KL(think||think) == 0 (perfect match), and temperature scaling stays finite
+    assert think_distill_loss(think_l, think_l, dl_labels).abs() < 1e-5
+    assert torch.isfinite(think_distill_loss(talk_logits, think_l, dl_labels, temperature=2.0))
+    # no predict positions -> exact 0 (graph-preserving), not nan
+    z = think_distill_loss(talk_logits, think_l, torch.full_like(dl_labels, -100))
+    assert float(z) == 0.0
     print("t3d_topk_talk selftest OK")
 
 
