@@ -37,8 +37,12 @@ train:
   t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> pure teacher-forced cold start
   t3_commit_threshold: 0.3
   t3_curriculum_step: 0.5               # CURRICULUM: 3-step reveal-ratio ramp 25%->12.5%->0% (sigma 0.75/0.875/1.0).
-                                        #   advance one step each time the talk beats think (acc_tf>acc_think).
-  t3_full_mask_after_acc: 0.5           # acc floor: don't advance on early noise (real gate = talk beats think).
+  # ADVANCE when EITHER: (A) BOTH paths reach 95% of their teacher acc (Path A: acc_mask vs acc_think s+1;
+  # Path B: acc_tf vs acc_think2 s+2), OR (B) the loss plateaus = 3 contiguous vals with <0.3% CE change.
+  t3_curriculum_teacher_frac: 0.95      # (A) both paths >= 95% of teacher acc
+  t3_curriculum_plateau_vals: 3         # (B) 3 contiguous vals ...
+  t3_curriculum_plateau_tol: 0.003      #     ... each with retention-CE relative change < 0.3%
+  t3_full_mask_after_acc: 0.0           # acc floor (legacy; 0 = unused now that the gate is teacher-relative)
 
   # Path-A think->talk distillation (NEW): on the mask path, forward the frozen 16B think and
   # add forward-KL(think||talk) at the predict positions, so think's dark knowledge (full top-K)

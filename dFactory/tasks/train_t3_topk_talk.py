@@ -172,23 +172,39 @@ class LLaDA2TrainingArguments(TrainingArguments):
     t3_curriculum_step: float = field(
         default=0.0,
         metadata={"help": "Mask-ratio CURRICULUM enable + step. 0 = off (sigma uniform in [noise_range]). "
-                          ">0 enables a multi-step ramp from noise_range_low to high: each time the talk "
-                          "BEATS think's top-1 (acc_tf > acc_think, i.e. positive gain) AND acc_tf >= "
-                          "t3_full_mask_after_acc, the shared sigma-progress advances by this step. "
-                          "0.5 -> low / mid / high (e.g. reveal 25% -> 12.5% -> 0%); 1.0 -> low / high. "
-                          "Requires noise_range_low != noise_range_high."}
+                          ">0 enables a multi-step ramp from noise_range_low to high; the sigma-progress "
+                          "advances by this step whenever the advance gate fires (BOTH paths >= "
+                          "t3_curriculum_teacher_frac of their teacher acc, OR the loss plateaus -- see "
+                          "t3_curriculum_plateau_*). 0.5 -> low / mid / high (e.g. reveal 25% -> 12.5% -> "
+                          "0%); 1.0 -> low / high. Requires noise_range_low != noise_range_high."}
     )
     t3_full_mask_after_acc: float = field(
         default=0.0,
-        metadata={"help": "Curriculum acc FLOOR: don't advance the mask-ratio step until val/acc_tf >= "
-                          "this (prevents advancing on early noise)."}
+        metadata={"help": "DEPRECATED (no longer used by the advance gate; the gate is now teacher-relative "
+                          "+ plateau). Kept for back-compat."}
     )
     t3_curriculum_margin: float = field(
         default=0.03,
-        metadata={"help": "Curriculum advance gate: advance when the talk has CAUGHT UP to think's "
-                          "top-1, i.e. acc_tf >= acc_think - margin. (The talk MATCHES, never beats, "
-                          "think — that's its ceiling — so a strict 'beats think' gate would stall "
-                          "forever. This fires once the talk has learned all it can at the level.)"}
+        metadata={"help": "DEPRECATED (no longer used by the advance gate; kept for back-compat). The "
+                          "gate now advances when BOTH paths reach t3_curriculum_teacher_frac of their "
+                          "teacher acc, OR the loss plateaus (t3_curriculum_plateau_*)."}
+    )
+    t3_curriculum_teacher_frac: float = field(
+        default=0.95,
+        metadata={"help": "Curriculum advance gate (condition A): advance only when BOTH paths reach this "
+                          "FRACTION of their teacher acc -- Path A: acc_mask >= frac*acc_think (s+1); "
+                          "Path B: acc_tf >= frac*acc_think2 (s+2). 0.95 = within 95% of teacher."}
+    )
+    t3_curriculum_plateau_vals: int = field(
+        default=3,
+        metadata={"help": "Curriculum advance gate (condition B, OR'd with A): advance after this many "
+                          "CONTIGUOUS vals whose retention-CE relative change all stay < t3_curriculum_"
+                          "plateau_tol (the talk has stopped improving at this reveal level). Reset on advance."}
+    )
+    t3_curriculum_plateau_tol: float = field(
+        default=0.003,
+        metadata={"help": "Relative loss-change threshold for the plateau gate (0.003 = 0.3%). A val counts "
+                          "as 'flat' when |ce_t - ce_{t-1}| <= tol * |ce_{t-1}|."}
     )
     t3_keep_mask_residual: bool = field(
         default=False,
@@ -308,18 +324,22 @@ def _append_jsonl(path, record):
 
 @torch.no_grad()
 def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
-                  top_k, rollout_frac=0.5, keep_mask_residual=False, do_rollout=True):
-    """Quick anchor-free top-K val. Reports TWO sets of CE + token-match acc on the masked
-    predict positions:
-      * `_tf`   : teacher-forced -- clean context (the base rerank ability; looks easy).
-      * `_roll` : rollout -- a `rollout_frac` slice of masked positions is committed with the
-                  talk's OWN argmax (own imperfect commits as context), the rest re-predicted.
-                  This mirrors the on-policy/inference condition and is the metric that should
-                  track GSM8K. The talk's first (TF) forward IS the rollout's first pass, so
-                  this costs 2 talk forwards/example total."""
+                  top_k, rollout_frac=0.5, keep_mask_residual=False, do_rollout=True,
+                  block_size=32, commit_threshold=0.3):
+    """Quick anchor-free top-K val. CE + token-match acc on the masked predict positions, with
+    the two TEACHER references each path is actually chasing:
+      * `_think`  : think's s+1 top-1 (one think forward on [reveal+mask]). The teacher the
+                    Path-A [MASK] path (`_mask`) wants to reach -> compare acc_mask vs acc_think.
+      * `_think2` : think's REAL 2nd iteration (think_{s+2}: DMax-decode s+1 then re-forward).
+                    The teacher the Path-B top-K path (`_tf`) wants to reach, since one talk pass
+                    is meant to leap one think iteration -> compare acc_tf vs acc_think2.
+      * `_tf`     : teacher-forced talk on think's top-K (clean context).
+      * `_mask`   : pure [MASK] path (no think) -- the Path-A baseline.
+      * `_roll`   : rollout (own commits as context) -- inference-condition, tracks GSM8K."""
     was_training = talk.training
     talk.eval()
-    th_ce = th_ok = th_n = 0          # think's own top-1 (the candidate source) — does the talk beat it?
+    th_ce = th_ok = th_n = 0          # think's s+1 top-1 (teacher for the mask path)
+    th2_ce = th2_ok = th2_n = 0       # think's s+2 (real 2nd iteration) top-1 (teacher for the topK path)
     tf_ce = tf_ok = tf_n = 0
     mk_ce = mk_ok = mk_n = 0
     rl_ce = rl_ok = rl_n = 0
@@ -346,6 +366,15 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
         th_ok += int(((th_logits.argmax(-1) == labels) & valid).sum())
         th_n += int(valid.sum())
+        # --- think's REAL 2nd iteration (think_{s+2}) vs gold: the teacher for acc_tf / Path B ---
+        th2_logits, _, _ = build_think_next_teacher(
+            think, embedding, full, think_logits, L, mask_id,
+            block_size=block_size, threshold=commit_threshold, top_k=top_k,
+            attention_mask=attn, position_ids=pos)
+        th2_ce += F.cross_entropy(th2_logits.reshape(-1, th2_logits.shape[-1]).float(),
+                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+        th2_ok += int(((th2_logits.argmax(-1) == labels) & valid).sum())
+        th2_n += int(valid.sum())
         # --- teacher-forced (clean context) ---
         tf_embeds = build_talk_inputs_embeds(full, think_logits, embedding, mask_id,
                                              mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
@@ -385,6 +414,8 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         talk.train()
     out = {"val/ce_think": (th_ce / th_n if th_n else float("nan")),
            "val/acc_think": (th_ok / th_n if th_n else float("nan")),
+           "val/ce_think2": (th2_ce / th2_n if th2_n else float("nan")),
+           "val/acc_think2": (th2_ok / th2_n if th2_n else float("nan")),
            "val/ce_tf": (tf_ce / tf_n if tf_n else float("nan")),
            "val/acc_tf": (tf_ok / tf_n if tf_n else float("nan")),
            "val/ce_mask": (mk_ce / mk_n if mk_n else float("nan")),
@@ -443,9 +474,10 @@ def main():
         if not tokenizer.chat_template:
             raise ValueError(f"No chat template found in the tokenizer.")
 
-        # T3-D mask-ratio curriculum: when t3_full_mask_after_acc>0, sigma is gated by a shared
-        # progress value (0 -> noise_range_low, 1 -> noise_range_high). The val loop flips it to
-        # 1.0 once val/acc_tf crosses the threshold (sigma low -> high = e.g. 75% -> 100% mask).
+        # T3-D mask-ratio curriculum: when t3_curriculum_step>0 (and noise_range is a range), sigma is
+        # gated by a shared progress value (0 -> noise_range_low, 1 -> noise_range_high). The val loop
+        # advances it by t3_curriculum_step whenever the advance gate fires (both paths >= teacher_frac
+        # of their teacher acc, OR loss plateau); sigma low -> high = e.g. 75% -> 100% mask.
         noise_progress = (mp.Value("d", 0.0)
                           if args.train.t3_curriculum_step > 0
                           and args.data.noise_range_low != args.data.noise_range_high else None)
@@ -557,6 +589,7 @@ def main():
     _metrics_path = args.train.t3_metrics_jsonl or os.path.join(args.train.output_dir, "metrics.jsonl")
     _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
     _last_val_ce = float("nan")
+    _val_loss_hist = []        # retention-CE per val at the CURRENT reveal level (plateau gate; reset on advance)
 
     optimizer = build_optimizer(
         model,
@@ -895,7 +928,9 @@ def main():
                                         _val_examples, transform, block_diffusion_attn_mask_prototype,
                                         get_device_type(), args.train.t3_top_k,
                                         keep_mask_residual=args.train.t3_keep_mask_residual,
-                                        do_rollout=args.train.t3_rollout_commit_frac > 0)
+                                        do_rollout=args.train.t3_rollout_commit_frac > 0,
+                                        block_size=args.train.block_size,
+                                        commit_threshold=args.train.t3_commit_threshold)
                     _rec.update(_vm)
                     # retention by the inference-relevant rollout CE (fall back to TF if nan)
                     _last_val_ce = _vm["val/ce_roll"]
@@ -906,28 +941,48 @@ def main():
                     _roll_str = (f"acc_roll={_vm['val/acc_roll']:.4f} "
                                  if _vm["val/acc_roll"] == _vm["val/acc_roll"] else "")  # nan => off (Stage 1)
                     logger.info_rank0(f"[t3d val] step {global_step} "
-                                      f"acc_think={_vm['val/acc_think']:.4f}(think top1) "
-                                      f"acc_tf={_vm['val/acc_tf']:.4f}(talk topK) "
-                                      f"acc_mask={_vm['val/acc_mask']:.4f}(mask) {_roll_str}| "
+                                      f"acc: think_s1={_vm['val/acc_think']:.4f} think_s2={_vm['val/acc_think2']:.4f} "
+                                      f"tf={_vm['val/acc_tf']:.4f}(talk topK) mask={_vm['val/acc_mask']:.4f} {_roll_str}| "
+                                      f"[A: mask-vs-s1={_vm['val/acc_mask']-_vm['val/acc_think']:+.3f}] "
+                                      f"[B: tf-vs-s2={_vm['val/acc_tf']-_vm['val/acc_think2']:+.3f}] "
                                       f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}] "
-                                      f"[talk-vs-think={_vm['val/acc_tf']-_vm['val/acc_think']:+.3f}] "
                                       f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
-                    # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when the
-                    # talk has CAUGHT UP to think's top-1 (acc_tf within margin of acc_think = its ceiling)
-                    # AND clears the acc floor. One-way. (A strict 'beats think' gate never fires since the
-                    # talk matches, not beats, think.)
-                    _caught_up = (_vm["val/acc_tf"] == _vm["val/acc_tf"]              # not nan
-                                  and _vm["val/acc_tf"] >= _vm["val/acc_think"] - args.train.t3_curriculum_margin)
+                    # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when EITHER
+                    #  (A) BOTH paths reach t3_curriculum_teacher_frac of their teacher acc -- Path A:
+                    #      acc_mask >= frac*acc_think (s+1); Path B: acc_tf >= frac*acc_think2 (s+2); OR
+                    #  (B) the loss has plateaued: t3_curriculum_plateau_vals contiguous vals whose
+                    #      retention-CE relative change all stay < t3_curriculum_plateau_tol.
+                    # One-way; the plateau history resets at the new reveal level.
+                    _both_95 = _plateau = False
+                    if noise_progress is not None and noise_progress.value < 1.0:
+                        _nan = lambda v: v != v
+                        _frac = args.train.t3_curriculum_teacher_frac
+                        _both_95 = (not (_nan(_vm["val/acc_mask"]) or _nan(_vm["val/acc_think"])
+                                         or _nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
+                                    and _vm["val/acc_mask"] >= _frac * _vm["val/acc_think"]
+                                    and _vm["val/acc_tf"]   >= _frac * _vm["val/acc_think2"])
+                        # plateau over the last K val-to-val deltas of the retention CE (needs K+1 points)
+                        _val_loss_hist.append(_last_val_ce)
+                        _K = max(1, args.train.t3_curriculum_plateau_vals)
+                        _tol = args.train.t3_curriculum_plateau_tol
+                        if len(_val_loss_hist) > _K:
+                            _w = _val_loss_hist[-_K - 1:]
+                            if all(h == h for h in _w):                   # no nan in the window
+                                _plateau = all(abs(_w[i + 1] - _w[i]) <= _tol * max(abs(_w[i]), 1e-8)
+                                               for i in range(_K))
                     if (noise_progress is not None and noise_progress.value < 1.0
-                            and _caught_up
-                            and _vm["val/acc_tf"] >= args.train.t3_full_mask_after_acc):
+                            and (_both_95 or _plateau)):
+                        _reason = ("both paths >= %.0f%% of teacher (mask %.3f/think %.3f, tf %.3f/think2 %.3f)"
+                                   % (_frac * 100, _vm["val/acc_mask"], _vm["val/acc_think"],
+                                      _vm["val/acc_tf"], _vm["val/acc_think2"])) if _both_95 \
+                                  else ("loss plateau: %d contiguous vals < %.2f%% (ce %s)"
+                                        % (_K, _tol * 100, ",".join(f"{h:.3f}" for h in _val_loss_hist[-_K - 1:])))
                         noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
+                        _val_loss_hist.clear()                            # fresh plateau tracking at the new level
                         _sigma = (args.data.noise_range_low + noise_progress.value
                                   * (args.data.noise_range_high - args.data.noise_range_low))
                         _rec["curriculum"] = f"sigma={_sigma:.3f}"
-                        logger.info_rank0(f"[t3d curriculum] step {global_step} talk caught up to think "
-                                          f"(acc_tf {_vm['val/acc_tf']:.3f} vs acc_think "
-                                          f"{_vm['val/acc_think']:.3f}, margin {args.train.t3_curriculum_margin}) "
+                        logger.info_rank0(f"[t3d curriculum] step {global_step} ADVANCE ({_reason}) "
                                           f"-> progress {noise_progress.value:.2f}, sigma~{_sigma:.3f} "
                                           f"(reveal~{(1-_sigma)*100:.1f}%)")
                 _append_jsonl(_metrics_path, _rec)
