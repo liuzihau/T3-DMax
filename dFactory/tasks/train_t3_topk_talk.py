@@ -206,6 +206,15 @@ class LLaDA2TrainingArguments(TrainingArguments):
         metadata={"help": "Relative loss-change threshold for the plateau gate (0.003 = 0.3%). A val counts "
                           "as 'flat' when |ce_t - ce_{t-1}| <= tol * |ce_{t-1}|."}
     )
+    t3_curriculum_reveals: str = field(
+        default="",
+        metadata={"help": "Explicit reveal-ratio SCHEDULE (comma list, strictly decreasing to 0.0), e.g. "
+                          "'0.5,0.25,0.125,0.0' for reveal-HALVING. When set it OVERRIDES the linear "
+                          "t3_curriculum_step ramp -- each advance steps to the next entry, so you get "
+                          "exactly these levels (the linear ramp can only do arithmetic steps in sigma, not "
+                          "halving). First entry must equal 1 - noise_range_low (the start); last must be 0.0 "
+                          "(= noise_range_high). sigma = 1 - reveal."}
+    )
     t3_keep_mask_residual: bool = field(
         default=False,
         metadata={"help": "Path-B top-K input variant. False = no-mask renorm-in-top-K (clean candidate "
@@ -474,12 +483,13 @@ def main():
         if not tokenizer.chat_template:
             raise ValueError(f"No chat template found in the tokenizer.")
 
-        # T3-D mask-ratio curriculum: when t3_curriculum_step>0 (and noise_range is a range), sigma is
-        # gated by a shared progress value (0 -> noise_range_low, 1 -> noise_range_high). The val loop
-        # advances it by t3_curriculum_step whenever the advance gate fires (both paths >= teacher_frac
-        # of their teacher acc, OR loss plateau); sigma low -> high = e.g. 75% -> 100% mask.
+        # T3-D mask-ratio curriculum: a shared progress value maps 0 -> noise_range_low, 1 ->
+        # noise_range_high (sigma = low + progress*(high-low); reveal = 1 - sigma). The val loop advances
+        # it whenever the gate fires (both paths >= teacher_frac of teacher acc, OR loss plateau). Two
+        # modes: linear (t3_curriculum_step added each advance) OR an explicit reveal SCHEDULE
+        # (t3_curriculum_reveals, e.g. reveal-halving 0.5,0.25,0.125,0.0) stepped one entry per advance.
         noise_progress = (mp.Value("d", 0.0)
-                          if args.train.t3_curriculum_step > 0
+                          if (args.train.t3_curriculum_step > 0 or args.train.t3_curriculum_reveals.strip())
                           and args.data.noise_range_low != args.data.noise_range_high else None)
         transform = partial(
             process_mdm_sft_example,
@@ -590,6 +600,12 @@ def main():
     _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
     _last_val_ce = float("nan")
     _val_loss_hist = []        # retention-CE per val at the CURRENT reveal level (plateau gate; reset on advance)
+    # Explicit reveal schedule (overrides the linear step). progress = (1 - reveal - low)/(high - low).
+    _reveal_sched = [float(x) for x in args.train.t3_curriculum_reveals.split(",") if x.strip()] or None
+    _cur_reveal_idx = 0
+    if _reveal_sched is not None and noise_progress is not None:
+        _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
+        noise_progress.value = min(1.0, max(0.0, (1.0 - _reveal_sched[0] - _lo) / (_hi - _lo)))
 
     optimizer = build_optimizer(
         model,
@@ -954,7 +970,10 @@ def main():
                     #      retention-CE relative change all stay < t3_curriculum_plateau_tol.
                     # One-way; the plateau history resets at the new reveal level.
                     _both_95 = _plateau = False
-                    if noise_progress is not None and noise_progress.value < 1.0:
+                    _can_advance = (noise_progress is not None and (
+                        _cur_reveal_idx < len(_reveal_sched) - 1 if _reveal_sched is not None
+                        else noise_progress.value < 1.0))
+                    if _can_advance:
                         _nan = lambda v: v != v
                         _frac = args.train.t3_curriculum_teacher_frac
                         _both_95 = (not (_nan(_vm["val/acc_mask"]) or _nan(_vm["val/acc_think"])
@@ -970,14 +989,19 @@ def main():
                             if all(h == h for h in _w):                   # no nan in the window
                                 _plateau = all(abs(_w[i + 1] - _w[i]) <= _tol * max(abs(_w[i]), 1e-8)
                                                for i in range(_K))
-                    if (noise_progress is not None and noise_progress.value < 1.0
-                            and (_both_95 or _plateau)):
+                    if _can_advance and (_both_95 or _plateau):
                         _reason = ("both paths >= %.0f%% of teacher (mask %.3f/think %.3f, tf %.3f/think2 %.3f)"
                                    % (_frac * 100, _vm["val/acc_mask"], _vm["val/acc_think"],
                                       _vm["val/acc_tf"], _vm["val/acc_think2"])) if _both_95 \
                                   else ("loss plateau: %d contiguous vals < %.2f%% (ce %s)"
                                         % (_K, _tol * 100, ",".join(f"{h:.3f}" for h in _val_loss_hist[-_K - 1:])))
-                        noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
+                        if _reveal_sched is not None:                     # explicit schedule: step one entry
+                            _cur_reveal_idx += 1
+                            _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
+                            noise_progress.value = min(1.0, max(0.0,
+                                (1.0 - _reveal_sched[_cur_reveal_idx] - _lo) / (_hi - _lo)))
+                        else:                                            # linear ramp
+                            noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
                         _val_loss_hist.clear()                            # fresh plateau tracking at the new level
                         _sigma = (args.data.noise_range_low + noise_progress.value
                                   * (args.data.noise_range_high - args.data.noise_range_low))

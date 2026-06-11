@@ -22,7 +22,7 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75            # mask-ratio curriculum: start at 75% ...
+  noise_range_low: 0.5            # mask-ratio curriculum: start at 75% ...
   noise_range_high: 1.0            # ... ramp to 100% (inference block-start condition) once learned
   num_workers: 16
 
@@ -36,7 +36,9 @@ train:
   t3_mask_token_id: 156895
   t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> pure teacher-forced cold start
   t3_commit_threshold: 0.3
-  t3_curriculum_step: 0.5               # CURRICULUM: 3-step reveal-ratio ramp 25%->12.5%->0% (sigma 0.75/0.875/1.0).
+  t3_curriculum_step: 0.5               # (linear-ramp step; IGNORED when t3_curriculum_reveals is set below)
+  t3_curriculum_reveals: "0.5,0.25,0.125,0.0"   # reveal-HALVING schedule: 50% -> 25% -> 12.5% -> 0%
+                                                #   (sigma 0.5/0.75/0.875/1.0); first entry = 1 - noise_range_low.
   # ADVANCE when EITHER: (A) BOTH paths reach 95% of their teacher acc (Path A: acc_mask vs acc_think s+1;
   # Path B: acc_tf vs acc_think2 s+2), OR (B) the loss plateaus = 3 contiguous vals with <0.3% CE change.
   t3_curriculum_teacher_frac: 0.95      # (A) both paths >= 95% of teacher acc
@@ -70,8 +72,8 @@ train:
   expert_parallel_size: 1
   global_batch_size: 8
   micro_batch_size: 1
-  num_train_epochs: 2
-  max_steps: 10000                      # generous CAP — interrupt on plateau (see below), don't run it all.
+  num_train_epochs: 1
+  max_steps: 30000                      # generous CAP — interrupt on plateau (see below), don't run it all.
                                         #   (full epoch = 174854 steps ~= 97h; never needed — ce plateaus early.)
   rmpad: false
   rmpad_with_pos_ids: false
