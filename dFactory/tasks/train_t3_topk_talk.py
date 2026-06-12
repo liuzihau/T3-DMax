@@ -180,16 +180,23 @@ class LLaDA2TrainingArguments(TrainingArguments):
     )
     t3_curriculum_teacher_frac: float = field(
         default=0.95,
-        metadata={"help": "Curriculum advance gate (condition A): advance only when BOTH paths reach this "
-                          "FRACTION of their teacher acc -- Path A: acc_mask >= frac*acc_think (s+1); "
-                          "Path B: acc_tf >= frac*acc_think2 (s+2). 0.95 = within 95% of teacher."}
+        metadata={"help": "Curriculum advance gate (condition A): advance when PATH B (the inference path) "
+                          "reaches this FRACTION of its teacher acc -- acc_tf >= frac*acc_think2 (s+2). "
+                          "0.95 = within 95% of think's 2nd iteration. Path A (mask) is a capacity-limited "
+                          "regularizer that can't hit 95% of the 16B think, so it does NOT gate (logged only)."}
     )
     t3_curriculum_plateau_vals: int = field(
         default=5,
-        metadata={"help": "Curriculum advance gate (condition B, OR'd with A): early-stopping PATIENCE -- "
-                          "advance after this many CONTIGUOUS vals with NO new best CE in EITHER path "
-                          "(both Path A ce_mask and Path B ce_tf above their best-ever at this reveal level). "
-                          "Best CE + counter reset on advance."}
+        metadata={"help": "Curriculum advance gate (condition B, OR'd with A): early-stopping PATIENCE on "
+                          "PATH B -- advance after this many CONTIGUOUS vals with no new best ce_tf (Path A's "
+                          "slow tail no longer blocks). A val sets a 'new best' only if it beats the best by "
+                          "> t3_curriculum_plateau_tol (relative), so noise doesn't reset. Reset on advance."}
+    )
+    t3_curriculum_plateau_tol: float = field(
+        default=0.002,
+        metadata={"help": "Min RELATIVE ce_tf improvement to count as a new best for the plateau gate "
+                          "(0.002 = 0.2%); a val is 'no improvement' unless ce_tf < best*(1-tol). Stops "
+                          "tiny noise dips from resetting the patience counter."}
     )
     t3_curriculum_reveals: str = field(
         default="",
@@ -607,8 +614,8 @@ def main():
     _metrics_path = args.train.t3_metrics_jsonl or os.path.join(args.train.output_dir, "metrics.jsonl")
     _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
     _last_val_ce = float("nan")
-    _best_ce_A = _best_ce_B = float("inf")   # best (lowest) Path-A/B val CE at the CURRENT reveal level
-    _no_improve = 0                          # consecutive vals with no new best in EITHER path (plateau patience)
+    _best_ce_B = float("inf")                # best (lowest) Path-B val CE (ce_tf) at the CURRENT reveal level
+    _no_improve = 0                          # consecutive vals with no new best ce_tf (plateau patience)
     # Guard: the on-policy rollout (Stage 2, talk-sourced commits) and the Path-B s+2 KL (Stage 1,
     # think-sourced commits) BOTH write committed tokens into input_ids -- they are stage-exclusive.
     assert not (args.train.t3_rollout_commit_frac > 0 and args.train.t3_pathb_kl_gamma > 0), (
@@ -988,45 +995,36 @@ def main():
                                       f"A={_vm['val/recover_mask']:.3f} B={_vm['val/recover_tf']:.3f} | "
                                       f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
                     # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when EITHER
-                    #  (A) BOTH paths reach t3_curriculum_teacher_frac of their teacher acc -- Path A:
-                    #      acc_mask >= frac*acc_think (s+1); Path B: acc_tf >= frac*acc_think2 (s+2); OR
-                    #  (B) plateau (early-stopping patience): no new best CE in EITHER path (ce_mask AND
-                    #      ce_tf) for t3_curriculum_plateau_vals consecutive vals.
-                    # One-way; the best-CE + patience reset at the new reveal level.
-                    _both_95 = _plateau = False
+                    #  (A) PATH B (the inference path) reaches teacher parity: acc_tf >= frac*acc_think2 (s+2); OR
+                    #  (B) plateau (early-stop patience): no new best ce_tf for t3_curriculum_plateau_vals vals
+                    #      (a 'new best' must beat the best by > t3_curriculum_plateau_tol relative).
+                    # Path A (mask) is a capacity-limited regularizer (can't hit 95% of the 16B think, and has
+                    # a slow improvement tail) -> it does NOT gate; logged only. One-way; reset on advance.
+                    _parity_B = _plateau = False
                     _can_advance = (noise_progress is not None and (
                         _cur_reveal_idx < len(_reveal_sched) - 1 if _reveal_sched is not None
                         else noise_progress.value < 1.0))
                     if _can_advance:
                         _nan = lambda v: v != v
                         _frac = args.train.t3_curriculum_teacher_frac
-                        _both_95 = (not (_nan(_vm["val/acc_mask"]) or _nan(_vm["val/acc_think"])
-                                         or _nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
-                                    and _vm["val/acc_mask"] >= _frac * _vm["val/acc_think"]
-                                    and _vm["val/acc_tf"]   >= _frac * _vm["val/acc_think2"])
-                        # plateau = early-stopping patience: no new BEST CE in EITHER path for K vals.
-                        # (Both Path A ce_mask and Path B ce_tf must be above their best-ever; if either
-                        # sets a new best the streak resets.) Best + counter reset on advance.
-                        _ce_A, _ce_B = _vm["val/ce_mask"], _vm["val/ce_tf"]
-                        _improved = ((not _nan(_ce_A) and _ce_A < _best_ce_A - 1e-9)
-                                     or (not _nan(_ce_B) and _ce_B < _best_ce_B - 1e-9))
-                        if _improved:
+                        # (A) Path B parity vs think_{s+2}
+                        _parity_B = (not (_nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
+                                     and _vm["val/acc_tf"] >= _frac * _vm["val/acc_think2"])
+                        # (B) plateau on ce_tf with a relative min-delta (Path A's slow tail can't reset it)
+                        _ce_B = _vm["val/ce_tf"]
+                        _tol = args.train.t3_curriculum_plateau_tol
+                        if (not _nan(_ce_B)) and _ce_B < _best_ce_B * (1.0 - _tol):
+                            _best_ce_B = _ce_B
                             _no_improve = 0
-                            if not _nan(_ce_A):
-                                _best_ce_A = min(_best_ce_A, _ce_A)
-                            if not _nan(_ce_B):
-                                _best_ce_B = min(_best_ce_B, _ce_B)
                         else:
                             _no_improve += 1
                         _P = max(1, args.train.t3_curriculum_plateau_vals)
                         _plateau = _no_improve >= _P
-                    if _can_advance and (_both_95 or _plateau):
-                        _reason = ("both paths >= %.0f%% of teacher (mask %.3f/think %.3f, tf %.3f/think2 %.3f)"
-                                   % (_frac * 100, _vm["val/acc_mask"], _vm["val/acc_think"],
-                                      _vm["val/acc_tf"], _vm["val/acc_think2"])) if _both_95 \
-                                  else ("plateau: no new best CE in either path for %d vals "
-                                        "(ce_mask %.3f best %.3f, ce_tf %.3f best %.3f)"
-                                        % (_P, _ce_A, _best_ce_A, _ce_B, _best_ce_B))
+                    if _can_advance and (_parity_B or _plateau):
+                        _reason = ("Path B parity: acc_tf %.3f >= %.0f%% of acc_think2 %.3f"
+                                   % (_vm["val/acc_tf"], _frac * 100, _vm["val/acc_think2"])) if _parity_B \
+                                  else ("plateau: ce_tf no >%.1f%% improvement for %d vals (ce_tf %.4f best %.4f)"
+                                        % (_tol * 100, _P, _ce_B, _best_ce_B))
                         if _reveal_sched is not None:                     # explicit schedule: step one entry
                             _cur_reveal_idx += 1
                             _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
@@ -1034,7 +1032,7 @@ def main():
                                 (1.0 - _reveal_sched[_cur_reveal_idx] - _lo) / (_hi - _lo)))
                         else:                                            # linear ramp
                             noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
-                        _best_ce_A = _best_ce_B = float("inf"); _no_improve = 0   # fresh plateau tracking
+                        _best_ce_B = float("inf"); _no_improve = 0       # fresh plateau tracking at new level
                         _sigma = (args.data.noise_range_low + noise_progress.value
                                   * (args.data.noise_range_high - args.data.noise_range_low))
                         _rec["curriculum"] = f"sigma={_sigma:.3f}"

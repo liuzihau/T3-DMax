@@ -39,10 +39,12 @@ train:
   t3_curriculum_step: 0.5               # (linear-ramp step; IGNORED when t3_curriculum_reveals is set below)
   t3_curriculum_reveals: "0.5,0.25,0.125,0.0"   # reveal-HALVING schedule: 50% -> 25% -> 12.5% -> 0%
                                                 #   (sigma 0.5/0.75/0.875/1.0); first entry = 1 - noise_range_low.
-  # ADVANCE when EITHER: (A) BOTH paths reach 95% of their teacher acc (Path A: acc_mask vs acc_think s+1;
-  # Path B: acc_tf vs acc_think2 s+2), OR (B) plateau = no new best CE in EITHER path for 5 vals.
-  t3_curriculum_teacher_frac: 0.95      # (A) both paths >= 95% of teacher acc
-  t3_curriculum_plateau_vals: 5         # (B) early-stop patience: 5 vals with no new best CE (both paths)
+  # ADVANCE when EITHER: (A) PATH B reaches 95% of its teacher acc (acc_tf >= 0.95*acc_think2, s+2), OR
+  # (B) plateau = no new best ce_tf for 5 vals. Path A (mask) is a capacity-limited regularizer (can't
+  # reach 95% of the 16B think) -> it does NOT gate; logged only.
+  t3_curriculum_teacher_frac: 0.97      # (A) Path B acc_tf >= 95% of acc_think2
+  t3_curriculum_plateau_vals: 5         # (B) early-stop patience on ce_tf: 5 vals with no new best
+  t3_curriculum_plateau_tol: 0.002      #     'new best' must beat best by >0.2% (noise doesn't reset)
 
   # Path-A think->talk distillation (NEW): on the mask path, forward the frozen 16B think and
   # add forward-KL(think||talk) at the predict positions, so think's dark knowledge (full top-K)
