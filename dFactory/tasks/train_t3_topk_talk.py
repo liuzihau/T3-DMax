@@ -178,17 +178,6 @@ class LLaDA2TrainingArguments(TrainingArguments):
                           "t3_curriculum_plateau_*). 0.5 -> low / mid / high (e.g. reveal 25% -> 12.5% -> "
                           "0%); 1.0 -> low / high. Requires noise_range_low != noise_range_high."}
     )
-    t3_full_mask_after_acc: float = field(
-        default=0.0,
-        metadata={"help": "DEPRECATED (no longer used by the advance gate; the gate is now teacher-relative "
-                          "+ plateau). Kept for back-compat."}
-    )
-    t3_curriculum_margin: float = field(
-        default=0.03,
-        metadata={"help": "DEPRECATED (no longer used by the advance gate; kept for back-compat). The "
-                          "gate now advances when BOTH paths reach t3_curriculum_teacher_frac of their "
-                          "teacher acc, OR the loss plateaus (t3_curriculum_plateau_*)."}
-    )
     t3_curriculum_teacher_frac: float = field(
         default=0.95,
         metadata={"help": "Curriculum advance gate (condition A): advance only when BOTH paths reach this "
@@ -196,15 +185,11 @@ class LLaDA2TrainingArguments(TrainingArguments):
                           "Path B: acc_tf >= frac*acc_think2 (s+2). 0.95 = within 95% of teacher."}
     )
     t3_curriculum_plateau_vals: int = field(
-        default=3,
-        metadata={"help": "Curriculum advance gate (condition B, OR'd with A): advance after this many "
-                          "CONTIGUOUS vals whose retention-CE relative change all stay < t3_curriculum_"
-                          "plateau_tol (the talk has stopped improving at this reveal level). Reset on advance."}
-    )
-    t3_curriculum_plateau_tol: float = field(
-        default=0.003,
-        metadata={"help": "Relative loss-change threshold for the plateau gate (0.003 = 0.3%). A val counts "
-                          "as 'flat' when |ce_t - ce_{t-1}| <= tol * |ce_{t-1}|."}
+        default=5,
+        metadata={"help": "Curriculum advance gate (condition B, OR'd with A): early-stopping PATIENCE -- "
+                          "advance after this many CONTIGUOUS vals with NO new best CE in EITHER path "
+                          "(both Path A ce_mask and Path B ce_tf above their best-ever at this reveal level). "
+                          "Best CE + counter reset on advance."}
     )
     t3_curriculum_reveals: str = field(
         default="",
@@ -334,7 +319,7 @@ def _append_jsonl(path, record):
 @torch.no_grad()
 def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
                   top_k, rollout_frac=0.5, keep_mask_residual=False, do_rollout=True,
-                  block_size=32, commit_threshold=0.3):
+                  block_size=32, commit_threshold=0.3, val_seed=12345):
     """Quick anchor-free top-K val. CE + token-match acc on the masked predict positions, with
     the two TEACHER references each path is actually chasing:
       * `_think`  : think's s+1 top-1 (one think forward on [reveal+mask]). The teacher the
@@ -352,8 +337,16 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
     tf_ce = tf_ok = tf_n = 0
     mk_ce = mk_ok = mk_n = 0
     rl_ce = rl_ok = rl_n = 0
+    thwrong_n = recA_n = recB_n = 0   # RECOVERY (H2): of think_{s+1}-WRONG positions, frac each talk path FIXES
     attn = attn_proto.to(device)
-    for ex in val_examples:
+    # Deterministic reveal: seed the global RNG per example so every val (at a given curriculum
+    # sigma) masks the SAME positions -> val CE/acc is comparable across steps (fair best-ce gate).
+    # Save/restore the RNG state so training's stream is unperturbed. (As sigma rises across
+    # curriculum levels the masked set grows monotonically -> reveals nest.)
+    _cpu_rng = torch.get_rng_state()
+    _cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    for i, ex in enumerate(val_examples):
+        torch.manual_seed(val_seed + i)
         try:
             t = transform(ex)
             t = t[0] if isinstance(t, (list, tuple)) else t
@@ -378,7 +371,7 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         # --- think's REAL 2nd iteration (think_{s+2}) vs gold: the teacher for acc_tf / Path B ---
         th2_logits, _, _ = build_think_next_teacher(
             think, embedding, full, think_logits, L, mask_id,
-            block_size=block_size, threshold=commit_threshold, top_k=top_k,
+            block_size=block_size, threshold=commit_threshold,
             attention_mask=attn, position_ids=pos)
         th2_ce += F.cross_entropy(th2_logits.reshape(-1, th2_logits.shape[-1]).float(),
                                   labels.reshape(-1), ignore_index=-100, reduction="sum").item()
@@ -401,6 +394,14 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                                  labels.reshape(-1), ignore_index=-100, reduction="sum").item()
         mk_ok += int(((mk_logits.argmax(-1) == labels) & valid).sum())
         mk_n += int(valid.sum())
+        # --- RECOVERY (H2): of the positions think_{s+1} gets WRONG, what frac does each talk path FIX?
+        #     recovered / (think s+1 wrong). At inference the still-masked region is a top-K+mask blend
+        #     (a Path-A/B mix), so both paths' recovery matter. This is the "talk solves what the first
+        #     think can't" signal -- the whole point of T3-D. ----------------------------------------
+        _thw = (th_logits.argmax(-1) != labels) & valid                  # think s+1 wrong, at predict pos
+        thwrong_n += int(_thw.sum())
+        recB_n += int((_thw & (tf_logits.argmax(-1) == labels)).sum())   # Path B (top-K) recovers
+        recA_n += int((_thw & (mk_logits.argmax(-1) == labels)).sum())   # Path A (mask) recovers
         # --- rollout (own commits as context) — ONLY when on-policy is active (Stage 2) ---
         if do_rollout:
             argmax_tf = tf_logits.argmax(-1)                               # talk's own preds
@@ -419,6 +420,9 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                                          labels_still.reshape(-1), ignore_index=-100, reduction="sum").item()
                 rl_ok += int(((rl_logits.argmax(-1) == labels) & still).sum())
                 rl_n += int(still.sum())
+    torch.set_rng_state(_cpu_rng)                              # restore: don't perturb training's RNG stream
+    if _cuda_rng is not None:
+        torch.cuda.set_rng_state_all(_cuda_rng)
     if was_training:
         talk.train()
     out = {"val/ce_think": (th_ce / th_n if th_n else float("nan")),
@@ -430,7 +434,11 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
            "val/ce_mask": (mk_ce / mk_n if mk_n else float("nan")),
            "val/acc_mask": (mk_ok / mk_n if mk_n else float("nan")),
            "val/ce_roll": (rl_ce / rl_n if rl_n else float("nan")),
-           "val/acc_roll": (rl_ok / rl_n if rl_n else float("nan"))}
+           "val/acc_roll": (rl_ok / rl_n if rl_n else float("nan")),
+           # recovery of think_{s+1}'s errors (denominator = think s+1 wrong @ predict positions)
+           "val/recover_mask": (recA_n / thwrong_n if thwrong_n else float("nan")),   # Path A
+           "val/recover_tf": (recB_n / thwrong_n if thwrong_n else float("nan")),     # Path B
+           "val/think_wrong_n": thwrong_n}
     return out
 
 
@@ -599,12 +607,26 @@ def main():
     _metrics_path = args.train.t3_metrics_jsonl or os.path.join(args.train.output_dir, "metrics.jsonl")
     _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
     _last_val_ce = float("nan")
-    _val_loss_hist = []        # retention-CE per val at the CURRENT reveal level (plateau gate; reset on advance)
+    _best_ce_A = _best_ce_B = float("inf")   # best (lowest) Path-A/B val CE at the CURRENT reveal level
+    _no_improve = 0                          # consecutive vals with no new best in EITHER path (plateau patience)
+    # Guard: the on-policy rollout (Stage 2, talk-sourced commits) and the Path-B s+2 KL (Stage 1,
+    # think-sourced commits) BOTH write committed tokens into input_ids -- they are stage-exclusive.
+    assert not (args.train.t3_rollout_commit_frac > 0 and args.train.t3_pathb_kl_gamma > 0), (
+        "t3_rollout_commit_frac>0 (Stage-2 on-policy) and t3_pathb_kl_gamma>0 (Stage-1 s+2 KL) are "
+        "mutually exclusive -- both commit into input_ids. Enable only one.")
     # Explicit reveal schedule (overrides the linear step). progress = (1 - reveal - low)/(high - low).
     _reveal_sched = [float(x) for x in args.train.t3_curriculum_reveals.split(",") if x.strip()] or None
     _cur_reveal_idx = 0
     if _reveal_sched is not None and noise_progress is not None:
         _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
+        # Guard (consistency): first entry must equal the start reveal (1 - noise_range_low), the list
+        # must be strictly decreasing, and the last must be 0.0 (= noise_range_high), else the curriculum
+        # silently starts/ends on the wrong level.
+        assert abs((1.0 - _reveal_sched[0]) - _lo) < 1e-6, (
+            f"t3_curriculum_reveals[0]={_reveal_sched[0]} must equal 1 - noise_range_low ({1.0 - _lo})")
+        assert abs(_reveal_sched[-1]) < 1e-6, "t3_curriculum_reveals must end at 0.0 (= noise_range_high 1.0)"
+        assert all(_reveal_sched[i] > _reveal_sched[i + 1] for i in range(len(_reveal_sched) - 1)), (
+            "t3_curriculum_reveals must be strictly decreasing")
         noise_progress.value = min(1.0, max(0.0, (1.0 - _reveal_sched[0] - _lo) / (_hi - _lo)))
 
     optimizer = build_optimizer(
@@ -825,7 +847,7 @@ def main():
                         think_s2_logits, _b_argmax, _b_commit = build_think_next_teacher(
                             think, think_emb, micro_batch["input_ids"], think_logits, L0b,
                             mask_token_id, block_size=args.train.block_size,
-                            threshold=args.train.t3_commit_threshold, top_k=args.train.t3_top_k,
+                            threshold=args.train.t3_commit_threshold,
                             attention_mask=micro_batch["attention_mask"],
                             position_ids=micro_batch["position_ids"])
                         micro_batch["input_ids"][:, :L0b] = torch.where(
@@ -961,14 +983,16 @@ def main():
                                       f"tf={_vm['val/acc_tf']:.4f}(talk topK) mask={_vm['val/acc_mask']:.4f} {_roll_str}| "
                                       f"[A: mask-vs-s1={_vm['val/acc_mask']-_vm['val/acc_think']:+.3f}] "
                                       f"[B: tf-vs-s2={_vm['val/acc_tf']-_vm['val/acc_think2']:+.3f}] "
-                                      f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}] "
+                                      f"[topK gain={_vm['val/acc_tf']-_vm['val/acc_mask']:+.3f}] | "
+                                      f"RECOVER(think_s1 wrong, n={_vm['val/think_wrong_n']}): "
+                                      f"A={_vm['val/recover_mask']:.3f} B={_vm['val/recover_tf']:.3f} | "
                                       f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
                     # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when EITHER
                     #  (A) BOTH paths reach t3_curriculum_teacher_frac of their teacher acc -- Path A:
                     #      acc_mask >= frac*acc_think (s+1); Path B: acc_tf >= frac*acc_think2 (s+2); OR
-                    #  (B) the loss has plateaued: t3_curriculum_plateau_vals contiguous vals whose
-                    #      retention-CE relative change all stay < t3_curriculum_plateau_tol.
-                    # One-way; the plateau history resets at the new reveal level.
+                    #  (B) plateau (early-stopping patience): no new best CE in EITHER path (ce_mask AND
+                    #      ce_tf) for t3_curriculum_plateau_vals consecutive vals.
+                    # One-way; the best-CE + patience reset at the new reveal level.
                     _both_95 = _plateau = False
                     _can_advance = (noise_progress is not None and (
                         _cur_reveal_idx < len(_reveal_sched) - 1 if _reveal_sched is not None
@@ -980,21 +1004,29 @@ def main():
                                          or _nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
                                     and _vm["val/acc_mask"] >= _frac * _vm["val/acc_think"]
                                     and _vm["val/acc_tf"]   >= _frac * _vm["val/acc_think2"])
-                        # plateau over the last K val-to-val deltas of the retention CE (needs K+1 points)
-                        _val_loss_hist.append(_last_val_ce)
-                        _K = max(1, args.train.t3_curriculum_plateau_vals)
-                        _tol = args.train.t3_curriculum_plateau_tol
-                        if len(_val_loss_hist) > _K:
-                            _w = _val_loss_hist[-_K - 1:]
-                            if all(h == h for h in _w):                   # no nan in the window
-                                _plateau = all(abs(_w[i + 1] - _w[i]) <= _tol * max(abs(_w[i]), 1e-8)
-                                               for i in range(_K))
+                        # plateau = early-stopping patience: no new BEST CE in EITHER path for K vals.
+                        # (Both Path A ce_mask and Path B ce_tf must be above their best-ever; if either
+                        # sets a new best the streak resets.) Best + counter reset on advance.
+                        _ce_A, _ce_B = _vm["val/ce_mask"], _vm["val/ce_tf"]
+                        _improved = ((not _nan(_ce_A) and _ce_A < _best_ce_A - 1e-9)
+                                     or (not _nan(_ce_B) and _ce_B < _best_ce_B - 1e-9))
+                        if _improved:
+                            _no_improve = 0
+                            if not _nan(_ce_A):
+                                _best_ce_A = min(_best_ce_A, _ce_A)
+                            if not _nan(_ce_B):
+                                _best_ce_B = min(_best_ce_B, _ce_B)
+                        else:
+                            _no_improve += 1
+                        _P = max(1, args.train.t3_curriculum_plateau_vals)
+                        _plateau = _no_improve >= _P
                     if _can_advance and (_both_95 or _plateau):
                         _reason = ("both paths >= %.0f%% of teacher (mask %.3f/think %.3f, tf %.3f/think2 %.3f)"
                                    % (_frac * 100, _vm["val/acc_mask"], _vm["val/acc_think"],
                                       _vm["val/acc_tf"], _vm["val/acc_think2"])) if _both_95 \
-                                  else ("loss plateau: %d contiguous vals < %.2f%% (ce %s)"
-                                        % (_K, _tol * 100, ",".join(f"{h:.3f}" for h in _val_loss_hist[-_K - 1:])))
+                                  else ("plateau: no new best CE in either path for %d vals "
+                                        "(ce_mask %.3f best %.3f, ce_tf %.3f best %.3f)"
+                                        % (_P, _ce_A, _best_ce_A, _ce_B, _best_ce_B))
                         if _reveal_sched is not None:                     # explicit schedule: step one entry
                             _cur_reveal_idx += 1
                             _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
@@ -1002,7 +1034,7 @@ def main():
                                 (1.0 - _reveal_sched[_cur_reveal_idx] - _lo) / (_hi - _lo)))
                         else:                                            # linear ramp
                             noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
-                        _val_loss_hist.clear()                            # fresh plateau tracking at the new level
+                        _best_ce_A = _best_ce_B = float("inf"); _no_improve = 0   # fresh plateau tracking
                         _sigma = (args.data.noise_range_low + noise_progress.value
                                   * (args.data.noise_range_high - args.data.noise_range_low))
                         _rec["curriculum"] = f"sigma={_sigma:.3f}"

@@ -39,8 +39,9 @@ train:
   t3_mask_token_id: 156895
   t3_rollout_commit_frac: 1.0           # ROLLOUT ON (gate); commit SELECTION = confidence-prefix below
   t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
-  t3_curriculum_step: 0.5               # CURRICULUM: 3-step reveal ramp 25%->12.5%->0%; advance when talk beats think
-  t3_full_mask_after_acc: 0.5           # acc floor (real gate = talk beats think)
+  t3_curriculum_step: 0.5               # CURRICULUM linear ramp step (no explicit reveals list here).
+                                        # ADVANCE gate: both paths >= teacher_frac of teacher acc, OR
+                                        # plateau (no new best CE in either path for plateau_vals).
   t3_keep_mask_residual: true           # Stage 2 mimics inference EXACTLY: Path B input = top-K +
                                         # mask-residual + renorm (the decode-time blend). Commits and
                                         # trained input now match inference. (Stage 1 stays false.)

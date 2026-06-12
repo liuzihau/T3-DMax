@@ -162,7 +162,7 @@ def confident_prefix_commit(logits, mask_index, block_size, threshold):
 
 
 def build_think_next_teacher(think, think_emb, full_input_ids, think_s1_logits, noisy_len,
-                             mask_id, *, block_size, threshold, top_k=10,
+                             mask_id, *, block_size, threshold,
                              attention_mask=None, position_ids=None):
     """The think_{s+2} teacher for the Path-B (stage-1) KL.
 
@@ -171,9 +171,10 @@ def build_think_next_teacher(think, think_emb, full_input_ids, think_s1_logits, 
       1. DMax decode of think's s+1 logits -> `confident_prefix_commit` (left-to-right,
          threshold-gated) -> (argmax, commit_mask).
       2. Rebuild think's next input the `decode_uniform` way: newly-committed positions get
-         the SOFT mix (top-K of s+1 logits blended with [MASK], renormalized -- exactly
-         build_topk_soft_embeds(keep_mask_residual=True)); the reveal/earlier-committed stay
-         their token embedding; still-masked stay bare [MASK]. The clean half is untouched.
+         the SOFT mix of the SINGLE committed token blended with [MASK], renormalized
+         (top_k=1 -- think commits ONE token per position, so this is its native commit
+         representation, NOT the talk's top-10 input); reveal/earlier-committed stay their
+         token embedding; still-masked stay bare [MASK]. The clean half is untouched.
       3. Re-forward think -> s+2 logits.
 
     Returns (s2_logits[:, :noisy_len], argmax, commit_mask). The caller reuses the SAME
@@ -190,7 +191,9 @@ def build_think_next_teacher(think, think_emb, full_input_ids, think_s1_logits, 
     committed_ids = torch.where(commit_mask, argmax, noisy_ids)          # commit -> token, else unchanged
     noisy_in = _embed(think_emb, committed_ids)                          # reveal/commit -> token, mask -> [MASK]
     if bool(commit_mask.any()):
-        soft = build_topk_soft_embeds(s1_noisy, think_emb, mask_id, top_k=top_k,
+        # top_k=1: think's native commit soft-mix (committed token + mask residual, renorm) --
+        # NOT the talk's top-10 input. This makes the teacher think's genuine 2nd iteration.
+        soft = build_topk_soft_embeds(s1_noisy, think_emb, mask_id, top_k=1,
                                       keep_mask_residual=True)           # decode_uniform soft mix
         noisy_in = inject_soft_embeds(noisy_in, soft, commit_mask)       # newly-committed -> soft mix
     clean_in = _embed(think_emb, full_input_ids[:, L:])
@@ -259,7 +262,7 @@ def _selftest():
     stub = _StubLM(W.t())
     for thr in (0.0, 0.99):                              # 0.0 commits the whole prefix; 0.99 ~ none
         s2, am, cm = build_think_next_teacher(stub, W, full_ids.clone(), s1, Ln, mask_id,
-                                              block_size=2, threshold=thr, top_k=K)
+                                              block_size=2, threshold=thr)
         assert s2.shape == (B, Ln, V) and torch.isfinite(s2).all()
         assert cm.shape == (B, Ln) and bool((cm <= (full_ids[:, :Ln] == mask_id)).all())  # commits subset of masked
     print("t3d_topk_talk selftest OK")
