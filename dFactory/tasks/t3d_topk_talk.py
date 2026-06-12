@@ -116,6 +116,7 @@ def build_talk_inputs_embeds(
 
 def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
                        labels: torch.Tensor, *, temperature: float = 1.0,
+                       weight: "torch.Tensor | None" = None,
                        ignore_index: int = -100, eps: float = 1e-8) -> torch.Tensor:
     """Path-A think->talk distillation: pull the talk's distribution toward the FROZEN
     think's distribution at the predict positions (labels != ignore_index, i.e. the still-
@@ -125,9 +126,10 @@ def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
     start (reverse KL would be mode-seeking -> collapse onto think's top-1 = the ceiling).
 
     `temperature` softens both sides (classic distillation T); the loss is scaled by T^2 to
-    keep the gradient magnitude comparable to the gold CE term. Returns a scalar = mean
-    forward-KL over the predict positions (0 at a perfect match -> clean monitor).
-    Computed in fp32. think_logits must be aligned to talk_logits' positions (no shift)."""
+    keep the gradient magnitude comparable to the gold CE term. `weight` (optional [B,L])
+    gives a per-position weight (e.g. entropy weight) -> WEIGHTED mean over predict positions
+    (else plain mean). Returns a scalar (0 at a perfect match). Computed in fp32; think_logits
+    and weight must be aligned to talk_logits' positions (no shift)."""
     predict = (labels != ignore_index)                        # [B, L] bool
     if not bool(predict.any()):
         return talk_logits.sum() * 0.0                        # keep graph, zero contribution
@@ -138,7 +140,31 @@ def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
     student_logp = F.log_softmax(tl, dim=-1)
     teacher_logp = F.log_softmax(th, dim=-1)
     kl = (teacher * (teacher_logp - student_logp)).sum(-1)    # [N] forward KL per position
-    return kl.mean() * (T * T)
+    if weight is None:
+        return kl.mean() * (T * T)
+    w = weight[predict].float()                               # [N]
+    return (kl * w).sum() / w.sum().clamp_min(eps) * (T * T)  # weighted mean
+
+
+def think_entropy_norm(logits: torch.Tensor) -> torch.Tensor:
+    """Per-position NORMALIZED entropy of softmax(logits), in [0,1] (H / log V). High = the
+    think model is uncertain there = forking/hard. Used to up-weight hard positions (Path A)."""
+    import math
+    p = F.softmax(logits.float(), dim=-1)
+    H = -(p * p.clamp_min(1e-12).log()).sum(-1)               # [B, L]
+    return H / math.log(logits.shape[-1])
+
+
+def recoverable_mask(think_logits: torch.Tensor, labels: torch.Tensor, top_k: int,
+                     ignore_index: int = -100) -> torch.Tensor:
+    """[B,L] bool: a 'recoverable hard' position for Path B = think's top-1 is WRONG but the
+    gold token IS in think's top-K (so the talk, fed the top-K, *can* pick it). Excludes
+    non-predict positions. Where gold is NOT in top-K, Path B can't recover -> left to Path A."""
+    predict = labels != ignore_index
+    argmax = think_logits.argmax(dim=-1)                       # think top-1
+    topk_idx = think_logits.topk(top_k, dim=-1).indices        # [B, L, K]
+    gold_in_topk = (topk_idx == labels.unsqueeze(-1)).any(dim=-1)
+    return predict & (argmax != labels) & gold_in_topk
 
 
 def confident_prefix_commit(logits, mask_index, block_size, threshold):
@@ -248,6 +274,25 @@ def _selftest():
     # no predict positions -> exact 0 (graph-preserving), not nan
     z = think_distill_loss(talk_logits, think_l, torch.full_like(dl_labels, -100))
     assert float(z) == 0.0
+    # weighted KL: uniform weight == plain mean; zero weight -> 0
+    kl_u = think_distill_loss(talk_logits, think_l, dl_labels)
+    kl_w1 = think_distill_loss(talk_logits, think_l, dl_labels, weight=torch.ones(B, L))
+    assert torch.allclose(kl_u, kl_w1, atol=1e-5)
+    assert think_distill_loss(talk_logits, think_l, dl_labels, weight=torch.zeros(B, L)).abs() < 1e-6
+
+    # think_entropy_norm in [0,1]; uniform logits -> ~1, peaked -> ~0
+    Hn = think_entropy_norm(think_l)
+    assert Hn.shape == (B, L) and (Hn >= -1e-6).all() and (Hn <= 1 + 1e-6).all()
+    assert think_entropy_norm(torch.zeros(1, 1, V)).item() > 0.99           # uniform -> max entropy
+    peaked = torch.full((1, 1, V), -1e4); peaked[0, 0, 0] = 1e4
+    assert think_entropy_norm(peaked).item() < 0.01                          # one-hot -> ~0
+
+    # recoverable_mask: gold in top-K but think top-1 wrong
+    rl = torch.zeros(1, 3, V); lab = torch.tensor([[5, -100, 7]])
+    rl[0, 0, 9] = 10.0; rl[0, 0, 5] = 5.0     # pos0: top1=9 (wrong, gold5 in top-K) -> recoverable
+    rl[0, 2, 7] = 10.0                          # pos2: top1=7 == gold -> NOT (think right)
+    rm = recoverable_mask(rl, lab, top_k=K)
+    assert bool(rm[0, 0]) and not bool(rm[0, 1]) and not bool(rm[0, 2])
 
     # build_think_next_teacher: shape [B, Ln], finite, reuses one commit decision
     class _StubLM:                                       # logits = inputs_embeds @ W^T

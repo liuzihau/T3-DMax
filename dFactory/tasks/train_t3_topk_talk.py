@@ -43,7 +43,7 @@ import random
 # input embedding at masked positions. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
 from tasks.t3d_topk_talk import (build_talk_inputs_embeds, load_causal_lm, set_talk_trainable,
                                  confident_prefix_commit, think_distill_loss,
-                                 build_think_next_teacher)
+                                 build_think_next_teacher, think_entropy_norm, recoverable_mask)
 
 
 logger = helper.create_logger(__name__)
@@ -251,6 +251,23 @@ class LLaDA2TrainingArguments(TrainingArguments):
         metadata={"help": "Path-B s+2 distillation softmax temperature (loss scaled by T^2). Only "
                           "used when t3_pathb_kl_gamma>0. Keep gamma modest so gold (truth) wins the "
                           "flip decision at stuck-wrong forking positions (KL is a dope, not driver)."}
+    )
+    # Hard-position weighting (focus the loss on forking / recoverable positions) -------
+    t3_patha_entropy_lambda: float = field(
+        default=0.0,
+        metadata={"help": "Path-A entropy weighting (>0 = on). Per-position loss weight = 1 + lambda * "
+                          "Hnorm(think), Hnorm in [0,1] = think's normalized entropy. Up-weights the "
+                          "uncertain/forking positions (where gold is often NOT in top-K and the mask "
+                          "path is the only hope). Weights BOTH Path-A CE and KL. Needs think forwarded "
+                          "on Path A (auto-on). Keep modest (~1-2)."}
+    )
+    t3_pathb_recover_lambda: float = field(
+        default=0.0,
+        metadata={"help": "Path-B recoverable up-weight (>0 = on). Per-position CE weight = 1 + lambda "
+                          "where think's top-1 is WRONG but gold IS in think's top-K (the talk, fed the "
+                          "top-K, CAN pick it). Teaches 'select the right candidate over think's wrong "
+                          "top-1' = the recovery skill. Where gold is not in top-K, weight stays 1 (left "
+                          "to Path A). Keep modest (~1-2)."}
     )
 
 
@@ -812,8 +829,9 @@ def main():
                 # Path-A input stays bare [MASK] (build_talk_inputs_embeds mode='mask'
                 # ignores think_logits), so think is a teacher, not an input, here.
                 _distill_A = (not flag) and args.train.t3_distill_beta > 0
+                _patha_ew = (not flag) and args.train.t3_patha_entropy_lambda > 0   # Path-A entropy weighting
                 think_logits = None
-                if flag or _distill_A:
+                if flag or _distill_A or _patha_ew:
                     with torch.no_grad():
                         think_logits = think(
                             inputs_embeds=think_emb(micro_batch["input_ids"]),
@@ -880,35 +898,52 @@ def main():
                     else:
                         noisy_logits = logits
 
+                    V = noisy_logits.shape[-1]
+                    L_n = noisy_input_ids.shape[1]
+                    # Per-position loss WEIGHT (hard-position focus). Path A: entropy weight (up-weight
+                    # uncertain/forking positions). Path B: recoverable up-weight (think top-1 wrong but
+                    # gold in top-K -> 'pick the right candidate'). Applied to BOTH that path's CE and KL.
+                    _w = None
+                    if _patha_ew:
+                        _w = 1.0 + args.train.t3_patha_entropy_lambda * think_entropy_norm(think_logits[:, :L_n])
+                    elif flag and args.train.t3_pathb_recover_lambda > 0:
+                        _recov = recoverable_mask(think_logits[:, :L_n], labels, args.train.t3_top_k)
+                        _w = 1.0 + args.train.t3_pathb_recover_lambda * _recov.float()
+
                     if args.train.same_token_labels:
                         unscaled_loss = torch.nn.functional.cross_entropy(
-                            noisy_logits.view(-1, noisy_logits.shape[-1]),
-                            labels.view(-1),
-                            reduction="none",
-                        )
-                        ce_mean = unscaled_loss.sum() / (labels != -100).sum()
+                            noisy_logits.view(-1, V), labels.view(-1), reduction="none")
+                        _pred = (labels.view(-1) != -100)
+                        if _w is None:
+                            ce_mean = unscaled_loss.sum() / _pred.sum()
+                        else:
+                            _wf = _w.reshape(-1)
+                            ce_mean = (unscaled_loss * _wf).sum() / (_wf * _pred.float()).sum().clamp_min(1e-8)
+                        _kl_w = _w
                     else:
                         shifted_noisy_logits = noisy_logits[:, :-1, :].contiguous()
                         shifted_labels = labels[:, 1:].contiguous()
                         unscaled_loss = torch.nn.functional.cross_entropy(
-                            shifted_noisy_logits.view(-1, shifted_noisy_logits.shape[-1]),
-                            shifted_labels.view(-1),
-                            reduction="none",
-                        ).view(shifted_noisy_logits.shape[0], -1)
-                        ce_mean = unscaled_loss.sum() / (shifted_labels != -100).sum()
+                            shifted_noisy_logits.view(-1, V), shifted_labels.view(-1),
+                            reduction="none").view(shifted_noisy_logits.shape[0], -1)
+                        _pred = (shifted_labels != -100)
+                        _kl_w = None if _w is None else _w[:, 1:]
+                        if _kl_w is None:
+                            ce_mean = unscaled_loss.sum() / _pred.sum()
+                        else:
+                            ce_mean = (unscaled_loss * _kl_w).sum() / (_kl_w * _pred.float()).sum().clamp_min(1e-8)
 
                     # Path-A think->talk distillation: hybrid alpha*CE(gold) + beta*KL(think||talk)
                     # at the predict positions. Path B (flag) and distill-off keep pure gold CE.
                     if _distill_A:
-                        L_n = noisy_input_ids.shape[1]
                         if args.train.same_token_labels:
                             kl = think_distill_loss(
                                 noisy_logits, think_logits[:, :L_n], labels,
-                                temperature=args.train.t3_distill_temp)
+                                temperature=args.train.t3_distill_temp, weight=_kl_w)
                         else:
                             kl = think_distill_loss(
                                 shifted_noisy_logits, think_logits[:, :L_n][:, 1:].contiguous(),
-                                shifted_labels, temperature=args.train.t3_distill_temp)
+                                shifted_labels, temperature=args.train.t3_distill_temp, weight=_kl_w)
                         loss = (args.train.t3_distill_alpha * ce_mean
                                 + args.train.t3_distill_beta * kl) / len(micro_batches)
                     elif think_s2_logits is not None:
@@ -916,11 +951,11 @@ def main():
                         # both over the predict positions (Portion 1 + still-masked; reveal is -100).
                         if args.train.same_token_labels:
                             kl_b = think_distill_loss(noisy_logits, think_s2_logits, labels,
-                                                      temperature=args.train.t3_pathb_kl_temp)
+                                                      temperature=args.train.t3_pathb_kl_temp, weight=_kl_w)
                         else:
                             kl_b = think_distill_loss(shifted_noisy_logits,
                                                       think_s2_logits[:, 1:].contiguous(), shifted_labels,
-                                                      temperature=args.train.t3_pathb_kl_temp)
+                                                      temperature=args.train.t3_pathb_kl_temp, weight=_kl_w)
                         loss = (ce_mean + args.train.t3_pathb_kl_gamma * kl_b) / len(micro_batches)
                     else:
                         loss = ce_mean / len(micro_batches)
