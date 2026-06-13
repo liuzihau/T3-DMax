@@ -154,10 +154,12 @@ def main():
     ap.add_argument("--no_mask_residual", action="store_true",
                     help="Feed the talk no-mask top-K (matches training keep_mask_residual=False). "
                          "Try this first — the mask-residual default is off-distribution for the talk.")
-    ap.add_argument("--think_every", type=int, default=2,
-                    help="THINK cadence within a block. Default (huge) = think once/block + talk-many "
-                         "(cheap, stale top-K). 1 = think+talk ALTERNATING, a fresh think every talk "
-                         "forward (diagnostic: does fresh top-K recover accuracy? ~DMax cost).")
+    ap.add_argument("--think_every", type=int, default=10**9,
+                    help="THINK cadence within a block. Default (huge) = think ONCE/block + talk-many "
+                         "(L2: cheap, stale top-K, the compute-saving target mode). 1 = think+talk "
+                         "ALTERNATING, a fresh think every talk forward (L1 diagnostic: does fresh top-K "
+                         "recover accuracy? ~DMax cost). Sweep 2/3/5 between them for the H1 sweet spot. "
+                         "(Was wrongly defaulting to 2, contradicting this help.)")
     args = ap.parse_args()
     dtype = torch.bfloat16
 

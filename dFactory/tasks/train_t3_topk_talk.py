@@ -267,7 +267,62 @@ class LLaDA2TrainingArguments(TrainingArguments):
                           "where think's top-1 is WRONG but gold IS in think's top-K (the talk, fed the "
                           "top-K, CAN pick it). Teaches 'select the right candidate over think's wrong "
                           "top-1' = the recovery skill. Where gold is not in top-K, weight stays 1 (left "
-                          "to Path A). Keep modest (~1-2)."}
+                          "to Path A). Keep modest (~1-2). (Stage-1 Path B only; the stage-2 multi-pass "
+                          "rollout below ignores it.)"}
+    )
+    # Stage-2 on-policy MULTI-PASS rollout (talk's own trajectory + refreshed-think distill) --------
+    t3_rollout_passes: int = field(
+        default=1,
+        metadata={"help": "Stage-2: number of on-policy commit ROUNDS J per Path-B micro-batch. J>=2 is "
+                          "the stage-2 regime (1 = depth-1 legacy). Each round: talk GRAD forward on its "
+                          "CURRENT committed state (still-masked -> think top-K, committed -> token), then "
+                          "confidence-prefix commit of the talk's OWN argmax (own commits become context), "
+                          "then (optional) think refresh. Per-pass loss is averaged over the J passes; "
+                          "backward is taken PER pass (passes connect only through DISCRETE commits, so "
+                          "1x memory, identical grads). think fwds = J+1 (initial + J refreshes) when "
+                          "refresh on, talk grad fwds = J. X_1 = teacher-forced start (keeps base skill); "
+                          "X_2..X_J = own-commit robustness. Only fires when t3_rollout_commit_frac>0. "
+                          "If t3_rollout_passes_max > this, J ANNEALS from here up to the max (depth "
+                          "curriculum); otherwise J is fixed at this value."}
+    )
+    t3_rollout_passes_max: int = field(
+        default=0,
+        metadata={"help": "Stage-2 DEPTH-CURRICULUM cap. 0 (or <= t3_rollout_passes) = OFF (J fixed). "
+                          ">t3_rollout_passes = ANNEAL J: start at t3_rollout_passes, +1 each time the "
+                          "advance gate fires AFTER the reveal schedule is exhausted (full mask), up to "
+                          "this max. Rationale (THUNLP 2604 §6.1 depth curriculum): master the shallow "
+                          "trajectory at the inference (full-mask) condition first, THEN deepen -- depth "
+                          "matters most at full mask. J advances on a ce_roll PLATEAU (own-commit depth "
+                          "stabilized), reveal advances on ce_tf parity/plateau (one shared gate, "
+                          "sequential: reveal first, then J). Requires single-rank (world_size==1) -- the "
+                          "per-pass backward count must match across DDP ranks (else collective hang)."}
+    )
+    t3_think_refresh: bool = field(
+        default=False,
+        metadata={"help": "Stage-2: re-run the FROZEN think on the talk's committed state after each "
+                          "rollout round. think_fresh serves DOUBLE duty: (a) the fresh top-K input for "
+                          "the next round's still-masked positions, (b) the KL teacher for the current "
+                          "pass -- think ONE talk-commit AHEAD of the input (the on-policy twin of "
+                          "stage-1's think_{s+2}; NOT a same-state degenerate echo). think is fed the "
+                          "talk's HARD committed tokens (think's OPUT-train input form; soft-mix refresh "
+                          "= deferred ablation). Required for t3_stage2_kl_gamma>0. Off => reuse the "
+                          "stale pass-0 top-K for every round (cheap depth-only rollout, 1 think fwd)."}
+    )
+    t3_stage2_kl_gamma: float = field(
+        default=0.0,
+        metadata={"help": "Stage-2 refreshed-think distillation weight: per-pass loss = CE(gold) + gamma "
+                          "* forward-KL(think_fresh || talk). Distilling the REFRESHED think (think on "
+                          "the talk's own committed state) teaches the talk to internalize think's "
+                          "refresh, so inference can keep think_every large (the H1 compute win) and the "
+                          "frozen-iter-0 top-1 ceiling is broken. Forward KL = mass-covering (keeps the "
+                          "candidate structure; entropy-gated direction = deferred). Keep modest (~0.3) "
+                          "so gold wins stuck-wrong forking positions (the H2 target). Requires "
+                          "t3_think_refresh=true."}
+    )
+    t3_stage2_kl_temp: float = field(
+        default=1.0,
+        metadata={"help": "Stage-2 refreshed-think KL softmax temperature (loss scaled by T^2). Only "
+                          "used when t3_stage2_kl_gamma>0."}
     )
 
 
@@ -343,7 +398,8 @@ def _append_jsonl(path, record):
 @torch.no_grad()
 def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn_proto, device,
                   top_k, rollout_frac=0.5, keep_mask_residual=False, do_rollout=True,
-                  block_size=32, commit_threshold=0.3, val_seed=12345):
+                  block_size=32, commit_threshold=0.3, val_seed=12345,
+                  rollout_passes=1, think_refresh=False):
     """Quick anchor-free top-K val. CE + token-match acc on the masked predict positions, with
     the two TEACHER references each path is actually chasing:
       * `_think`  : think's s+1 top-1 (one think forward on [reveal+mask]). The teacher the
@@ -353,7 +409,13 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
                     is meant to leap one think iteration -> compare acc_tf vs acc_think2.
       * `_tf`     : teacher-forced talk on think's top-K (clean context).
       * `_mask`   : pure [MASK] path (no think) -- the Path-A baseline.
-      * `_roll`   : rollout (own commits as context) -- inference-condition, tracks GSM8K."""
+      * `_roll`   : STAGE-2 multi-pass rollout (talk's OWN confidence-prefix commits as context, J
+                    rounds w/ optional think refresh) -- the inference condition, tracks GSM8K. acc_roll
+                    = the final pass's talk argmax vs gold over all predict positions.
+      * OPD health (when do_rollout AND think_refresh): `overlap_ratio` (|talk topK ∩ think_fresh topK|/K),
+        `entropy_gap` (|Hnorm(talk) - Hnorm(think_fresh)|), `beat_roll` (talk right where think_fresh
+        top-1 wrong = the H2 read on the own-commit trajectory). Rising overlap + narrowing gap = the
+        on-policy distill is working (2604); stagnant = a failing run."""
     was_training = talk.training
     talk.eval()
     th_ce = th_ok = th_n = 0          # think's s+1 top-1 (teacher for the mask path)
@@ -362,6 +424,8 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
     mk_ce = mk_ok = mk_n = 0
     rl_ce = rl_ok = rl_n = 0
     thwrong_n = recA_n = recB_n = 0   # RECOVERY (H2): of think_{s+1}-WRONG positions, frac each talk path FIXES
+    ov_sum = ov_n = eg_sum = 0.0      # OPD health: top-K overlap ratio + normalized entropy gap (vs think_fresh)
+    beat_d = beat_n = 0               # beat_roll: talk right where the REFRESHED think top-1 is wrong (H2)
     attn = attn_proto.to(device)
     # Deterministic reveal: seed the global RNG per example so every val (at a given curriculum
     # sigma) masks the SAME positions -> val CE/acc is comparable across steps (fair best-ce gate).
@@ -426,24 +490,45 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
         thwrong_n += int(_thw.sum())
         recB_n += int((_thw & (tf_logits.argmax(-1) == labels)).sum())   # Path B (top-K) recovers
         recA_n += int((_thw & (mk_logits.argmax(-1) == labels)).sum())   # Path A (mask) recovers
-        # --- rollout (own commits as context) — ONLY when on-policy is active (Stage 2) ---
+        # --- STAGE-2 multi-pass rollout (own confidence-prefix commits as context) — Stage 2 only ---
+        # Mirrors training: J rounds, each commits the talk's OWN argmax (confidence-prefix, not a random
+        # fraction), optional think refresh between rounds. acc_roll/ce_roll = the FINAL pass vs gold on
+        # all predict positions (the own-commit-trajectory quality). OPD health (overlap/entropy-gap/beat)
+        # vs the refreshed think -- the go/no-go signal for the on-policy distill.
         if do_rollout:
-            argmax_tf = tf_logits.argmax(-1)                               # talk's own preds
-            committed = valid & (torch.rand_like(argmax_tf.float()) < rollout_frac)
-            still = valid & (~committed)
-            if int(still.sum()) > 0:
-                full_roll = full.clone()
-                full_roll[:, :L] = torch.where(committed, argmax_tf, full_roll[:, :L])
-                rl_embeds = build_talk_inputs_embeds(full_roll, think_logits, embedding, mask_id,
+            roll_ids = full.clone()
+            think_cur = think_logits                                       # think(X_1) (already computed)
+            rl_logits = tf_logits                                          # fallback if no masked positions
+            for _vp in range(max(1, rollout_passes)):
+                mnow = roll_ids[:, :L] == mask_id
+                if not bool(mnow.any()):
+                    break
+                rl_embeds = build_talk_inputs_embeds(roll_ids, think_cur, embedding, mask_id,
                                                      mode="topk_soft", top_k=top_k, keep_mask_residual=keep_mask_residual)
                 rl_logits = talk(inputs_embeds=rl_embeds, attention_mask=attn, position_ids=pos,
                                  use_cache=False, return_dict=True).logits[:, :L]
-                labels_still = labels.clone()
-                labels_still[~still] = -100
-                rl_ce += F.cross_entropy(rl_logits.reshape(-1, rl_logits.shape[-1]).float(),
-                                         labels_still.reshape(-1), ignore_index=-100, reduction="sum").item()
-                rl_ok += int(((rl_logits.argmax(-1) == labels) & still).sum())
-                rl_n += int(still.sum())
+                _am, _cm = confident_prefix_commit(rl_logits, mnow, block_size, commit_threshold)
+                roll_ids[:, :L] = torch.where(_cm, _am, roll_ids[:, :L])
+                if think_refresh:
+                    think_cur = think(inputs_embeds=embedding(roll_ids), attention_mask=attn,
+                                      position_ids=pos, use_cache=False, return_dict=True).logits
+            rl_ce += F.cross_entropy(rl_logits.reshape(-1, rl_logits.shape[-1]).float(),
+                                     labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+            rl_ok += int(((rl_logits.argmax(-1) == labels) & valid).sum())
+            rl_n += int(valid.sum())
+            # OPD health vs the REFRESHED think (only meaningful when think_refresh is on)
+            if think_refresh:
+                tk = think_cur[:, :L]
+                _ti = tk.topk(top_k, -1).indices                           # think_fresh top-K
+                _si = rl_logits.topk(top_k, -1).indices                    # talk top-K
+                _ov = (_ti.unsqueeze(-1) == _si.unsqueeze(-2)).any(-1).float().sum(-1) / top_k   # [B,L]
+                ov_sum += float((_ov * valid.float()).sum())
+                ov_n += int(valid.sum())
+                eg_sum += float(((think_entropy_norm(tk) - think_entropy_norm(rl_logits)).abs()
+                                 * valid.float()).sum())
+                _tw = (tk.argmax(-1) != labels) & valid                    # refreshed think top-1 wrong
+                beat_d += int(_tw.sum())
+                beat_n += int((_tw & (rl_logits.argmax(-1) == labels)).sum())
     torch.set_rng_state(_cpu_rng)                              # restore: don't perturb training's RNG stream
     if _cuda_rng is not None:
         torch.cuda.set_rng_state_all(_cuda_rng)
@@ -462,7 +547,11 @@ def _run_topk_val(think, talk, embedding, mask_id, val_examples, transform, attn
            # recovery of think_{s+1}'s errors (denominator = think s+1 wrong @ predict positions)
            "val/recover_mask": (recA_n / thwrong_n if thwrong_n else float("nan")),   # Path A
            "val/recover_tf": (recB_n / thwrong_n if thwrong_n else float("nan")),     # Path B
-           "val/think_wrong_n": thwrong_n}
+           "val/think_wrong_n": thwrong_n,
+           # STAGE-2 OPD health (vs the refreshed think on the talk's own-commit trajectory)
+           "val/overlap_ratio": (ov_sum / ov_n if ov_n else float("nan")),
+           "val/entropy_gap": (eg_sum / ov_n if ov_n else float("nan")),
+           "val/beat_roll": (beat_n / beat_d if beat_d else float("nan"))}
     return out
 
 
@@ -631,13 +720,35 @@ def main():
     _metrics_path = args.train.t3_metrics_jsonl or os.path.join(args.train.output_dir, "metrics.jsonl")
     _saved_ckpts = []          # [{val_ce, dir, step}] for best-N retention
     _last_val_ce = float("nan")
-    _best_ce_B = float("inf")                # best (lowest) Path-B val CE (ce_tf) at the CURRENT reveal level
-    _no_improve = 0                          # consecutive vals with no new best ce_tf (plateau patience)
+    _best_ce_B = float("inf")                # best (lowest) gate val CE at the CURRENT level (ce_tf in the
+                                             #   reveal phase, ce_roll in the J-anneal phase)
+    _no_improve = 0                          # consecutive vals with no new best gate-CE (plateau patience)
+    # Stage-2 DEPTH curriculum: J anneals from t3_rollout_passes up to t3_rollout_passes_max, +1 per
+    # advance AFTER the reveal schedule is exhausted (full mask). _cur_J is the live value the training
+    # loop reads each micro-batch; updated rank-0-only in the val block (single-rank required -- the
+    # per-pass backward COUNT must match across DDP ranks or the grad all-reduce collectives mismatch).
+    _J_anneal = (args.train.t3_rollout_commit_frac > 0
+                 and args.train.t3_rollout_passes_max > args.train.t3_rollout_passes)
+    _J_max = args.train.t3_rollout_passes_max
+    _cur_J = args.train.t3_rollout_passes
+    if _J_anneal:
+        assert args.train.world_size == 1, (
+            "t3_rollout_passes_max > t3_rollout_passes (J depth-annealing) requires single-rank "
+            f"(world_size==1); got {args.train.world_size}. The per-pass backward count varies with J, "
+            "so an unsynced J across DDP ranks mismatches the grad all-reduce collectives (hang). "
+            "Use a fixed J (set t3_rollout_passes_max=0) for multi-GPU, or broadcast _cur_J.")
+        logger.info_rank0(f"[t3d depth-curriculum] J anneals {_cur_J} -> {_J_max} "
+                          f"(+1 per advance once reveal hits full mask)")
     # Guard: the on-policy rollout (Stage 2, talk-sourced commits) and the Path-B s+2 KL (Stage 1,
     # think-sourced commits) BOTH write committed tokens into input_ids -- they are stage-exclusive.
     assert not (args.train.t3_rollout_commit_frac > 0 and args.train.t3_pathb_kl_gamma > 0), (
         "t3_rollout_commit_frac>0 (Stage-2 on-policy) and t3_pathb_kl_gamma>0 (Stage-1 s+2 KL) are "
         "mutually exclusive -- both commit into input_ids. Enable only one.")
+    # Stage-2 refreshed-think KL needs the refresh (the teacher) AND the rollout (the on-policy state).
+    if args.train.t3_stage2_kl_gamma > 0:
+        assert args.train.t3_think_refresh and args.train.t3_rollout_commit_frac > 0, (
+            "t3_stage2_kl_gamma>0 requires t3_think_refresh=true (supplies the KL teacher think_fresh) "
+            "and t3_rollout_commit_frac>0 (the on-policy multi-pass rollout).")
     # Explicit reveal schedule (overrides the linear step). progress = (1 - reveal - low)/(high - low).
     _reveal_sched = [float(x) for x in args.train.t3_curriculum_reveals.split(",") if x.strip()] or None
     _cur_reveal_idx = 0
@@ -839,24 +950,86 @@ def main():
                             position_ids=micro_batch["position_ids"],
                             use_cache=False,
                         ).logits
-                        if flag and args.train.t3_rollout_commit_frac > 0:
-                            L0 = noisy_input_ids.shape[1]
-                            # commit-deciding forward uses the EXACT inference input (mask-residual
-                            # when t3_keep_mask_residual), so the commits match decode time.
-                            _roll_in = build_talk_inputs_embeds(
-                                micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                                mode="topk_soft", top_k=args.train.t3_top_k,
-                                keep_mask_residual=args.train.t3_keep_mask_residual)
-                            _roll_logits = model(
-                                inputs_embeds=_roll_in, attention_mask=micro_batch["attention_mask"],
+                        # (Stage-2's on-policy commits happen in the MULTI-PASS rollout below, AFTER
+                        #  think_logits is cached as think(X_1); no depth-1 single-commit here.)
+
+                # ===================== STAGE-2 on-policy MULTI-PASS rollout (Path B) =====================
+                # J commit rounds on the talk's OWN trajectory -- fixes exposure bias at DEPTH (not just
+                # depth-1) AND breaks the frozen-iter-0 top-1 ceiling by distilling a REFRESHED think.
+                # Per round j (state X_j; think_cur = think(X_j) = this round's top-K source):
+                #   1. talk GRAD forward on build(X_j, think_cur)               -> logits_j
+                #   2. commit talk's OWN argmax (confidence-prefix)             -> X_{j+1}  (own commits=context)
+                #   3. REFRESH frozen think on X_{j+1}                          -> think_fresh (teacher_j + next top-K)
+                #   4. loss_j = CE(gold) + gamma*KL_fwd(think_fresh||talk_j); BACKWARD per pass (1x mem,
+                #      identical grads -- passes connect only through DISCRETE commits, no grad between).
+                # think fwds = J+1 (initial X_1 + J refreshes); talk grad fwds = J. The teacher is think
+                # ONE talk-commit ahead of the input (the on-policy twin of stage-1's think_{s+2}, NOT a
+                # same-state echo). think_fresh feeds think the talk's HARD committed tokens.
+                _stage2 = (flag and args.train.t3_rollout_commit_frac > 0
+                           and args.train.t3_rollout_passes >= 1)
+                if _stage2:
+                    L0 = noisy_input_ids.shape[1]
+                    J = _cur_J                                     # live (annealed) depth; fixed if no curriculum
+                    _refresh = args.train.t3_think_refresh
+                    _gamma2 = args.train.t3_stage2_kl_gamma
+                    _ids = micro_batch["input_ids"]
+                    think_cur = think_logits                       # think(X_1) = s+1 (no grad, cached above)
+                    for _j in range(J):
+                        masked_now = _ids[:, :L0] == mask_token_id
+                        if not bool(masked_now.any()):
+                            break                                  # block fully decoded -> stop early
+                        talk_in_j = build_talk_inputs_embeds(
+                            _ids, think_cur, think_emb, mask_token_id,
+                            mode="topk_soft", top_k=args.train.t3_top_k,
+                            keep_mask_residual=args.train.t3_keep_mask_residual)
+                        with model_fwd_context:
+                            logits_j = model(
+                                inputs_embeds=talk_in_j, attention_mask=micro_batch["attention_mask"],
                                 position_ids=micro_batch["position_ids"], use_cache=False,
-                                output_router_logits=False).logits[:, :L0]
-                            _masked = micro_batch["input_ids"][:, :L0] == mask_token_id
-                            # CONFIDENCE-PREFIX commit (inference rule), not a random fraction.
-                            _argmax, _commit = confident_prefix_commit(
-                                _roll_logits, _masked, args.train.block_size, args.train.t3_commit_threshold)
-                            micro_batch["input_ids"][:, :L0] = torch.where(
-                                _commit, _argmax, micro_batch["input_ids"][:, :L0])
+                                output_router_logits=False).logits
+                            noisy_logits_j = logits_j[:, :L0].contiguous()
+                            # (2) commit talk's OWN argmax (detached) -> X_{j+1};  (3) refresh think -> teacher_j
+                            with torch.no_grad():
+                                _argmax_j, _commit_j = confident_prefix_commit(
+                                    noisy_logits_j.detach(), masked_now, args.train.block_size,
+                                    args.train.t3_commit_threshold)
+                                _ids[:, :L0] = torch.where(_commit_j, _argmax_j, _ids[:, :L0])
+                                think_fresh = None
+                                if _refresh:
+                                    think_fresh = think(
+                                        inputs_embeds=think_emb(_ids),
+                                        attention_mask=micro_batch["attention_mask"],
+                                        position_ids=micro_batch["position_ids"],
+                                        use_cache=False).logits
+                            # (4) loss_j = gold CE [+ gamma*KL(think_fresh||talk)], averaged over J passes
+                            V = noisy_logits_j.shape[-1]
+                            if args.train.same_token_labels:
+                                ce_j = torch.nn.functional.cross_entropy(
+                                    noisy_logits_j.view(-1, V), labels.view(-1),
+                                    ignore_index=-100, reduction="mean")
+                                _tl, _tlab = noisy_logits_j, labels
+                            else:
+                                _sl = noisy_logits_j[:, :-1, :].contiguous()
+                                _slab = labels[:, 1:].contiguous()
+                                ce_j = torch.nn.functional.cross_entropy(
+                                    _sl.view(-1, V), _slab.view(-1), ignore_index=-100, reduction="mean")
+                                _tl, _tlab = _sl, _slab
+                            if think_fresh is not None and _gamma2 > 0:
+                                _teach = (think_fresh[:, :L0] if args.train.same_token_labels
+                                          else think_fresh[:, :L0][:, 1:].contiguous())
+                                kl_j = think_distill_loss(_tl, _teach, _tlab,
+                                                          temperature=args.train.t3_stage2_kl_temp)
+                                loss_j = (ce_j + _gamma2 * kl_j) / J / len(micro_batches)
+                            else:
+                                loss_j = ce_j / J / len(micro_batches)
+                        with model_bwd_context:
+                            loss_j.backward()
+                        total_loss += loss_j.item()
+                        if think_fresh is not None:
+                            think_cur = think_fresh                # fresh top-K for the next round
+                    del micro_batch
+                    continue                                       # stage-2 handled its own fwd/loss/bwd
+                # =========================================================================================
 
                 # ---- Path-B (stage-1) think_{s+2} teacher + Portion-1 hard-commit ----------------
                 # OPUT-style, think-sourced (off-policy): advance think ONE DMax step to think_{s+2}
@@ -1010,7 +1183,9 @@ def main():
                                         keep_mask_residual=args.train.t3_keep_mask_residual,
                                         do_rollout=args.train.t3_rollout_commit_frac > 0,
                                         block_size=args.train.block_size,
-                                        commit_threshold=args.train.t3_commit_threshold)
+                                        commit_threshold=args.train.t3_commit_threshold,
+                                        rollout_passes=_cur_J,
+                                        think_refresh=args.train.t3_think_refresh)
                     _rec.update(_vm)
                     # retention by the inference-relevant rollout CE (fall back to TF if nan)
                     _last_val_ce = _vm["val/ce_roll"]
@@ -1029,51 +1204,71 @@ def main():
                                       f"RECOVER(think_s1 wrong, n={_vm['val/think_wrong_n']}): "
                                       f"A={_vm['val/recover_mask']:.3f} B={_vm['val/recover_tf']:.3f} | "
                                       f"ce: think={_vm['val/ce_think']:.3f} talk={_vm['val/ce_tf']:.3f}")
-                    # mask-ratio curriculum: advance one step (reveal ratio down -> sigma up) when EITHER
-                    #  (A) PATH B (the inference path) reaches teacher parity: acc_tf >= frac*acc_think2 (s+2); OR
-                    #  (B) plateau (early-stop patience): no new best ce_tf for t3_curriculum_plateau_vals vals
-                    #      (a 'new best' must beat the best by > t3_curriculum_plateau_tol relative).
-                    # Path A (mask) is a capacity-limited regularizer (can't hit 95% of the 16B think, and has
-                    # a slow improvement tail) -> it does NOT gate; logged only. One-way; reset on advance.
+                    # STAGE-2 OPD health line (rising overlap + narrowing entropy gap = on-policy distill works)
+                    if args.train.t3_think_refresh and _vm["val/overlap_ratio"] == _vm["val/overlap_ratio"]:
+                        logger.info_rank0(f"[t3d stage2] step {global_step} "
+                                          f"overlap_ratio={_vm['val/overlap_ratio']:.3f} "
+                                          f"entropy_gap={_vm['val/entropy_gap']:.3f} "
+                                          f"beat_roll={_vm['val/beat_roll']:.3f} "
+                                          f"(talk fixes refreshed-think's top-1 errors)")
+                    # TWO-PHASE curriculum, one shared advance gate, run SEQUENTIALLY:
+                    #  PHASE 1 -- mask-ratio (reveal down -> sigma up): advance when EITHER
+                    #    (A) Path B parity: acc_tf >= frac*acc_think2 (s+2); OR (B) ce_tf plateau (patience).
+                    #    Path A (mask) is a capacity-bound regularizer -> does NOT gate (logged only).
+                    #  PHASE 2 -- DEPTH (J += 1), only AFTER reveal is exhausted (full mask) and J<J_max:
+                    #    advance on a ce_ROLL plateau (the own-commit trajectory has stabilized at this depth
+                    #    -- the right signal for deepening, THUNLP 2604 §6.1). Master shallow-at-full-mask
+                    #    first, then deepen. One-way; _best_ce_B/_no_improve reset on every advance.
+                    _reveal_done = (noise_progress is None) or (
+                        _cur_reveal_idx >= len(_reveal_sched) - 1 if _reveal_sched is not None
+                        else noise_progress.value >= 1.0)
+                    _in_reveal = (not _reveal_done) and (noise_progress is not None)
+                    _in_Jphase = _reveal_done and _J_anneal and (_cur_J < _J_max)
                     _parity_B = _plateau = False
-                    _can_advance = (noise_progress is not None and (
-                        _cur_reveal_idx < len(_reveal_sched) - 1 if _reveal_sched is not None
-                        else noise_progress.value < 1.0))
+                    _can_advance = _in_reveal or _in_Jphase
                     if _can_advance:
                         _nan = lambda v: v != v
                         _frac = args.train.t3_curriculum_teacher_frac
-                        # (A) Path B parity vs think_{s+2}
-                        _parity_B = (not (_nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
-                                     and _vm["val/acc_tf"] >= _frac * _vm["val/acc_think2"])
-                        # (B) plateau on ce_tf with a relative min-delta (Path A's slow tail can't reset it)
-                        _ce_B = _vm["val/ce_tf"]
+                        if _in_reveal:                                   # reveal phase: tf parity + ce_tf plateau
+                            _parity_B = (not (_nan(_vm["val/acc_tf"]) or _nan(_vm["val/acc_think2"]))
+                                         and _vm["val/acc_tf"] >= _frac * _vm["val/acc_think2"])
+                            _gate_ce = _vm["val/ce_tf"]
+                        else:                                            # J phase: own-commit depth -> ce_roll plateau
+                            _gate_ce = _vm["val/ce_roll"]
                         _tol = args.train.t3_curriculum_plateau_tol
-                        if (not _nan(_ce_B)) and _ce_B < _best_ce_B * (1.0 - _tol):
-                            _best_ce_B = _ce_B
+                        if (not _nan(_gate_ce)) and _gate_ce < _best_ce_B * (1.0 - _tol):
+                            _best_ce_B = _gate_ce
                             _no_improve = 0
                         else:
                             _no_improve += 1
                         _P = max(1, args.train.t3_curriculum_plateau_vals)
                         _plateau = _no_improve >= _P
                     if _can_advance and (_parity_B or _plateau):
-                        _reason = ("Path B parity: acc_tf %.3f >= %.0f%% of acc_think2 %.3f"
-                                   % (_vm["val/acc_tf"], _frac * 100, _vm["val/acc_think2"])) if _parity_B \
-                                  else ("plateau: ce_tf no >%.1f%% improvement for %d vals (ce_tf %.4f best %.4f)"
-                                        % (_tol * 100, _P, _ce_B, _best_ce_B))
-                        if _reveal_sched is not None:                     # explicit schedule: step one entry
-                            _cur_reveal_idx += 1
-                            _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
-                            noise_progress.value = min(1.0, max(0.0,
-                                (1.0 - _reveal_sched[_cur_reveal_idx] - _lo) / (_hi - _lo)))
-                        else:                                            # linear ramp
-                            noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
-                        _best_ce_B = float("inf"); _no_improve = 0       # fresh plateau tracking at new level
-                        _sigma = (args.data.noise_range_low + noise_progress.value
-                                  * (args.data.noise_range_high - args.data.noise_range_low))
-                        _rec["curriculum"] = f"sigma={_sigma:.3f}"
-                        logger.info_rank0(f"[t3d curriculum] step {global_step} ADVANCE ({_reason}) "
-                                          f"-> progress {noise_progress.value:.2f}, sigma~{_sigma:.3f} "
-                                          f"(reveal~{(1-_sigma)*100:.1f}%)")
+                        if _in_reveal:                                   # PHASE 1: step the reveal schedule
+                            _reason = ("Path B parity: acc_tf %.3f >= %.0f%% of acc_think2 %.3f"
+                                       % (_vm["val/acc_tf"], _frac * 100, _vm["val/acc_think2"])) if _parity_B \
+                                      else ("plateau: ce_tf no >%.1f%% improvement for %d vals (ce_tf %.4f best %.4f)"
+                                            % (_tol * 100, _P, _gate_ce, _best_ce_B))
+                            if _reveal_sched is not None:                # explicit schedule: step one entry
+                                _cur_reveal_idx += 1
+                                _lo, _hi = args.data.noise_range_low, args.data.noise_range_high
+                                noise_progress.value = min(1.0, max(0.0,
+                                    (1.0 - _reveal_sched[_cur_reveal_idx] - _lo) / (_hi - _lo)))
+                            else:                                        # linear ramp
+                                noise_progress.value = min(1.0, noise_progress.value + args.train.t3_curriculum_step)
+                            _sigma = (args.data.noise_range_low + noise_progress.value
+                                      * (args.data.noise_range_high - args.data.noise_range_low))
+                            _rec["curriculum"] = f"sigma={_sigma:.3f}"
+                            logger.info_rank0(f"[t3d curriculum] step {global_step} ADVANCE ({_reason}) "
+                                              f"-> progress {noise_progress.value:.2f}, sigma~{_sigma:.3f} "
+                                              f"(reveal~{(1-_sigma)*100:.1f}%)")
+                        else:                                            # PHASE 2: deepen the rollout (J += 1)
+                            _cur_J += 1
+                            _rec["rollout_passes"] = _cur_J
+                            logger.info_rank0(f"[t3d depth-curriculum] step {global_step} ADVANCE "
+                                              f"(ce_roll plateau: no >%.1f%% improvement for %d vals) -> J=%d"
+                                              % (_tol * 100, _P, _cur_J))
+                        _best_ce_B = float("inf"); _no_improve = 0       # fresh plateau tracking at the new level
                 _append_jsonl(_metrics_path, _rec)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

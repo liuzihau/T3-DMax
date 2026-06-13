@@ -1,12 +1,21 @@
-# T3-D top-K talk — STAGE 2: on-policy OPD, initialised from the Stage-1 cold start.
+# T3-D top-K talk — STAGE 2: ON-POLICY MULTI-PASS rollout + refreshed-think distillation.
 #
-# CRITICAL (THUNLP §5.1): model_path MUST point at the Stage-1 checkpoint, NOT ../merged_10L.
-# Running Stage 2 from scratch is the documented FAILURE mode ("Only OPD"). The rollout
-# now commits the CONFIDENCE-PREFIX (matches inference), not a random fraction.
-# See probe_runner/T3D_TOPK_TALK_METHOD.md §4.2-4.3.
+# Initialised from the Stage-1 cold start (THUNLP arXiv:2604.13016 §5.1: on-policy-from-scratch
+# FAILS; the documented failure mode "Only OPD" is running this from ../merged_10L). model_path
+# below MUST point at the Stage-1 hf_ckpt.
 #
-# Before launching: set model.{config,model,tokenizer}_path below to the Stage-1 hf_ckpt
-# (e.g. ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt).
+# WHAT'S NEW vs the old depth-1 stage 2 (see T3D_STAGE2_DESIGN.md):
+#   * J commit ROUNDS per Path-B block (t3_rollout_passes), not a single commit -> trains the talk's
+#     own-commit TRAJECTORY at DEPTH (the iterative advantage val can't see, the writeup's core point).
+#   * After each round the FROZEN think is REFRESHED on the talk's committed state (t3_think_refresh):
+#     it supplies the next round's fresh top-K AND the KL teacher = think ONE talk-commit ahead (the
+#     on-policy twin of stage-1's think_{s+2}). Distilling the refresh into the talk is what lets
+#     inference keep think_every large (the H1 compute win) and breaks the frozen-iter-0 top-1 ceiling.
+#   * Loss per pass = CE(gold) + gamma*forward-KL(think_fresh||talk) (t3_stage2_kl_gamma); gold leads,
+#     KL is the dope. Averaged over the J passes, backward per pass (1x memory, identical grads).
+#
+# J SWEEP: t3_rollout_passes starts at 2 (X_1 teacher-forced start + X_2 own-commit). Re-run with
+# 3 / 4 / 5 to sweep depth (separate controlled runs). think cost = (J+1) 16B fwds on Path B.
 #
 # Launch:  PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
 #          sh train.sh tasks/train_t3_topk_talk.py configs/sft/t3_topk_talk_stage2_onpolicy.yaml
@@ -26,8 +35,8 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75            # mask-ratio curriculum (75% -> 100%)
-  noise_range_high: 1.0
+  noise_range_low: 0.75            # mask-ratio curriculum (reveal 25% -> 0%); stage 2 starts harder
+  noise_range_high: 1.0            #   than stage 1 (the talk is already cold-started).
   num_workers: 16
 
 train:
@@ -35,20 +44,42 @@ train:
 
   think_path: ../DMax-Math-16B-moe-merge
   t3_top_k: 10
-  t3_train_layers: "5,6,7,8,9"          # same capacity scope as Stage 1
+  t3_train_layers: "5,6,7,8,9"          # same capacity scope as Stage 1 (back half)
   t3_mask_token_id: 156895
+
+  # ---- Stage-2 on-policy MULTI-PASS rollout (the core of this stage) ----
   t3_rollout_commit_frac: 1.0           # ROLLOUT ON (gate); commit SELECTION = confidence-prefix below
   t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
-  t3_curriculum_step: 0.5               # CURRICULUM linear ramp step (no explicit reveals list here).
-                                        # ADVANCE gate: both paths >= teacher_frac of teacher acc, OR
-                                        # plateau (no new best CE in either path for plateau_vals).
-  t3_keep_mask_residual: true           # Stage 2 mimics inference EXACTLY: Path B input = top-K +
-                                        # mask-residual + renorm (the decode-time blend). Commits and
-                                        # trained input now match inference. (Stage 1 stays false.)
+  t3_rollout_passes: 2                  # J commit rounds per Path-B block: START depth (J>=2)
+  t3_rollout_passes_max: 5              # ANNEAL J 2->3->4->5 (depth curriculum): +1 per advance AFTER the
+                                        #   reveal schedule hits full mask, on a ce_roll plateau. 0 = fixed J.
+                                        #   Requires single-rank (world_size==1; per-pass backward count).
+  t3_think_refresh: true                # refresh think on the talk's commits each round -> fresh top-K
+                                        #   + the KL teacher (think one talk-commit ahead). think fwds=J+1.
+  t3_stage2_kl_gamma: 0.3               # CE(gold) + gamma*forward-KL(think_fresh||talk) per pass. Modest
+                                        #   so gold wins stuck-wrong forking positions (set 0 = gold-only
+                                        #   depth rollout, an A/B). Requires t3_think_refresh.
+  t3_stage2_kl_temp: 1.0
+  t3_keep_mask_residual: true           # Stage 2 mimics inference EXACTLY: top-K + mask-residual + renorm
+                                        #   = the decode-time blend (commits + trained input both match).
 
-  t3_val_every: 200                     # watch val/ce_roll vs val/ce_tf — the gap is the exposure bias
-  t3_val_size: 64
-  t3_keep_best_n: 2        # keep latest 2 (keep-latest retention); set 1 if storage is tight
+  # ---- mask-ratio curriculum (reveal-halving, Path-B-gated) — same machinery as Stage 1 ----
+  t3_curriculum_reveals: "0.25,0.125,0.0"   # reveal 25% -> 12.5% -> 0% (full mask = inference block-start);
+                                            #   first entry = 1 - noise_range_low (0.25).
+  t3_curriculum_teacher_frac: 0.95      # (A) advance when Path B reaches 95% of acc_think2 (clean-ctx tf)
+  t3_curriculum_plateau_vals: 5         # (B) early-stop patience on ce_tf plateau (the gate's stable signal;
+  t3_curriculum_plateau_tol: 0.002      #     watch ce_roll/acc_roll separately for the real own-commit verdict)
+
+  # ---- Path A (mask path) regularizer — KD + entropy weighting, as in Stage 1 ----
+  t3_distill_beta: 1.0                  # KL(think_{s+1}||talk) on the mask path (cold-start alignment)
+  t3_distill_alpha: 1.0
+  t3_distill_temp: 1.0
+  t3_patha_entropy_lambda: 1.0          # Path A: up-weight uncertain/forking positions
+  t3_pathb_recover_lambda: 0.0          # IGNORED by the stage-2 multi-pass rollout (Stage-1 Path B only)
+
+  t3_val_every: 200                     # watch val/acc_roll, val/overlap_ratio (rising), val/entropy_gap
+  t3_val_size: 64                       #   (narrowing), val/beat_roll — the OPD-health go/no-go signals
+  t3_keep_best_n: 2
 
   data_parallel_mode: ddp
   tensor_parallel_size: 1
@@ -57,7 +88,9 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 2
-  max_steps: 4000
+  max_steps: 8000                       # room for the full curriculum: reveal (2 advances) THEN J 2->5
+                                        #   (3 advances), each needs >= plateau_vals*val_every to stabilize.
+                                        #   Interrupt early if acc_roll/overlap plateau before J reaches 5.
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
@@ -74,7 +107,9 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
 
-  # Memory note: Stage 2 does an extra (no-grad) rollout forward per flag=True batch (~1.5x talk compute).
+  # Memory: J grad talk forwards (backward'd + freed PER pass -> ~1x talk graph) + (J+1) no-grad 16B
+  # think forwards on Path B. At J=5 the think forwards dominate wall-clock; drop t3_think_refresh or
+  # J if compute-bound. enable_gradient_checkpointing keeps the per-pass talk graph cheap.
   enable_mixed_precision: false
   enable_gradient_checkpointing: true
   enable_full_shard: false
