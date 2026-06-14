@@ -67,12 +67,12 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
 @torch.no_grad()
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
-                     think_every=10**9):
-    """think_every = THINK cadence within a block: refresh think's top-K every N talk
-    iterations (it=0 always). N=10^9 (default) -> think once per block, then talk·N (cheap,
-    but top-K is stale). N=1 -> think+talk ALTERNATING: a FRESH think pass before every
-    talk forward (no contiguous talk passes) — the diagnostic 'is the stale top-K the
-    problem?' level (expensive: think every iter ~ DMax cost)."""
+                     seed_passes=1):
+    """Stage-2 inference dynamic (matches training): per block, think SEEDS the first
+    `seed_passes` talk passes (think's top-K candidates); thereafter the talk iterates on its
+    OWN previous-pass top-K (think is gone -> the H1 think-once-or-twice compute win). Commit =
+    the talk's confident left-to-right prefix (DMax rule). seed_passes=1 -> think once/block;
+    2 -> twice. think_fwd = seed_passes-per-block (the cheap cost); talk_fwd = passes/block."""
     P = prompt_ids.shape[1]
     L = ((P + gen_length + block_length - 1) // block_length) * block_length
     x = torch.full((1, L), mask_id, dtype=torch.long, device=device)
@@ -81,29 +81,32 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
     pos = torch.arange(L, device=device).unsqueeze(0)
     first_b, num_b = P // block_length, L // block_length
     think_fwd = talk_fwd = 0
+    sp = max(1, seed_passes)
 
     for b in range(first_b, num_b):
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
-        think_soft = None
+        prev_talk = None                                       # the talk's own previous block logits
         for it in range(max_iters):
             block_x = x[:, bs:be]
             mask_index = (block_x == mask_id)
             if not bool(mask_index.any()):
                 break
-            # (re)compute think's top-K every think_every iters on the CURRENT (partly committed)
-            # block, so its candidates reflect the latest commits (fresh, not stale).
-            if it % think_every == 0:
+            if it < sp:                                        # THINK SEED: think's top-K on the current block
                 think_logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
                                      position_ids=p, use_cache=False, return_dict=True).logits
                 think_fwd += 1
-                think_soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, mask_id,
-                                                    top_k=top_k, keep_mask_residual=keep_mask_residual)
+                soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, mask_id,
+                                              top_k=top_k, keep_mask_residual=keep_mask_residual)
+            else:                                              # TALK's OWN previous top-K (think gone)
+                soft = build_topk_soft_embeds(prev_talk, emb, mask_id,
+                                              top_k=top_k, keep_mask_residual=keep_mask_residual)
             inp = emb(x[:, :be]).clone()                       # committed -> token embed
-            inp[:, bs:be][mask_index] = think_soft[mask_index].to(inp.dtype)   # masked -> think top-K
+            inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)        # masked -> candidates
             talk_logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
                                use_cache=False, return_dict=True).logits[:, bs:be]
             talk_fwd += 1
+            prev_talk = talk_logits                            # feed the talk's own top-K forward
             x0, high_conf, _, breakflag = dmax_commit_uniform(talk_logits, mask_index, mask_index, threshold)
             x[:, bs:be] = torch.where(high_conf, x0, block_x)
             if breakflag:
@@ -154,12 +157,10 @@ def main():
     ap.add_argument("--no_mask_residual", action="store_true",
                     help="Feed the talk no-mask top-K (matches training keep_mask_residual=False). "
                          "Try this first — the mask-residual default is off-distribution for the talk.")
-    ap.add_argument("--think_every", type=int, default=10**9,
-                    help="THINK cadence within a block. Default (huge) = think ONCE/block + talk-many "
-                         "(L2: cheap, stale top-K, the compute-saving target mode). 1 = think+talk "
-                         "ALTERNATING, a fresh think every talk forward (L1 diagnostic: does fresh top-K "
-                         "recover accuracy? ~DMax cost). Sweep 2/3/5 between them for the H1 sweet spot. "
-                         "(Was wrongly defaulting to 2, contradicting this help.)")
+    ap.add_argument("--seed_passes", type=int, default=1,
+                    help="Stage-2 dynamic: think SEEDS the first N talk passes per block (think's top-K); "
+                         "thereafter the talk iterates on its OWN previous top-K (think gone). 1 = think "
+                         "once/block (the H1 target), 2 = twice. think cost = N forwards/block.")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -189,7 +190,7 @@ def main():
                                         threshold=args.threshold, top_k=args.top_k,
                                         max_iters=args.max_iters, device=args.device, dtype=dtype,
                                         keep_mask_residual=not args.no_mask_residual,
-                                        think_every=args.think_every)
+                                        seed_passes=args.seed_passes)
         text = tok.decode(resp[0], skip_special_tokens=True)
         gold, pred = gold_answer(row["answer"]), pred_answer(text)
         ok = is_correct(pred, gold)

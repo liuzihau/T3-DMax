@@ -117,29 +117,39 @@ def build_talk_inputs_embeds(
 def think_distill_loss(talk_logits: torch.Tensor, think_logits: torch.Tensor,
                        labels: torch.Tensor, *, temperature: float = 1.0,
                        weight: "torch.Tensor | None" = None,
-                       ignore_index: int = -100, eps: float = 1e-8) -> torch.Tensor:
-    """Path-A think->talk distillation: pull the talk's distribution toward the FROZEN
-    think's distribution at the predict positions (labels != ignore_index, i.e. the still-
-    masked ~75%). Token-decomposed FORWARD KL  D_KL(think || talk)  (== soft cross-entropy
-    up to think's entropy, same gradient) -> MASS-COVERING: the talk is pulled to cover
-    think's full top-K, not just its top-1. That is the right signal for the Stage-1 cold
-    start (reverse KL would be mode-seeking -> collapse onto think's top-1 = the ceiling).
+                       ignore_index: int = -100, eps: float = 1e-8,
+                       reverse: bool = False, kl_top_k: int = -1) -> torch.Tensor:
+    """think<->talk distillation at the predict positions (labels != ignore_index). Two directions:
 
-    `temperature` softens both sides (classic distillation T); the loss is scaled by T^2 to
-    keep the gradient magnitude comparable to the gold CE term. `weight` (optional [B,L])
-    gives a per-position weight (e.g. entropy weight) -> WEIGHTED mean over predict positions
-    (else plain mean). Returns a scalar (0 at a perfect match). Computed in fp32; think_logits
-    and weight must be aligned to talk_logits' positions (no shift)."""
+    * `reverse=False` (default): FORWARD KL  D_KL(think || talk)  (== soft cross-entropy up to
+      think's entropy). MASS-COVERING: pulls the talk to cover think's full top-K, not just its
+      top-1. The right signal for the STAGE-1 cold start.
+    * `reverse=True`: REVERSE KL  D_KL(talk || think). MODE-SEEKING: pulls the talk onto think's
+      high-probability mode. This is the STAGE-2 on-policy OPD objective (THUNLP 2604) -- combined
+      with gold CE the split is clean: reverse-KL -> parity (H1), gold CE -> beat-think (H2).
+
+    `kl_top_k>0` restricts the divergence to think's TOP-K candidate support (gather think's top-k
+    ids, renormalize BOTH sides over that set via log_softmax) -- 2604 shows overlap/top-k KL ~=
+    full-vocab at far lower cost; `-1` = full vocab. `temperature` softens both sides (loss x T^2).
+    `weight` (optional [B,L]) -> weighted mean over predict positions. Returns a scalar (0 at a
+    perfect match). fp32; think_logits and weight must be aligned to talk_logits (no shift)."""
     predict = (labels != ignore_index)                        # [B, L] bool
     if not bool(predict.any()):
         return talk_logits.sum() * 0.0                        # keep graph, zero contribution
     T = float(temperature)
     th = (think_logits[predict].float() / T)                  # [N, V]
     tl = (talk_logits[predict].float() / T)                   # [N, V]
-    teacher = F.softmax(th, dim=-1)                           # think's soft target
-    student_logp = F.log_softmax(tl, dim=-1)
+    if kl_top_k and kl_top_k > 0 and kl_top_k < th.shape[-1]:
+        _idx = th.topk(kl_top_k, dim=-1).indices              # think's top-k candidate support
+        th = th.gather(-1, _idx); tl = tl.gather(-1, _idx)    # restrict both to that set
     teacher_logp = F.log_softmax(th, dim=-1)
-    kl = (teacher * (teacher_logp - student_logp)).sum(-1)    # [N] forward KL per position
+    student_logp = F.log_softmax(tl, dim=-1)
+    if reverse:                                               # D(talk || think): mode-seeking
+        student = student_logp.exp()
+        kl = (student * (student_logp - teacher_logp)).sum(-1)
+    else:                                                     # D(think || talk): mass-covering
+        teacher = teacher_logp.exp()
+        kl = (teacher * (teacher_logp - student_logp)).sum(-1)
     if weight is None:
         return kl.mean() * (T * T)
     w = weight[predict].float()                               # [N]
@@ -271,6 +281,14 @@ def _selftest():
     # KL(think||think) == 0 (perfect match), and temperature scaling stays finite
     assert think_distill_loss(think_l, think_l, dl_labels).abs() < 1e-5
     assert torch.isfinite(think_distill_loss(talk_logits, think_l, dl_labels, temperature=2.0))
+    # REVERSE KL D(talk||think): finite, >0, and 0 at a perfect match (both directions vanish)
+    rk = think_distill_loss(talk_logits, think_l, dl_labels, reverse=True)
+    assert torch.isfinite(rk) and rk > 0
+    assert think_distill_loss(think_l, think_l, dl_labels, reverse=True).abs() < 1e-5
+    # kl_top_k truncation: finite, >0, and == full when kl_top_k >= V (no truncation)
+    assert torch.isfinite(think_distill_loss(talk_logits, think_l, dl_labels, reverse=True, kl_top_k=10))
+    assert torch.allclose(think_distill_loss(talk_logits, think_l, dl_labels, kl_top_k=V + 5),
+                          think_distill_loss(talk_logits, think_l, dl_labels), atol=1e-5)
     # no predict positions -> exact 0 (graph-preserving), not nan
     z = think_distill_loss(talk_logits, think_l, torch.full_like(dl_labels, -100))
     assert float(z) == 0.0
