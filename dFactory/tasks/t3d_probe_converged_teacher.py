@@ -73,6 +73,39 @@ def think_converge(think, emb, x, bs, be, m, p, threshold, max_iters):
 
 
 @torch.no_grad()
+def mixed_converge(think, talk, emb, x, bs, be, m, p, threshold, top_k, kmr, max_iters, schedule):
+    """Decode block [bs:be] UNTIL CONVERGED with a MIXED think/talk schedule: schedule(i) -> 'think'|'talk'
+    for iteration i. A think step runs think on the committed state (bare [MASK] at undecided). A talk step
+    runs the talk fed the top-K soft-embed of the PREVIOUS pass's logits (think's if the prev step was think,
+    the talk's own otherwise -- the inference dynamic). Commits the confident prefix each step. Mutates
+    x[:, bs:be]. Returns (final_logits[block], ids[block], n_think, n_talk)."""
+    cand = None
+    nth = ntk = 0
+    while bool((x[:, bs:be] == MASK_ID).any()) and (nth + ntk) < max_iters:
+        block = x[:, bs:be]
+        mask_index = block == MASK_ID
+        if schedule(nth + ntk) == "think":
+            logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+                           use_cache=False, return_dict=True).logits
+            nth += 1
+        else:
+            src = cand if cand is not None else think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
+                                                      position_ids=p, use_cache=False, return_dict=True).logits
+            soft = build_topk_soft_embeds(src[:, bs:be], emb, MASK_ID, top_k=top_k, keep_mask_residual=kmr)
+            inp = emb(x[:, :be]).clone()
+            inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)
+            logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
+                          use_cache=False, return_dict=True).logits
+            ntk += 1
+        cand = logits
+        x0, high_conf, _, _ = dmax_commit_uniform(logits[:, bs:be], mask_index, mask_index, threshold)
+        x[:, bs:be] = torch.where(high_conf, x0, block)
+    final = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+                  use_cache=False, return_dict=True).logits[:, bs:be]
+    return final, x[:, bs:be].clone(), nth, ntk
+
+
+@torch.no_grad()
 def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     """Analyse one block [bs:be] of x (preceding blocks already committed). Prints the 5 strategies
     split into commit/still regions + a per-position table. Returns base_think's committed ids [1,B]
@@ -140,6 +173,26 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     base_still = masked & (base_ids == MASK_ID)
     base_fwd = base_iters                                  # all think (the converge loop)
 
+    # ---- method C: think + think + talk... UNTIL CONVERGED (2 think seeds, then talk) ----
+    xc = x.clone()
+    _sync(); _t = time.time()
+    c_logits, c_ids, c_nth, c_ntk = mixed_converge(
+        think, talk, emb, xc, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
+        args.max_iters, lambda i: "think" if i < 2 else "talk")
+    _sync(); t_c = time.time() - _t
+    ac, cc = _conf(c_logits)
+    c_commit = masked & (c_ids != MASK_ID); c_still = masked & (c_ids == MASK_ID)
+
+    # ---- method D: think + talk + think + talk + ... UNTIL CONVERGED (strictly alternating) ----
+    xd = x.clone()
+    _sync(); _t = time.time()
+    d_logits, d_ids, d_nth, d_ntk = mixed_converge(
+        think, talk, emb, xd, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
+        args.max_iters, lambda i: "think" if i % 2 == 0 else "talk")
+    _sync(); t_d = time.time() - _t
+    ad, cd = _conf(d_logits)
+    d_commit = masked & (d_ids != MASK_ID); d_still = masked & (d_ids == MASK_ID)
+
     # ---- print: each strategy split into commit | still-mask region ----
     print("-" * 118)
     print(f"  ({tag}) block {bs}:{be}  masked={int(masked.sum())}")
@@ -155,6 +208,12 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     print(f"  base_think  CONVERGED: COMMIT[{int((masked & (base_ids != MASK_ID)).sum())}] STILL[{int(base_still.sum())}]  "
           f"FWD = {base_fwd} think | wall = {1e3 * t_base:.0f} ms")
     print(f"      committed: {dtxt(base_ids[0], masked[0])!r}")
+    print(f"  think+think+talk... CONVERGED: COMMIT[{int(c_commit.sum())}] STILL[{int(c_still.sum())}]  "
+          f"FWD = {c_nth} think + {c_ntk} talk = {c_nth + c_ntk} total | wall = {1e3 * t_c:.0f} ms")
+    print(f"      committed: {dtxt(c_ids[0], c_commit[0])!r}")
+    print(f"  think+talk+think+talk... CONVERGED: COMMIT[{int(d_commit.sum())}] STILL[{int(d_still.sum())}]  "
+          f"FWD = {d_nth} think + {d_ntk} talk = {d_nth + d_ntk} total | wall = {1e3 * t_d:.0f} ms")
+    print(f"      committed: {dtxt(d_ids[0], d_commit[0])!r}")
 
     # ---- per-position table over the masked block ----
     def cell(a, c, j, cm=None, w=12):
@@ -175,9 +234,14 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
             agg[name][1] += int(reg.sum())
     agg["ttk_vs_base"][0] += int((atk[0][masked[0]] == ab[0][masked[0]]).sum())
     agg["ttk_vs_base"][1] += int(masked.sum())
-    for key, val in (("ttk_fwd", ttk_fwd), ("ttk_wall", ttk_wall), ("base_fwd", base_fwd), ("base_wall", t_base)):
+    for key, val in (("ttk_fwd", ttk_fwd), ("ttk_wall", ttk_wall), ("base_fwd", base_fwd), ("base_wall", t_base),
+                     ("c_fwd", c_nth + c_ntk), ("c_wall", t_c), ("d_fwd", d_nth + d_ntk), ("d_wall", t_d)):
         agg[key][0] += val
         agg[key][1] += 1
+    agg["c_vs_base"][0] += int((ac[0][masked[0]] == ab[0][masked[0]]).sum())
+    agg["c_vs_base"][1] += int(masked.sum())
+    agg["d_vs_base"][0] += int((ad[0][masked[0]] == ab[0][masked[0]]).sum())
+    agg["d_vs_base"][1] += int(masked.sum())
     cr, sr = cm1[0], sm1[0]
     ac = (aT[0][cr] == a2[0][cr]).float().mean().item() if int(cr.sum()) else float("nan")
     as_ = (aT[0][sr] == a2[0][sr]).float().mean().item() if int(sr.sum()) else float("nan")
@@ -213,7 +277,9 @@ def main():
     B = args.block_length
 
     agg = {"commit": [0, 0], "still": [0, 0], "ttk_vs_base": [0, 0],
-           "ttk_fwd": [0, 0], "ttk_wall": [0, 0], "base_fwd": [0, 0], "base_wall": [0, 0]}
+           "ttk_fwd": [0, 0], "ttk_wall": [0, 0], "base_fwd": [0, 0], "base_wall": [0, 0],
+           "c_fwd": [0, 0], "c_wall": [0, 0], "c_vs_base": [0, 0],
+           "d_fwd": [0, 0], "d_wall": [0, 0], "d_vs_base": [0, 0]}
     rows = list(load_dataset("gsm8k", "main", split="test"))[:args.limit]
     for i, row in enumerate(rows):
         messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
@@ -248,13 +314,20 @@ def main():
     print(f"[TOTAL] talk_think_converged vs base_think (does think recover the talk's commit?): "
           f"{agg['ttk_vs_base'][0]}/{agg['ttk_vs_base'][1]} = {agg['ttk_vs_base'][0]/max(1,agg['ttk_vs_base'][1]):.3f}")
     nb = max(1, agg["base_fwd"][1])
-    print(f"[TOTAL] avg FORWARDS/block:  talk_think = {agg['ttk_fwd'][0]/nb:.1f}  (1 think + 1 talk + trailing think)"
-          f"   vs   base_think = {agg['base_fwd'][0]/nb:.1f} think")
-    print(f"[TOTAL] avg WALL/block:      talk_think = {1e3*agg['ttk_wall'][0]/nb:.0f} ms   vs   "
-          f"base_think = {1e3*agg['base_wall'][0]/nb:.0f} ms")
-    print("Read: high COMMIT / low STILL agreement => the lightweight 2nd forward leaps the easy tokens but "
-          "not the hard deferred tail; high talk_think-vs-base => think recovers the block from the talk's "
-          "commit. Compare FORWARDS/WALL: talk_think pays +1 talk seed but may converge in fewer think iters.")
+    print(f"[TOTAL] vs base_think agreement:  think+think+talk = {agg['c_vs_base'][0]/max(1,agg['c_vs_base'][1]):.3f}  "
+          f"think+talk+talk... (alt) = {agg['d_vs_base'][0]/max(1,agg['d_vs_base'][1]):.3f}")
+    print(f"[TOTAL] avg FORWARDS/block (think+talk):")
+    print(f"          base_think           = {agg['base_fwd'][0]/nb:.1f}")
+    print(f"          talk_think_converged = {agg['ttk_fwd'][0]/nb:.1f}")
+    print(f"          think+think+talk...  = {agg['c_fwd'][0]/nb:.1f}")
+    print(f"          think+talk+think...  = {agg['d_fwd'][0]/nb:.1f}")
+    print(f"[TOTAL] avg WALL/block:  base_think = {1e3*agg['base_wall'][0]/nb:.0f} ms   "
+          f"talk_think = {1e3*agg['ttk_wall'][0]/nb:.0f} ms   "
+          f"think+think+talk = {1e3*agg['c_wall'][0]/nb:.0f} ms   "
+          f"think+talk+talk(alt) = {1e3*agg['d_wall'][0]/nb:.0f} ms")
+    print("Read: a mixed method WINS if it matches base_think's answer (high vs-base agreement) at LOWER wall "
+          "than base_think. Talk forwards are ~half a think's FLOPs, so wall is the honest cost; if a method "
+          "needs more total forwards but more of them are cheap talk passes, it can still be faster.")
 
 
 if __name__ == "__main__":
