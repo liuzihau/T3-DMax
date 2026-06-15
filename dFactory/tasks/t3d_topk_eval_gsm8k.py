@@ -197,6 +197,10 @@ def main():
         n_ok += ok; tot_think += th; tot_talk += tk
         if args.debug_print or (i < 3):
             print(f"[{i}] {'OK ' if ok else 'XX '} pred={pred} gold={gold} think={th} talk={tk} tail={text[-120:]!r}")
+        if args.debug_print:                                   # FULL generation (not just the tail)
+            print(f"  ---- [{i}] question ----\n{row['question']}")
+            print(f"  ---- [{i}] FULL generated ({len(text)} chars) ----\n{text}")
+            print(f"  ---- [{i}] end (pred={pred} gold={gold}) ----")
         if (i + 1) % 25 == 0:
             print(f"  …{i+1}/{len(rows)}  acc={n_ok/(i+1):.3f}")
 
