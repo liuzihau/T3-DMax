@@ -74,6 +74,10 @@ def main():
     ap.add_argument("--top_k", type=int, default=10)
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--k_iters", type=int, default=4, help="trailing think iterations for talk_think_k")
+    ap.add_argument("--gen_block", type=int, default=1,
+                    help="which GENERATION block to probe. 0 = the first block (mostly PROMPT -> few masked "
+                         "positions). >=1 = a FULLY-masked block (all 32 = response), conditioned on the "
+                         "earlier blocks decoded by think first. Use 1 to see the still-mask filler tail.")
     ap.add_argument("--limit", type=int, default=5)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no_mask_residual", action="store_true", help="match a talk trained with keep_mask_residual=false")
@@ -100,14 +104,21 @@ def main():
         prompt_ids = tok.apply_chat_template(messages, add_generation_prompt=True,
                                              tokenize=True, return_tensors="pt").to(args.device)
         P = prompt_ids.shape[1]
-        bs = (P // B) * B
-        be = bs + B
+        first_b = P // B                                        # block containing the prompt's end
+        target_b = first_b + args.gen_block                     # the block we probe
+        bs, be = target_b * B, (target_b + 1) * B
         L = be
         x = torch.full((1, L), MASK_ID, dtype=torch.long, device=args.device)
         x[:, :P] = prompt_ids
         attn = build_block_causal_mask(L, B, dtype, args.device)
-        m, p = attn[:, :, :be, :be], torch.arange(L, device=args.device).unsqueeze(0)[:, :be]
-        masked = (x[:, bs:be] == MASK_ID)                       # [1, B] originally-masked positions
+        pos = torch.arange(L, device=args.device).unsqueeze(0)
+        # decode the PRECEDING blocks with think (realistic committed context) so the probed block is fresh
+        for b in range(first_b, target_b):
+            b_end = (b + 1) * B
+            think_k_iters(think, emb, x, b * B, b_end, attn[:, :, :b_end, :b_end], pos[:, :b_end],
+                          args.threshold, args.k_iters + 6)
+        m, p = attn[:, :, :be, :be], pos[:, :be]
+        masked = (x[:, bs:be] == MASK_ID)                       # [1, B] masked positions in the probed block
 
         # ---- think_1 (one pass) + its commit region ----
         th1 = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
