@@ -31,6 +31,7 @@ Run (on the GPU box):
 from __future__ import annotations
 
 import argparse
+import time
 import torch
 
 from tasks.t3d_topk_talk import load_causal_lm, confident_prefix_commit
@@ -38,6 +39,11 @@ from tasks.t3d_topk_soft_embed import build_topk_soft_embeds
 from tasks.t3d_topk_eval_gsm8k import build_block_causal_mask, dmax_commit_uniform, GSM8K_USER_TEMPLATE
 
 MASK_ID = 156895
+
+
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def _conf(logits):
@@ -80,9 +86,11 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
         sel = ids_row[region_row]
         return tok.decode(sel, skip_special_tokens=False) if sel.numel() else "(empty)"
 
-    # ---- think_1 (one pass) ----
+    # ---- think_1 (one pass) ----  [timed: the seed forward of the talk_think method]
+    _sync(); _t = time.time()
     th1 = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
                 use_cache=False, return_dict=True).logits[:, bs:be]
+    _sync(); t_think1 = time.time() - _t
     a1, c1 = _conf(th1)
     am1, cm1 = confident_prefix_commit(th1, masked, B, args.threshold)
     sm1 = masked & (~cm1)
@@ -92,8 +100,10 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
                                   keep_mask_residual=not args.no_mask_residual)
     inp = emb(x[:, :be]).clone()
     inp[:, bs:be][masked] = soft[masked].to(inp.dtype)
+    _sync(); _t = time.time()
     ta1 = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
                use_cache=False, return_dict=True).logits[:, bs:be]
+    _sync(); t_talk1 = time.time() - _t
     aT, cT = _conf(ta1)
     amT, cmT = confident_prefix_commit(ta1, masked, B, args.threshold)
     smT = masked & (~cmT)
@@ -111,16 +121,24 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     # ---- talk_think_converged = think_1 -> talk_1 -> commit talk_1's prefix -> think until converged ----
     xt = x.clone()
     xt[:, bs:be] = torch.where(cmT, amT, xt[:, bs:be])
+    _sync(); _t = time.time()
     ttk_logits, ttk_ids, ttk_iters = think_converge(think, emb, xt, bs, be, m, p, args.threshold, args.max_iters)
+    _sync(); t_ttk = time.time() - _t
     atk, ctk = _conf(ttk_logits)
     ttk_commit = masked & (ttk_ids != MASK_ID)
     ttk_still = masked & (ttk_ids == MASK_ID)
+    # ALL forwards of the talk_think method: 1 think (seed) + 1 talk + ttk_iters think (the converge loop)
+    ttk_fwd = 1 + 1 + ttk_iters
+    ttk_wall = t_think1 + t_talk1 + t_ttk
 
     # ---- base_think = pure think decoded UNTIL CONVERGED (no talk) ----
     xb = x.clone()
+    _sync(); _t = time.time()
     base_logits, base_ids, base_iters = think_converge(think, emb, xb, bs, be, m, p, args.threshold, args.max_iters)
+    _sync(); t_base = time.time() - _t
     ab, cb = _conf(base_logits)
     base_still = masked & (base_ids == MASK_ID)
+    base_fwd = base_iters                                  # all think (the converge loop)
 
     # ---- print: each strategy split into commit | still-mask region ----
     print("-" * 118)
@@ -131,11 +149,12 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     print(f"  talk_1    STILL [{int(smT.sum())}]: {dtxt(aT[0],  smT[0])!r}")
     print(f"  think_2   COMMITS +{int(cm2.sum())}: {dtxt(am2[0], cm2[0])!r}   (think_1 left {int(sm1.sum())} masked)")
     print(f"  think_2   STILL [{int(sm2.sum())}]: {dtxt(a2[0], sm2[0])!r}")
-    print(f"  talk_think_converged ({ttk_iters} iters)  COMMIT[{int(ttk_commit.sum())}]: {dtxt(ttk_ids[0], ttk_commit[0])!r}")
-    print(f"  talk_think_converged  STILL [{int(ttk_still.sum())}]: {dtxt(atk[0], ttk_still[0])!r}")
-    print(f"  base_think  CONVERGED ({base_iters} iters)  COMMIT[{int((masked & (base_ids != MASK_ID)).sum())}]: {dtxt(base_ids[0], masked[0])!r}")
-    if int(base_still.sum()):
-        print(f"  base_think  STILL [{int(base_still.sum())}]: {dtxt(ab[0], base_still[0])!r}")
+    print(f"  talk_think_converged: COMMIT[{int(ttk_commit.sum())}] STILL[{int(ttk_still.sum())}]  "
+          f"FWD = 1 think + 1 talk + {ttk_iters} think = {ttk_fwd} total | wall = {1e3 * ttk_wall:.0f} ms")
+    print(f"      committed: {dtxt(ttk_ids[0], ttk_commit[0])!r}")
+    print(f"  base_think  CONVERGED: COMMIT[{int((masked & (base_ids != MASK_ID)).sum())}] STILL[{int(base_still.sum())}]  "
+          f"FWD = {base_fwd} think | wall = {1e3 * t_base:.0f} ms")
+    print(f"      committed: {dtxt(base_ids[0], masked[0])!r}")
 
     # ---- per-position table over the masked block ----
     def cell(a, c, j, cm=None, w=12):
@@ -156,6 +175,9 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
             agg[name][1] += int(reg.sum())
     agg["ttk_vs_base"][0] += int((atk[0][masked[0]] == ab[0][masked[0]]).sum())
     agg["ttk_vs_base"][1] += int(masked.sum())
+    for key, val in (("ttk_fwd", ttk_fwd), ("ttk_wall", ttk_wall), ("base_fwd", base_fwd), ("base_wall", t_base)):
+        agg[key][0] += val
+        agg[key][1] += 1
     cr, sr = cm1[0], sm1[0]
     ac = (aT[0][cr] == a2[0][cr]).float().mean().item() if int(cr.sum()) else float("nan")
     as_ = (aT[0][sr] == a2[0][sr]).float().mean().item() if int(sr.sum()) else float("nan")
@@ -190,7 +212,8 @@ def main():
     emb = think.get_input_embeddings()
     B = args.block_length
 
-    agg = {"commit": [0, 0], "still": [0, 0], "ttk_vs_base": [0, 0]}
+    agg = {"commit": [0, 0], "still": [0, 0], "ttk_vs_base": [0, 0],
+           "ttk_fwd": [0, 0], "ttk_wall": [0, 0], "base_fwd": [0, 0], "base_wall": [0, 0]}
     rows = list(load_dataset("gsm8k", "main", split="test"))[:args.limit]
     for i, row in enumerate(rows):
         messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
@@ -224,8 +247,14 @@ def main():
     print(f"[TOTAL] talk_1 vs think_2  [still ]: {agg['still'][0]}/{agg['still'][1]} = {agg['still'][0]/max(1,agg['still'][1]):.3f}")
     print(f"[TOTAL] talk_think_converged vs base_think (does think recover the talk's commit?): "
           f"{agg['ttk_vs_base'][0]}/{agg['ttk_vs_base'][1]} = {agg['ttk_vs_base'][0]/max(1,agg['ttk_vs_base'][1]):.3f}")
+    nb = max(1, agg["base_fwd"][1])
+    print(f"[TOTAL] avg FORWARDS/block:  talk_think = {agg['ttk_fwd'][0]/nb:.1f}  (1 think + 1 talk + trailing think)"
+          f"   vs   base_think = {agg['base_fwd'][0]/nb:.1f} think")
+    print(f"[TOTAL] avg WALL/block:      talk_think = {1e3*agg['ttk_wall'][0]/nb:.0f} ms   vs   "
+          f"base_think = {1e3*agg['base_wall'][0]/nb:.0f} ms")
     print("Read: high COMMIT / low STILL agreement => the lightweight 2nd forward leaps the easy tokens but "
-          "not the hard deferred tail; high talk_think-vs-base => think recovers the block from the talk's commit.")
+          "not the hard deferred tail; high talk_think-vs-base => think recovers the block from the talk's "
+          "commit. Compare FORWARDS/WALL: talk_think pays +1 talk seed but may converge in fewer think iters.")
 
 
 if __name__ == "__main__":
