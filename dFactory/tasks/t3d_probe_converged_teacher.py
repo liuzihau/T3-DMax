@@ -144,6 +144,10 @@ def main():
         th2 = think(inputs_embeds=emb(x1[:, :be]), attention_mask=m, position_ids=p,
                     use_cache=False, return_dict=True).logits[:, bs:be]
         a2, c2 = _conf(th2)
+        # think_2's NEW commits: confident-prefix over the positions think_1 LEFT masked (= sm1)
+        mask2 = (x1[:, bs:be] == MASK_ID)                       # == sm1
+        am2, cm2 = confident_prefix_commit(th2, mask2, B, args.threshold)
+        sm2 = mask2 & (~cm2)
 
         # ---- talk_think_k = think_1 -> talk_1 -> commit talk_1's prefix (hard) -> think x k ----
         xt = x.clone()
@@ -158,8 +162,12 @@ def main():
         print(f"  think_1  STILL [{int(sm1.sum())}]: {dtxt(a1[0],  sm1[0])!r}")
         print(f"  talk_1   COMMIT[{int(cmT.sum())}]: {dtxt(amT[0], cmT[0])!r}")
         print(f"  talk_1   STILL [{int(smT.sum())}]: {dtxt(aT[0],  smT[0])!r}")
-        print(f"  think_2  (think+think) @still_1[{int(sm1.sum())}]: {dtxt(a2[0], sm1[0])!r}")
-        print(f"  talk_think_k (1think+1talk+{args.k_iters}think) committed block: {dtxt(ttk_ids[0], masked[0])!r}")
+        print(f"  think_2  COMMITS +{int(cm2.sum())} more: {dtxt(am2[0], cm2[0])!r}   (think_1 left {int(sm1.sum())} masked)")
+        print(f"  think_2  STILL [{int(sm2.sum())}]: {dtxt(a2[0], sm2[0])!r}")
+        ttk_commit = masked & (ttk_ids != MASK_ID)             # committed over the k think iters
+        ttk_still = masked & (ttk_ids == MASK_ID)              # still masked after k iters (usually ~0)
+        print(f"  talk_think_k (1think+1talk+{args.k_iters}think) COMMIT[{int(ttk_commit.sum())}]: {dtxt(ttk_ids[0], ttk_commit[0])!r}")
+        print(f"  talk_think_k STILL [{int(ttk_still.sum())}]: {dtxt(atk[0], ttk_still[0])!r}")
 
         # ---- per-position table over the originally-masked block ----
         print(f"  {'pos':>3} | {'think_1(conf)C/M':>20} | {'talk_1(conf)C/M':>20} | {'think_2(conf)':>16} | {'ttk(conf)':>16}")
@@ -171,7 +179,7 @@ def main():
                 flag = "" if cm is None else (" C" if bool(cm[0, jj]) else " M")
                 return f"{t:>12}({c[0, jj]:.2f}){flag}"
             print(f"  {bs+j:>3} | {cell(a1,c1,j,cm1):>20} | {cell(aT,cT,j,cmT):>20} | "
-                  f"{cell(a2,c2,j):>16} | {cell(atk,ctk,j):>16}")
+                  f"{cell(a2,c2,j,(cm1 | cm2)):>18} | {cell(atk,ctk,j):>16}")
 
         # ---- aggregate: talk_1 vs think_2 (the lightweight-2nd-forward reference), split by region ----
         for name, reg in (("commit", cm1[0]), ("still", sm1[0])):
