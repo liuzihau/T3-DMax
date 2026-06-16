@@ -1,9 +1,13 @@
-# T3-D top-K talk — STAGE 1: off-policy COLD START (teacher-forced).
+# T3-D top-K talk — STAGE 1: off-policy COLD START (think gate-reveal + pure gold CE).
 #
-# Per OPD analysis (THUNLP arXiv:2604.13016 §5.1): on-policy-from-scratch FAILS; you must
-# first SFT the student off-policy on teacher rollouts, THEN do on-policy from THAT ckpt.
-# Stage 1 = pure teacher-forced top-K (rollout OFF). Stage 2 (t3_topk_talk_stage2_onpolicy.yaml)
-# initialises from this checkpoint. See probe_runner/T3D_TOPK_TALK_METHOD.md §4.3.
+# REDESIGN (T3D_STAGE12_REDESIGN_PLAN.md): the reveal is no longer a random sigma-curriculum
+# gold reveal. Data is sigma=1.0 full-mask (noise_range 1.0/1.0); the trainer regenerates the
+# reveal by running THINK's PER-BLOCK contiguous decode-to-gate (inference-shaped, imperfect
+# commits) over the noisy half. Committed = think's argmax (HARD, revised toward gold by CE);
+# still-masked = bare [MASK] (Path A) / think top-K soft (Path B). Loss = PURE gold CE on the
+# WHOLE response (committed + still-masked). NO KL, NO distill, NO sigma-curriculum.
+# Gate: fixed t3_stage1_warmup_gate for the first t3_stage1_warmup_steps, then U(0, gate_max).
+# Stage 2 (t3_topk_talk_stage2_onpolicy.yaml) initialises from this checkpoint.
 #
 # Launch:  PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH \
 #          sh train.sh tasks/train_t3_topk_talk.py configs/sft/t3_topk_talk_stage1_coldstart.yaml
@@ -22,8 +26,8 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.5            # mask-ratio curriculum: start at 75% ...
-  noise_range_high: 1.0            # ... ramp to 100% (inference block-start condition) once learned
+  noise_range_low: 1.0            # sigma=1.0 FULL MASK — the reveal is regenerated in-trainer by
+  noise_range_high: 1.0           # think's per-block decode-to-gate (NOT a data-pipeline sigma curriculum)
   num_workers: 16
 
 train:
@@ -34,40 +38,18 @@ train:
   t3_train_layers: "5,6,7,8,9"          # CAPACITY: back half (~3.7B) — diagnostic showed 2 layers too weak.
                                         #   merged-only "6,8" (1.6B) ← here (5,6,7,8,9) ← all-10 "0,..,9" (7.4B, needs multi-GPU)
   t3_mask_token_id: 156895
-  t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> pure teacher-forced cold start
-  t3_commit_threshold: 0.3
-  t3_curriculum_step: 0.5               # (linear-ramp step; IGNORED when t3_curriculum_reveals is set below)
-  t3_curriculum_reveals: "0.5,0.25,0.125,0.0"   # reveal-HALVING schedule: 50% -> 25% -> 12.5% -> 0%
-                                                #   (sigma 0.5/0.75/0.875/1.0); first entry = 1 - noise_range_low.
-  # ADVANCE when EITHER: (A) PATH B reaches 95% of its teacher acc (acc_tf >= 0.95*acc_think2, s+2), OR
-  # (B) plateau = no new best ce_tf for 5 vals. Path A (mask) is a capacity-limited regularizer (can't
-  # reach 95% of the 16B think) -> it does NOT gate; logged only.
-  t3_curriculum_teacher_frac: 0.97      # (A) Path B acc_tf >= 95% of acc_think2
-  t3_curriculum_plateau_vals: 5         # (B) early-stop patience on ce_tf: 5 vals with no new best
-  t3_curriculum_plateau_tol: 0.002      #     'new best' must beat best by >0.2% (noise doesn't reset)
+  t3_rollout_commit_frac: 0.0           # ROLLOUT OFF -> Stage-1 (gate-reveal + gold CE). >0 = Stage 2.
+  t3_commit_threshold: 0.6              # think's per-block confident-prefix commit threshold (toy-validated quality)
 
-  # Path-A think->talk distillation (NEW): on the mask path, forward the frozen 16B think and
-  # add forward-KL(think||talk) at the predict positions, so think's dark knowledge (full top-K)
-  # trains the talk instead of one-hot gold alone. Mass-covering -> cold-start alignment to parity.
-  # alpha/beta/temp are PROVISIONAL (pending discussion); beta=0 reverts to legacy pure-gold-CE.
-  t3_distill_beta: 1.0                   # KL(think||talk) weight on Path A
-  t3_distill_alpha: 1.0                  # gold-CE weight on Path A (keep, so think's errors are corrected)
-  t3_distill_temp: 1.0                   # softmax temperature (2.0 = classic Hinton softening)
-
-  # Hard-position weighting (focus each path on the positions it's responsible for). 0 = off.
-  # Path A (mask, no top-K): up-weight by think's entropy -> learn the uncertain/forking positions
-  #   (where gold often isn't in top-K and the mask path is the only hope). weight = 1 + lambda*Hnorm.
-  # Path B (top-K): up-weight where think's top-1 is WRONG but gold IS in top-K -> "pick the right
-  #   candidate" (the recovery skill). weight = 1 + lambda on those positions, else 1.
-  t3_patha_entropy_lambda: 1.0           # Path A entropy weight (0=off; ~1-2)
-  t3_pathb_recover_lambda: 1.0           # Path B recoverable up-weight (0=off; ~1-2)
-
-  # Path-B think_{s+2} distillation (NEW; OFF by default = gold-pure Path B). Enable for the
-  # NEXT run to test it vs the gold-pure baseline. Hard-commits think's s+1 confident prefix
-  # (Portion 1, in the loss), advances think one DMax step to think_{s+2}, adds gamma*KL. Costs
-  # a 2nd 16B think forward on Path B. Keep gamma modest so gold wins the flip at stuck-forking.
-  # t3_pathb_kl_gamma: 0.3               # 0 = OFF (gold-pure). 0.3-0.5 = "dope" the gold CE.
-  # t3_pathb_kl_temp: 1.0
+  # --- Stage-1 think gate-reveal (replaces the old sigma-curriculum + distill/weighting) ---
+  # The trainer runs think's PER-BLOCK decode-to-gate: decode every block until its committed
+  # fraction (of originally-masked positions) >= gate, snapshotting each block at the iter it
+  # FIRST crosses the gate (its committed prefix + still-masked top-K). The talk then trains
+  # pure gold CE over the whole response from that revealed state.
+  t3_stage1_warmup_steps: 2000          # first N steps: FIXED gate (warm-up); after: U(0, gate_max)
+  t3_stage1_warmup_gate: 0.4            # the fixed warm-up gate
+  t3_stage1_gate_max: 0.6               # after warm-up: gate ~ U(0, this) per micro-batch
+  t3_converge_max_iters: 8              # cap on think's per-block decode iters (compute guard)
 
   t3_val_every: 200
   t3_val_size: 64

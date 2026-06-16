@@ -240,6 +240,97 @@ def build_think_next_teacher(think, think_emb, full_input_ids, think_s1_logits, 
     return logits[:, :L], argmax, commit_mask
 
 
+@torch.no_grad()
+def think_converge_response(think, think_emb, full_ids, noisy_len, mask_id, *, block_size, threshold,
+                            attention_mask=None, position_ids=None, max_iters=32):
+    """STAGE-2 teacher. Decode the NOISY half (response) to CONVERGENCE with the FROZEN think (DMax
+    decode_uniform: contiguous confident-prefix commit per block, threshold-gated), each noisy block
+    conditioned on the clean half via the block-diffusion mask. Operates on a CLONE -- think's commits
+    must NOT pollute the caller's rollout state. Returns think's CONVERGED logits over [:, :noisy_len]
+    (the clean per-position target distribution). The clean half is untouched.
+
+    `full_ids` = the current doubled sequence [noisy | clean] (noisy half = the talk's committed state +
+    [MASK] at still-undecided). Loops commits into the clone until no [MASK] in the noisy half (or
+    max_iters), then one final forward for the converged logits."""
+    L = noisy_len
+    x = full_ids.clone()
+    it = 0
+    while bool((x[:, :L] == mask_id).any()) and it < max_iters:
+        logits = think(inputs_embeds=_embed(think_emb, x), attention_mask=attention_mask,
+                       position_ids=position_ids, use_cache=False).logits
+        argmax, commit = confident_prefix_commit(logits[:, :L], x[:, :L] == mask_id, block_size, threshold)
+        x[:, :L] = torch.where(commit, argmax, x[:, :L])
+        it += 1
+    final = think(inputs_embeds=_embed(think_emb, x), attention_mask=attention_mask,
+                  position_ids=position_ids, use_cache=False).logits[:, :L]
+    return final
+
+
+@torch.no_grad()
+def think_decode_to_gate_per_block(think, think_emb, full_ids, noisy_len, mask_id, *, block_size,
+                                   threshold, gate, attention_mask=None, position_ids=None, max_iters=32):
+    """STAGE-1 reveal (per-block gate). Decode the NOISY half with think (decode_uniform, contiguous
+    confident-prefix per block), each block conditioned on the clean half. Iterate until EVERY block's
+    committed fraction (of its ORIGINALLY-masked positions) >= gate; SNAPSHOT each block at the iter it
+    FIRST crosses gate -- its committed prefix (think argmax, hard) + still-masked positions + think's
+    logits there (for the Path-B top-K). Operates on a CLONE. gate<=0 => no reveal (full mask).
+
+    Returns (committed_ids[:, :L], committed_mask[:, :L] bool, gate_logits[:, :T, V]) where T = full
+    doubled length (so gate_logits can feed build_talk_inputs_embeds directly; only its noisy-half
+    masked positions are used):
+      committed_ids  = assembled noisy half (think's commits where committed, mask_id elsewhere; prompt kept),
+      committed_mask = originally-masked AND committed in the gate-crossing snapshot,
+      gate_logits    = think's FULL logits at the snapshot (noisy half = per-block gate-crossing; clean
+                       half = first-forward logits, unused)."""
+    L = noisy_len
+    B = full_ids.shape[0]
+    x = full_ids.clone()
+    masked0 = (x[:, :L] == mask_id)                                       # [B, L] response region (initial mask)
+    nb = L // block_size
+    n_masked_blk = masked0.view(B, nb, block_size).sum(-1)               # [B, nb]
+    # gate<=0: no reveal. one forward for the Path-B top-K on the full mask; nothing committed.
+    if gate <= 0.0:
+        logits = think(inputs_embeds=_embed(think_emb, x), attention_mask=attention_mask,
+                       position_ids=position_ids, use_cache=False).logits   # FULL [B, T, V]
+        return x[:, :L].clone(), torch.zeros_like(masked0), logits
+    target_blk = torch.ceil(gate * n_masked_blk.float()).long()         # [B, nb]; >=1 where masked (gate>0)
+    snap_ids = x[:, :L].clone()
+    snap_done = torch.zeros(B, nb, dtype=torch.bool, device=x.device)
+    snap_logits = None                                                  # FULL [B, T, V]
+    logits = None
+    it = 0
+    while it < max_iters:
+        cur_masked = (x[:, :L] == mask_id)
+        if not bool(cur_masked.any()):
+            break
+        logits = think(inputs_embeds=_embed(think_emb, x), attention_mask=attention_mask,
+                       position_ids=position_ids, use_cache=False).logits   # FULL [B, T, V]
+        nl = logits[:, :L]
+        if snap_logits is None:
+            snap_logits = logits.clone()                                # init FULL (clean half unused)
+        argmax, commit = confident_prefix_commit(nl, cur_masked, block_size, threshold)
+        x[:, :L] = torch.where(commit, argmax, x[:, :L])
+        committed_now = masked0 & (x[:, :L] != mask_id)                 # originally-masked now committed
+        committed_blk = committed_now.view(B, nb, block_size).sum(-1)   # [B, nb]
+        crossed = (committed_blk >= target_blk) & (~snap_done) & (n_masked_blk > 0)
+        if bool(crossed.any()):
+            cpos = crossed.unsqueeze(-1).expand(B, nb, block_size).reshape(B, L)   # [B, L] noisy-half mask
+            snap_ids = torch.where(cpos, x[:, :L], snap_ids)
+            snap_logits[:, :L] = torch.where(cpos.unsqueeze(-1), nl, snap_logits[:, :L])   # snapshot noisy half
+            snap_done = snap_done | crossed
+        if bool((snap_done | (n_masked_blk == 0)).all()):
+            break
+        it += 1
+    # blocks that never crossed (hit max_iters): snapshot their current state
+    not_done = (~snap_done) & (n_masked_blk > 0)
+    if bool(not_done.any()) and logits is not None:
+        npos = not_done.unsqueeze(-1).expand(B, nb, block_size).reshape(B, L)
+        snap_ids = torch.where(npos, x[:, :L], snap_ids)
+        snap_logits[:, :L] = torch.where(npos.unsqueeze(-1), logits[:, :L], snap_logits[:, :L])
+    committed_mask = masked0 & (snap_ids != mask_id)
+    return snap_ids, committed_mask, snap_logits
+
+
 # --------------------------------------------------------------------------- test
 def _selftest():
     torch.manual_seed(0)
@@ -328,6 +419,28 @@ def _selftest():
                                               block_size=2, threshold=thr)
         assert s2.shape == (B, Ln, V) and torch.isfinite(s2).all()
         assert cm.shape == (B, Ln) and bool((cm <= (full_ids[:, :Ln] == mask_id)).all())  # commits subset of masked
+
+    # think_converge_response: converges the noisy half (sharp stub => commits), returns [:, :Ln] logits
+    class _SharpLM:                                      # peaked logits so confident_prefix_commit fires
+        def __init__(self, Wt): self.Wt = Wt
+        def __call__(self, *, inputs_embeds, **kw):
+            class O: pass
+            o = O(); o.logits = (inputs_embeds @ self.Wt) * 8.0; return o
+    sharp = _SharpLM(W.t())
+    fcv = think_converge_response(sharp, W, full_ids.clone(), Ln, mask_id, block_size=2, threshold=0.3, max_iters=Ln)
+    assert fcv.shape == (B, Ln, V) and torch.isfinite(fcv).all()
+
+    # think_decode_to_gate_per_block: per-block snapshot. gate>0 => committed subset of masked, prompt kept.
+    fid = full_ids.clone(); fid[:, :Ln] = mask_id                       # full-mask noisy half (sigma=1.0 case)
+    cids, cmask, glog = think_decode_to_gate_per_block(sharp, W, fid, Ln, mask_id, block_size=2,
+                                                       threshold=0.3, gate=0.5, max_iters=Ln)
+    assert cids.shape == (B, Ln) and cmask.shape == (B, Ln) and glog.shape == (B, Ln + Lc, V)  # gate_logits = FULL doubled len
+    assert bool((cmask <= (fid[:, :Ln] == mask_id)).all())              # committed subset of originally-masked
+    assert bool(((cids == mask_id) == (~cmask)).all())                  # committed <=> not mask (full-mask input)
+    # gate=0 => no reveal (all mask, nothing committed)
+    cids0, cmask0, glog0 = think_decode_to_gate_per_block(sharp, W, fid, Ln, mask_id, block_size=2,
+                                                          threshold=0.3, gate=0.0, max_iters=Ln)
+    assert bool((~cmask0).all()) and bool((cids0[:, :Ln] == mask_id).all()) and glog0.shape == (B, Ln + Lc, V)
     print("t3d_topk_talk selftest OK")
 
 

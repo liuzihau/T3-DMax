@@ -43,7 +43,8 @@ import random
 # input embedding at masked positions. See probe_runner/T3D_TOPK_TALK_INTEGRATION.md.
 from tasks.t3d_topk_talk import (build_talk_inputs_embeds, load_causal_lm, set_talk_trainable,
                                  confident_prefix_commit, think_distill_loss,
-                                 build_think_next_teacher, think_entropy_norm, recoverable_mask)
+                                 build_think_next_teacher, think_entropy_norm, recoverable_mask,
+                                 think_converge_response, think_decode_to_gate_per_block)
 
 
 logger = helper.create_logger(__name__)
@@ -329,9 +330,39 @@ class LLaDA2TrainingArguments(TrainingArguments):
     )
     t3_kl_top_k: int = field(
         default=-1,
-        metadata={"help": "Stage-2 reverse-KL support: -1 = FULL vocab (default). >0 = restrict to think's "
+        metadata={"help": "Stage-2 KL support: -1 = FULL vocab (default). >0 = restrict to think's "
                           "top-k candidate set (e.g. 100 = 10*t3_top_k), renormalized both sides (2604: "
                           "top-k KL ~= full at lower cost). Use if full-vocab KL is memory-bound."}
+    )
+    # --- REDESIGN (T3D_STAGE12_REDESIGN_PLAN.md): Stage-1 gate-reveal + Stage-2 think_converge KL ---
+    t3_stage1_warmup_steps: int = field(
+        default=2000,
+        metadata={"help": "Stage-1 gate warm-up: for the first N steps use a FIXED gate (t3_stage1_warmup_gate); "
+                          "after, sample gate ~ U(0, t3_stage1_gate_max) per micro-batch."}
+    )
+    t3_stage1_warmup_gate: float = field(
+        default=0.4,
+        metadata={"help": "Stage-1 fixed gate during warm-up (per-block committed fraction think decodes to "
+                          "before the talk predicts the rest)."}
+    )
+    t3_stage1_gate_max: float = field(
+        default=0.6,
+        metadata={"help": "Stage-1 post-warmup gate sampled ~ U(0, this). 0 = no reveal (full mask); higher = "
+                          "more think-committed context. Covers the range of committed fractions inference visits."}
+    )
+    t3_converge_max_iters: int = field(
+        default=8,
+        metadata={"help": "Cap on think's decode iterations for think_converge (Stage-2 teacher) and "
+                          "think_decode_to_gate (Stage-1 reveal). >= block_size guarantees full convergence; "
+                          "lower bounds the per-pass think cost."}
+    )
+    t3_kl_forward_frac: float = field(
+        default=0.9,
+        metadata={"help": "Stage-2 KL direction blend: loss = frac*forward_KL(think||talk) + (1-frac)*reverse_KL"
+                          "(talk||think) to the CONVERGED think. 1.0 = pure forward (gentle, calibrated, "
+                          "preserves think's soft structure — safer for the confidence-commit decode); lower "
+                          "adds reverse (mode-seeking, sharper) if the talk under-commits. GKD-style; tune by "
+                          "the decode commit-rate."}
     )
 
 
@@ -941,208 +972,127 @@ def main():
                 mask_token_id = args.train.t3_mask_token_id
                 flag = bool(micro_batch["flag"].item())
 
-                # ===================== STAGE-2 on-policy MULTI-PASS rollout (BOTH paths) =====================
-                # FULL-MASK start (no reveal curriculum). A NO-GRAD priming pass seeds the talk's first
-                # commits; then J grad passes, each: think(X) = TEACHER (bare-mask input), talk GRAD forward,
-                # loss = alpha*gold_CE + beta*REVERSE_KL(talk||think(X)) [both paths], commit the talk's OWN
-                # argmax (confidence-prefix), roll X forward. The TWO PATHS differ ONLY in the talk's still-
-                # masked input: Path A (flag=False) = bare [MASK] (same input as the teacher -> pure same-
-                # input distill); Path B (flag=True) = the talk's OWN previous-pass top-K soft-embed (the
-                # inference dynamic). think candidates feed the talk ONLY at the Path-B seed (think-once);
-                # thereafter the talk iterates on its own top-K. Backward PER pass (1x mem; passes connect
-                # only via discrete commits). J = min(J_max, J_start + step//every) -- deterministic depth
-                # schedule (no reveal, no plateau). think fwds = J[+1 Path-B seed]; talk fwds = 1 prime + J.
+                # ===================== STAGE-2 on-policy self-distillation to CONVERGED think =====================
+                # FULL-MASK start (sigma=1.0). think = gold/oracle; NO dataset gold CE. A NO-GRAD priming pass
+                # (think seed commit "commit first" -> talk commit "commit second") seeds the talk's first
+                # commits; then J grad passes, each: think_converge(X) (think decoded to CONVERGENCE from the
+                # talk's CURRENT state, on a CLONE) = the CLEAN per-position teacher; talk GRAD forward; loss =
+                # KL blend frac*fwd_KL(think||talk) + (1-frac)*rev_KL(talk||think) at predict positions
+                # (labels!=-100); commit the talk's OWN argmax, roll X forward. Paths differ ONLY in the still-
+                # masked input: Path A bare [MASK] (NEVER soft, incl. prime); Path B the talk's OWN previous
+                # top-K (think seeds it ONCE at the prime). J = min(J_max, J_start + step//every) step-curriculum.
                 _stage2 = (args.train.t3_rollout_commit_frac > 0 and args.train.t3_rollout_passes >= 1)
                 if _stage2:
                     L0 = noisy_input_ids.shape[1]
-                    J = min(_J_max, _J_start + global_step // _J_every)     # deterministic depth schedule
-                    _alpha, _beta = args.train.t3_stage2_ce_alpha, args.train.t3_stage2_kl_beta
+                    J = min(_J_max, _J_start + global_step // _J_every)
+                    _fwd_frac = args.train.t3_kl_forward_frac
                     _klT, _kltk = args.train.t3_stage2_kl_temp, args.train.t3_kl_top_k
+                    _cmax = args.train.t3_converge_max_iters
                     _ids = micro_batch["input_ids"]
                     _amask, _pos = micro_batch["attention_mask"], micro_batch["position_ids"]
-                    # --- no-grad priming: seed the first commits (Path B = think top-K; Path A = bare mask) ---
+                    # --- NO-GRAD priming: think seed commit ("commit first") + talk commit ("commit second") ---
                     with torch.no_grad():
-                        if flag:
-                            _seed = think(inputs_embeds=think_emb(_ids), attention_mask=_amask,
-                                          position_ids=_pos, use_cache=False).logits
-                            _prime_in = build_talk_inputs_embeds(
-                                _ids, _seed, think_emb, mask_token_id, mode="topk_soft",
-                                top_k=args.train.t3_top_k, keep_mask_residual=args.train.t3_keep_mask_residual)
-                        else:
-                            _prime_in = build_talk_inputs_embeds(_ids, None, think_emb, mask_token_id, mode="mask")
-                        _prime_logits = model(inputs_embeds=_prime_in, attention_mask=_amask, position_ids=_pos,
-                                              use_cache=False, output_router_logits=False).logits
-                        _a0, _c0 = confident_prefix_commit(_prime_logits[:, :L0], _ids[:, :L0] == mask_token_id,
+                        seed_logits = think(inputs_embeds=think_emb(_ids), attention_mask=_amask,
+                                            position_ids=_pos, use_cache=False).logits
+                        _a0, _c0 = confident_prefix_commit(seed_logits[:, :L0], _ids[:, :L0] == mask_token_id,
                                                            args.train.block_size, args.train.t3_commit_threshold)
-                        _ids[:, :L0] = torch.where(_c0, _a0, _ids[:, :L0])
-                        tl_prev = _prime_logits                            # talk's OWN prev top-K (Path B input)
-                    # --- J on-policy grad passes ---
-                    _ce_sum = _kl_sum = 0.0; _npass = 0
+                        _ids[:, :L0] = torch.where(_c0, _a0, _ids[:, :L0])             # commit first (think)
+                        if flag:                                                       # Path B prime: think seed top-K
+                            prime_in = build_talk_inputs_embeds(_ids, seed_logits, think_emb, mask_token_id,
+                                mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=args.train.t3_keep_mask_residual)
+                        else:                                                          # Path A prime: bare [MASK]
+                            prime_in = build_talk_inputs_embeds(_ids, None, think_emb, mask_token_id, mode="mask")
+                        prime_logits = model(inputs_embeds=prime_in, attention_mask=_amask, position_ids=_pos,
+                                             use_cache=False, output_router_logits=False).logits
+                        _a1, _c1 = confident_prefix_commit(prime_logits[:, :L0], _ids[:, :L0] == mask_token_id,
+                                                           args.train.block_size, args.train.t3_commit_threshold)
+                        _ids[:, :L0] = torch.where(_c1, _a1, _ids[:, :L0])             # commit second (talk)
+                        tl_prev = prime_logits
+                    # --- J grad rounds: think_converge teacher + KL blend (NO gold CE) ---
+                    _kl_sum = 0.0; _npass = 0
                     for _j in range(J):
                         masked_now = _ids[:, :L0] == mask_token_id
                         if not bool(masked_now.any()):
-                            break                                          # block fully decoded -> stop early
-                        with torch.no_grad():                              # TEACHER: think on current state (bare mask)
-                            think_j = think(inputs_embeds=think_emb(_ids), attention_mask=_amask,
-                                            position_ids=_pos, use_cache=False).logits
-                        if flag:                                           # Path B: talk's OWN prev top-K soft-embed
-                            talk_in_j = build_talk_inputs_embeds(
-                                _ids, tl_prev, think_emb, mask_token_id, mode="topk_soft",
-                                top_k=args.train.t3_top_k, keep_mask_residual=args.train.t3_keep_mask_residual)
-                        else:                                              # Path A: bare [MASK]
+                            break
+                        with torch.no_grad():                                          # TEACHER: think CONVERGED from X (clone)
+                            think_conv = think_converge_response(
+                                think, think_emb, _ids, L0, mask_token_id,
+                                block_size=args.train.block_size, threshold=args.train.t3_commit_threshold,
+                                attention_mask=_amask, position_ids=_pos, max_iters=_cmax)
+                        if flag:                                                       # Path B: talk's OWN prev top-K
+                            talk_in_j = build_talk_inputs_embeds(_ids, tl_prev, think_emb, mask_token_id,
+                                mode="topk_soft", top_k=args.train.t3_top_k, keep_mask_residual=args.train.t3_keep_mask_residual)
+                        else:                                                          # Path A: bare [MASK]
                             talk_in_j = build_talk_inputs_embeds(_ids, None, think_emb, mask_token_id, mode="mask")
                         with model_fwd_context:
                             logits_j = model(inputs_embeds=talk_in_j, attention_mask=_amask, position_ids=_pos,
                                              use_cache=False, output_router_logits=False).logits
                             nlj = logits_j[:, :L0].contiguous()
-                            V = nlj.shape[-1]
                             if args.train.same_token_labels:
-                                ce_j = torch.nn.functional.cross_entropy(
-                                    nlj.view(-1, V), labels.view(-1), ignore_index=-100, reduction="mean")
-                                _tl, _tlab, _teach = nlj, labels, think_j[:, :L0]
+                                _tl, _teach, _tlab = nlj, think_conv, labels
                             else:
-                                _sl = nlj[:, :-1, :].contiguous(); _slab = labels[:, 1:].contiguous()
-                                ce_j = torch.nn.functional.cross_entropy(
-                                    _sl.view(-1, V), _slab.view(-1), ignore_index=-100, reduction="mean")
-                                _tl, _tlab, _teach = _sl, _slab, think_j[:, :L0][:, 1:].contiguous()
-                            # REVERSE KL D(talk||think(X)) -> parity (H1); gold CE -> beat-think (H2)
-                            kl_j = think_distill_loss(_tl, _teach, _tlab, temperature=_klT,
-                                                      reverse=True, kl_top_k=_kltk)
-                            loss_j = (_alpha * ce_j + _beta * kl_j) / J / len(micro_batches)
+                                _tl = nlj[:, :-1, :].contiguous()
+                                _teach = think_conv[:, 1:].contiguous()
+                                _tlab = labels[:, 1:].contiguous()
+                            # KL to the CONVERGED think (think = gold); forward/reverse blend; NO gold CE.
+                            kl_fwd = think_distill_loss(_tl, _teach, _tlab, temperature=_klT, reverse=False, kl_top_k=_kltk)
+                            kl_rev = think_distill_loss(_tl, _teach, _tlab, temperature=_klT, reverse=True, kl_top_k=_kltk)
+                            kl_j = _fwd_frac * kl_fwd + (1.0 - _fwd_frac) * kl_rev
+                            loss_j = kl_j / J / len(micro_batches)
                         with model_bwd_context:
                             loss_j.backward()
-                        total_loss += loss_j.item()
-                        _ce_sum += float(ce_j); _kl_sum += float(kl_j); _npass += 1
-                        # commit the talk's OWN argmax (confidence-prefix) -> advance X; feed its own top-K forward
-                        with torch.no_grad():
+                        total_loss += loss_j.item(); _kl_sum += float(kl_j); _npass += 1
+                        with torch.no_grad():                                          # commit talk's OWN argmax -> advance
                             _aj, _cj = confident_prefix_commit(nlj.detach(), masked_now,
                                                                args.train.block_size, args.train.t3_commit_threshold)
                             _ids[:, :L0] = torch.where(_cj, _aj, _ids[:, :L0])
                         tl_prev = logits_j.detach()
-                    if _npass:                                             # raw CE/KL means (to balance alpha/beta)
-                        _s2_ce_last, _s2_kl_last = _ce_sum / _npass, _kl_sum / _npass
+                    if _npass:
+                        _s2_kl_last = _kl_sum / _npass                                 # raw mean KL (for monitoring)
                     del micro_batch
                     continue                                              # stage-2 handled its own fwd/loss/bwd
                 # =============================================================================================
-                mode = "topk_soft" if flag else "mask"
-                # Path B always needs think (top-K input). Path A forwards think ONLY to
-                # distill (t3_distill_beta>0): the loss matches think's distribution; the
-                # Path-A input stays bare [MASK] (build_talk_inputs_embeds mode='mask'
-                # ignores think_logits), so think is a teacher, not an input, here.
-                _distill_A = (not flag) and args.train.t3_distill_beta > 0
-                _patha_ew = (not flag) and args.train.t3_patha_entropy_lambda > 0   # Path-A entropy weighting
-                think_logits = None
-                if flag or _distill_A or _patha_ew:
-                    with torch.no_grad():
-                        think_logits = think(
-                            inputs_embeds=think_emb(micro_batch["input_ids"]),
-                            attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"],
-                            use_cache=False,
-                        ).logits
-                        # (Stage-1 path only below; Stage-2's rollout ran above and `continue`d.)
-
-                # ---- Path-B (stage-1) think_{s+2} teacher + Portion-1 hard-commit ----------------
-                # OPUT-style, think-sourced (off-policy): advance think ONE DMax step to think_{s+2}
-                # (the KL teacher), and hard-commit that SAME s+1 confident prefix into the talk's
-                # input as Portion 1. Labels untouched -> Portion 1 stays gold (in CE + KL); the
-                # curriculum reveal stays -100 (no loss). Build the teacher from the ORIGINAL s+1
-                # state, THEN write Portion 1 (one decode decision drives both). Stage-2 will swap
-                # the commit source to the talk's own argmax (on-policy).
-                think_s2_logits = None
-                if flag and args.train.t3_pathb_kl_gamma > 0:
-                    with torch.no_grad():
-                        L0b = noisy_input_ids.shape[1]
-                        think_s2_logits, _b_argmax, _b_commit = build_think_next_teacher(
-                            think, think_emb, micro_batch["input_ids"], think_logits, L0b,
-                            mask_token_id, block_size=args.train.block_size,
-                            threshold=args.train.t3_commit_threshold,
-                            attention_mask=micro_batch["attention_mask"],
-                            position_ids=micro_batch["position_ids"])
-                        micro_batch["input_ids"][:, :L0b] = torch.where(
-                            _b_commit, _b_argmax, micro_batch["input_ids"][:, :L0b])
-                talk_embeds = build_talk_inputs_embeds(
-                    micro_batch["input_ids"], think_logits, think_emb, mask_token_id,
-                    mode=mode, top_k=args.train.t3_top_k,
-                    keep_mask_residual=args.train.t3_keep_mask_residual,
-                )
-                #======================================================================================
-
-
+                # ===================== STAGE-1 off-policy cold start (gate-reveal + pure gold CE) =====================
+                # Data = sigma=1.0 full-mask noisy half + labels=gold on the WHOLE response. Reveal = think's
+                # PER-BLOCK contiguous decode-to-gate (inference-shaped, imperfect commits): committed = think's
+                # argmax (HARD, revised toward gold by CE); still-masked = bare [MASK] (Path A) / think top-K soft
+                # (Path B, from the gate-crossing top-K logits). Loss = PURE gold CE on the whole response. NO KL.
+                # Gate: fixed t3_stage1_warmup_gate for the first t3_stage1_warmup_steps, then U(0, gate_max).
+                _ids = micro_batch["input_ids"]
+                _amask, _pos = micro_batch["attention_mask"], micro_batch["position_ids"]
+                L0 = noisy_input_ids.shape[1]
+                if global_step <= args.train.t3_stage1_warmup_steps:
+                    _gate = args.train.t3_stage1_warmup_gate
+                else:
+                    _gate = float(torch.rand(1).item()) * args.train.t3_stage1_gate_max
+                with torch.no_grad():
+                    _committed_ids, _committed_mask, _gate_logits = think_decode_to_gate_per_block(
+                        think, think_emb, _ids, L0, mask_token_id, block_size=args.train.block_size,
+                        threshold=args.train.t3_commit_threshold, gate=_gate,
+                        attention_mask=_amask, position_ids=_pos, max_iters=args.train.t3_converge_max_iters)
+                    _ids[:, :L0] = _committed_ids                          # write think's gate-reveal into the noisy half
+                if flag:                                                   # Path B: still-masked -> think top-K soft
+                    talk_embeds = build_talk_inputs_embeds(
+                        _ids, _gate_logits, think_emb, mask_token_id, mode="topk_soft",
+                        top_k=args.train.t3_top_k, keep_mask_residual=args.train.t3_keep_mask_residual)
+                else:                                                      # Path A: still-masked -> bare [MASK]
+                    talk_embeds = build_talk_inputs_embeds(_ids, None, think_emb, mask_token_id, mode="mask")
                 with model_fwd_context:
-                    # T3-D: talk forward on the top-K-injected embeds (anchor-free).
-                    logits: "torch.Tensor" = model(
-                        inputs_embeds=talk_embeds,
-                        attention_mask=micro_batch["attention_mask"],
-                        position_ids=micro_batch["position_ids"],
-                        use_cache=False, output_router_logits=False,
-                    ).logits
-                    if args.train.block_diffusion_mode:
-                        noisy_logits = logits[:, :noisy_input_ids.shape[1]].contiguous()
-                    else:
-                        noisy_logits = logits
-
+                    logits = model(inputs_embeds=talk_embeds, attention_mask=_amask, position_ids=_pos,
+                                   use_cache=False, output_router_logits=False).logits
+                    noisy_logits = logits[:, :L0].contiguous()
                     V = noisy_logits.shape[-1]
-                    L_n = noisy_input_ids.shape[1]
-                    # Per-position loss WEIGHT (hard-position focus). Path A: entropy weight (up-weight
-                    # uncertain/forking positions). Path B: recoverable up-weight (think top-1 wrong but
-                    # gold in top-K -> 'pick the right candidate'). Applied to BOTH that path's CE and KL.
-                    _w = None
-                    if _patha_ew:
-                        _w = 1.0 + args.train.t3_patha_entropy_lambda * think_entropy_norm(think_logits[:, :L_n])
-                    elif flag and args.train.t3_pathb_recover_lambda > 0:
-                        _recov = recoverable_mask(think_logits[:, :L_n], labels, args.train.t3_top_k)
-                        _w = 1.0 + args.train.t3_pathb_recover_lambda * _recov.float()
-
+                    # pure gold CE on the whole response (labels != -100 = committed + still-masked).
                     if args.train.same_token_labels:
-                        unscaled_loss = torch.nn.functional.cross_entropy(
-                            noisy_logits.view(-1, V), labels.view(-1), reduction="none")
-                        _pred = (labels.view(-1) != -100)
-                        if _w is None:
-                            ce_mean = unscaled_loss.sum() / _pred.sum()
-                        else:
-                            _wf = _w.reshape(-1)
-                            ce_mean = (unscaled_loss * _wf).sum() / (_wf * _pred.float()).sum().clamp_min(1e-8)
-                        _kl_w = _w
+                        loss = torch.nn.functional.cross_entropy(
+                            noisy_logits.view(-1, V), labels.view(-1), ignore_index=-100,
+                            reduction="mean") / len(micro_batches)
                     else:
-                        shifted_noisy_logits = noisy_logits[:, :-1, :].contiguous()
-                        shifted_labels = labels[:, 1:].contiguous()
-                        unscaled_loss = torch.nn.functional.cross_entropy(
-                            shifted_noisy_logits.view(-1, V), shifted_labels.view(-1),
-                            reduction="none").view(shifted_noisy_logits.shape[0], -1)
-                        _pred = (shifted_labels != -100)
-                        _kl_w = None if _w is None else _w[:, 1:]
-                        if _kl_w is None:
-                            ce_mean = unscaled_loss.sum() / _pred.sum()
-                        else:
-                            ce_mean = (unscaled_loss * _kl_w).sum() / (_kl_w * _pred.float()).sum().clamp_min(1e-8)
-
-                    # Path-A think->talk distillation: hybrid alpha*CE(gold) + beta*KL(think||talk)
-                    # at the predict positions. Path B (flag) and distill-off keep pure gold CE.
-                    if _distill_A:
-                        if args.train.same_token_labels:
-                            kl = think_distill_loss(
-                                noisy_logits, think_logits[:, :L_n], labels,
-                                temperature=args.train.t3_distill_temp, weight=_kl_w)
-                        else:
-                            kl = think_distill_loss(
-                                shifted_noisy_logits, think_logits[:, :L_n][:, 1:].contiguous(),
-                                shifted_labels, temperature=args.train.t3_distill_temp, weight=_kl_w)
-                        loss = (args.train.t3_distill_alpha * ce_mean
-                                + args.train.t3_distill_beta * kl) / len(micro_batches)
-                    elif think_s2_logits is not None:
-                        # Path-B s+2 distillation: gold CE + gamma * forward-KL(think_{s+2}||talk),
-                        # both over the predict positions (Portion 1 + still-masked; reveal is -100).
-                        if args.train.same_token_labels:
-                            kl_b = think_distill_loss(noisy_logits, think_s2_logits, labels,
-                                                      temperature=args.train.t3_pathb_kl_temp, weight=_kl_w)
-                        else:
-                            kl_b = think_distill_loss(shifted_noisy_logits,
-                                                      think_s2_logits[:, 1:].contiguous(), shifted_labels,
-                                                      temperature=args.train.t3_pathb_kl_temp, weight=_kl_w)
-                        loss = (ce_mean + args.train.t3_pathb_kl_gamma * kl_b) / len(micro_batches)
-                    else:
-                        loss = ce_mean / len(micro_batches)
+                        _sl = noisy_logits[:, :-1, :].contiguous()
+                        _slab = labels[:, 1:].contiguous()
+                        loss = torch.nn.functional.cross_entropy(
+                            _sl.view(-1, V), _slab.view(-1), ignore_index=-100,
+                            reduction="mean") / len(micro_batches)
 
                 with model_bwd_context:
                     loss.backward()
@@ -1176,10 +1126,10 @@ def main():
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
-                # Stage-2: raw (unweighted) CE & KL means so alpha/beta can be balanced (bump alpha if
-                # CE << KL). nan on non-stage-2 steps / stage 1.
-                _s2_extra = ({} if _s2_ce_last != _s2_ce_last
-                             else {"t3/s2_ce_raw": _s2_ce_last, "t3/s2_kl_raw": _s2_kl_last,
+                # Stage-2: raw (unweighted) mean KL to think_converge (monitor; tune t3_kl_forward_frac by
+                # the decode commit-rate). nan on Stage-1 steps. Also log the current J.
+                _s2_extra = ({} if _s2_kl_last != _s2_kl_last
+                             else {"t3/s2_kl_raw": _s2_kl_last,
                                    "t3/rollout_passes": min(_J_max, _J_start + global_step // _J_every)})
                 if args.train.use_wandb:
                     train_metrics.update(

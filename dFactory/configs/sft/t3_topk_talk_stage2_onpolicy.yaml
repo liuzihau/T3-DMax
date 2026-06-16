@@ -1,17 +1,19 @@
-# T3-D top-K talk — STAGE 2: ON-POLICY MULTI-PASS rollout + REVERSE-KL distillation.
+# T3-D top-K talk — STAGE 2: ON-POLICY MULTI-PASS rollout + KL to CONVERGED think.
 #
 # Initialised from the Stage-1 cold start (THUNLP arXiv:2604.13016 §5.1: on-policy-from-scratch
 # FAILS; "Only OPD" = running this from ../merged_10L). model_path below MUST be the Stage-1 hf_ckpt.
 #
-# DESIGN (T3D_STAGE2_DESIGN.md): ALWAYS full mask (no reveal curriculum -- Stage 1 already aligned the
-# talk to think). Per micro-batch: a NO-GRAD priming pass seeds the talk's first commits, then J grad
-# passes -- each runs think(X) as the TEACHER, the talk GRAD forward, loss = alpha*gold_CE +
-# beta*REVERSE_KL(talk||think(X)), then commits the talk's OWN argmax and rolls X forward. BOTH paths
-# (flag ~50/50) take CE+KL; they differ ONLY in the talk's still-masked input:
-#   Path A (flag=False): bare [MASK]               (same input as think -> pure same-input distill)
-#   Path B (flag=True):  the talk's OWN prev top-K (the inference dynamic; think candidates seed it ONCE)
-# reverse-KL -> parity with think (H1); gold CE -> beat-think (H2). J is the ONLY curriculum -- it
-# ANNEALS 2 -> 6 on a fixed STEP schedule (+1 every 2000 steps). think is fed the talk's HARD commits.
+# REDESIGN (T3D_STAGE12_REDESIGN_PLAN.md): ALWAYS full mask. think = gold/oracle, so there is NO
+# dataset gold CE in this stage. The TEACHER is think_converge (think decoded to CONVERGENCE from
+# the talk's CURRENT state, on a CLONE) -- a CLEAN target, NOT think's single-pass filler/deferral
+# (the cause of the \n-collapse). Per micro-batch: a NO-GRAD priming pass (think seed commit ->
+# talk commit) seeds the talk's first commits, then J grad passes -- each: think_converge(X) teacher,
+# talk GRAD forward, loss = frac*forward_KL(think||talk) + (1-frac)*reverse_KL(talk||think) at predict
+# positions, then commit the talk's OWN argmax and roll X forward. forward-dominant (GKD-style) keeps
+# the talk calibrated; the reverse term sharpens. Paths differ ONLY in the still-masked input:
+#   Path A (flag=False): bare [MASK]               (NEVER soft, incl. the prime)
+#   Path B (flag=True):  the talk's OWN prev top-K (think seeds it ONCE at the prime)
+# J STEP-curriculum: J = min(max, start + step // every) = 1 for [0,3k), 2 for [3k,6k), 3 for [6k+].
 #
 # Launch:  PYTHONPATH=$(pwd)/VeOmni:$PYTHONPATH NPROC_PER_NODE=1 \
 #          sh train.sh tasks/train_t3_topk_talk.py configs/sft/t3_topk_talk_stage2_onpolicy.yaml
@@ -44,22 +46,22 @@ train:
   t3_mask_token_id: 156895
 
   # ---- Stage-2 on-policy MULTI-PASS rollout (the core of this stage) ----
-  t3_rollout_commit_frac: 1.0           # ROLLOUT ON (the gate). Commit SELECTION = confidence-prefix below.
-  t3_commit_threshold: 0.3              # DMax decode_uniform tau — matches inference commits
-  t3_rollout_passes: 2                  # J START depth (J>=2)
-  t3_rollout_passes_max: 6              # ANNEAL J 2->3->4->5->6 ...
-  t3_rollout_passes_step_every: 2000    #   ... +1 every 2000 steps (deterministic; multi-GPU-safe)
-  t3_seed_passes: 1                     # think seeds the FIRST pass (Path B); decoder reads this too
+  t3_rollout_commit_frac: 1.0           # ROLLOUT ON (the Stage-2 gate). Commit SELECTION = confidence-prefix below.
+  t3_commit_threshold: 0.6              # confident-prefix commit threshold (talk commit + think_converge)
+  t3_rollout_passes: 1                  # J START depth (step-curriculum: 1 for [0,3k))
+  t3_rollout_passes_max: 3              # J CAP (anneals 1 -> 2 -> 3)
+  t3_rollout_passes_step_every: 3000    #   +1 every 3000 steps: J=1 [0,3k), 2 [3k,6k), 3 [6k+)
+  t3_seed_passes: 1                     # think seeds the prime (Path B); decoder reads this too
   t3_keep_mask_residual: true           # exact decode-time input (top-K + mask-residual + renorm)
+  t3_converge_max_iters: 8              # cap on think_converge per-pass decode iters (teacher compute guard)
 
-  # ---- per-pass loss = alpha*gold_CE + beta*reverse_KL(talk||think(X)), BOTH paths ----
-  t3_stage2_ce_alpha: 1.0               # gold-CE weight (H2). Bump if logged t3/s2_ce_raw << t3/s2_kl_raw.
-  t3_stage2_kl_beta: 1.0                # reverse-KL weight (H1 parity). 0 = gold-CE-only A/B.
+  # ---- per-pass loss = frac*forward_KL(think||talk) + (1-frac)*reverse_KL(talk||think). NO gold CE. ----
+  t3_kl_forward_frac: 0.9               # forward-dominant (GKD-style): keeps the talk calibrated; rev sharpens
   t3_stage2_kl_temp: 1.0
-  t3_kl_top_k: -1                       # -1 = FULL-vocab reverse KL; set 100 (=10*top_k) to truncate if OOM
+  t3_kl_top_k: -1                       # -1 = FULL-vocab KL; set 100 (=10*top_k) to truncate if OOM
 
   t3_val_every: 200                     # watch val/acc_roll, val/overlap_ratio (rising), val/entropy_gap
-  t3_val_size: 64                       #   (narrowing), val/beat_roll; + t3/s2_ce_raw vs t3/s2_kl_raw
+  t3_val_size: 64                       #   (narrowing), val/beat_roll; + t3/s2_kl_raw (monitor) + t3/rollout_passes
   t3_keep_best_n: 2
 
   data_parallel_mode: ddp
@@ -69,8 +71,8 @@ train:
   global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 3
-  max_steps: 12000                      # room for J to reach 6 (+1 every 2000 => J=6 at step ~8000) + tail.
-                                        #   Interrupt early if acc_roll/overlap plateau before J=6.
+  max_steps: 12000                      # J reaches its cap (3) at step 6000; ample tail at J=3.
+                                        #   Interrupt early if acc_roll/overlap plateau.
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
@@ -87,9 +89,10 @@ train:
   weight_decay: 0.01
   max_grad_norm: 1.0
 
-  # Memory/compute: J grad talk forwards (backward'd + freed PER pass -> ~1x talk graph) + ~J no-grad 16B
-  # think TEACHER forwards (+1 Path-B seed) per micro-batch. At J=6 the think teacher forwards dominate
-  # wall-clock; lower t3_rollout_passes_max or t3_kl_top_k if compute/memory-bound.
+  # Memory/compute: J grad talk forwards (backward'd + freed PER pass -> ~1x talk graph) + J think_converge
+  # TEACHER decodes (each up to t3_converge_max_iters no-grad 16B forwards) + 1 prime think + 1 prime talk
+  # per micro-batch. The think_converge teacher dominates wall-clock; lower t3_converge_max_iters,
+  # t3_rollout_passes_max, or t3_kl_top_k if compute/memory-bound.
   enable_mixed_precision: false
   enable_gradient_checkpointing: true
   enable_full_shard: false
