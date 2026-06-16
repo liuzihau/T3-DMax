@@ -46,6 +46,17 @@ def _sync():
         torch.cuda.synchronize()
 
 
+def _fwd(model, inputs_embeds, m, p):
+    """One model forward, returning (logits, model_seconds). Syncs around ONLY the model() call, so the
+    time is the pure GPU forward -- it excludes the emb lookup / soft-embed build / commit / clone that
+    surround it. Accumulating these gives each method's 'model' time vs its total 'wall' (= model + I/O)."""
+    _sync(); _t = time.time()
+    out = model(inputs_embeds=inputs_embeds, attention_mask=m, position_ids=p,
+                use_cache=False, return_dict=True).logits
+    _sync()
+    return out, time.time() - _t
+
+
 def _conf(logits):
     """argmax id + its softmax prob, per position. logits [1, n, V] -> (ids [1,n], probs [1,n])."""
     p = logits.softmax(-1)
@@ -57,19 +68,19 @@ def _conf(logits):
 def think_converge(think, emb, x, bs, be, m, p, threshold, max_iters):
     """Run think's DMax decode_uniform on block [bs:be] UNTIL no masked positions remain (or max_iters).
     Mutates x[:, bs:be] in place (commits think's own argmax each iter). Returns
-    (final_logits[block], committed_ids[block], n_iters)."""
+    (final_logits[block], committed_ids[block], n_think, model_seconds). n_think and model_seconds
+    INCLUDE the final convergence-check forward (a think here)."""
     n = 0
+    tm = 0.0
     while bool((x[:, bs:be] == MASK_ID).any()) and n < max_iters:
         block = x[:, bs:be]
         mask_index = block == MASK_ID
-        logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                       use_cache=False, return_dict=True).logits
+        logits, dt = _fwd(think, emb(x[:, :be]), m, p); tm += dt
         x0, high_conf, _, _ = dmax_commit_uniform(logits[:, bs:be], mask_index, mask_index, threshold)
         x[:, bs:be] = torch.where(high_conf, x0, block)
         n += 1
-    final = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                  use_cache=False, return_dict=True).logits[:, bs:be]
-    return final, x[:, bs:be].clone(), n
+    fl, dt = _fwd(think, emb(x[:, :be]), m, p); tm += dt; n += 1   # convergence-check forward (COUNTED)
+    return fl[:, bs:be], x[:, bs:be].clone(), n, tm
 
 
 @torch.no_grad()
@@ -78,31 +89,36 @@ def mixed_converge(think, talk, emb, x, bs, be, m, p, threshold, top_k, kmr, max
     for iteration i. A think step runs think on the committed state (bare [MASK] at undecided). A talk step
     runs the talk fed the top-K soft-embed of the PREVIOUS pass's logits (think's if the prev step was think,
     the talk's own otherwise -- the inference dynamic). Commits the confident prefix each step. Mutates
-    x[:, bs:be]. Returns (final_logits[block], ids[block], n_think, n_talk)."""
+    x[:, bs:be]. Returns (final_logits[block], ids[block], n_think, n_talk, model_seconds). The counts and
+    model_seconds INCLUDE the final convergence-check forward, which follows the schedule's NEXT step (so
+    for a talk-ending schedule the check is a cheaper talk -- methods differ here, by design)."""
     cand = None
     nth = ntk = 0
+    tm = 0.0
     while bool((x[:, bs:be] == MASK_ID).any()) and (nth + ntk) < max_iters:
         block = x[:, bs:be]
         mask_index = block == MASK_ID
         if schedule(nth + ntk) == "think":
-            logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                           use_cache=False, return_dict=True).logits
-            nth += 1
+            logits, dt = _fwd(think, emb(x[:, :be]), m, p); nth += 1
         else:
             src = cand if cand is not None else think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
                                                       position_ids=p, use_cache=False, return_dict=True).logits
             soft = build_topk_soft_embeds(src[:, bs:be], emb, MASK_ID, top_k=top_k, keep_mask_residual=kmr)
             inp = emb(x[:, :be]).clone()
             inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)
-            logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
-                          use_cache=False, return_dict=True).logits
-            ntk += 1
+            logits, dt = _fwd(talk, inp, m, p); ntk += 1
+        tm += dt
         cand = logits
         x0, high_conf, _, _ = dmax_commit_uniform(logits[:, bs:be], mask_index, mask_index, threshold)
         x[:, bs:be] = torch.where(high_conf, x0, block)
-    final = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                  use_cache=False, return_dict=True).logits[:, bs:be]
-    return final, x[:, bs:be].clone(), nth, ntk
+    # convergence-check forward follows the schedule's NEXT step (COUNTED) -- may be a (cheaper) talk.
+    # At convergence there are no masked positions, so the talk just reads the committed tokens (no soft).
+    if schedule(nth + ntk) == "think":
+        fl, dt = _fwd(think, emb(x[:, :be]), m, p); nth += 1
+    else:
+        fl, dt = _fwd(talk, emb(x[:, :be]), m, p); ntk += 1
+    tm += dt
+    return fl[:, bs:be], x[:, bs:be].clone(), nth, ntk, tm
 
 
 @torch.no_grad()
@@ -119,24 +135,24 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
         sel = ids_row[region_row]
         return tok.decode(sel, skip_special_tokens=False) if sel.numel() else "(empty)"
 
-    # ---- think_1 (one pass) ----  [timed: the seed forward of the talk_think method]
+    # ---- think_1 (one pass) ----  [the seed forward of the talk_think method; model + wall timed]
     _sync(); _t = time.time()
-    th1 = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
-                use_cache=False, return_dict=True).logits[:, bs:be]
-    _sync(); t_think1 = time.time() - _t
+    th1_full, m_th1 = _fwd(think, emb(x[:, :be]), m, p)
+    _sync(); w_th1 = time.time() - _t
+    th1 = th1_full[:, bs:be]
     a1, c1 = _conf(th1)
     am1, cm1 = confident_prefix_commit(th1, masked, B, args.threshold)
     sm1 = masked & (~cm1)
 
-    # ---- talk_1 (one think + one talk) ----
+    # ---- talk_1 (one think + one talk) ----  [wall includes the soft-embed build; model is the talk fwd]
+    _sync(); _t = time.time()
     soft = build_topk_soft_embeds(th1, emb, MASK_ID, top_k=args.top_k,
                                   keep_mask_residual=not args.no_mask_residual)
     inp = emb(x[:, :be]).clone()
     inp[:, bs:be][masked] = soft[masked].to(inp.dtype)
-    _sync(); _t = time.time()
-    ta1 = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
-               use_cache=False, return_dict=True).logits[:, bs:be]
-    _sync(); t_talk1 = time.time() - _t
+    ta1_full, m_ta1 = _fwd(talk, inp, m, p)
+    _sync(); w_ta1 = time.time() - _t
+    ta1 = ta1_full[:, bs:be]
     aT, cT = _conf(ta1)
     amT, cmT = confident_prefix_commit(ta1, masked, B, args.threshold)
     smT = masked & (~cmT)
@@ -155,20 +171,21 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     xt = x.clone()
     xt[:, bs:be] = torch.where(cmT, amT, xt[:, bs:be])
     _sync(); _t = time.time()
-    ttk_logits, ttk_ids, ttk_iters = think_converge(think, emb, xt, bs, be, m, p, args.threshold, args.max_iters)
-    _sync(); t_ttk = time.time() - _t
+    ttk_logits, ttk_ids, ttk_iters, m_ttk = think_converge(think, emb, xt, bs, be, m, p, args.threshold, args.max_iters)
+    _sync(); w_ttk = time.time() - _t
     atk, ctk = _conf(ttk_logits)
     ttk_commit = masked & (ttk_ids != MASK_ID)
     ttk_still = masked & (ttk_ids == MASK_ID)
     # ALL forwards of the talk_think method: 1 think (seed) + 1 talk + ttk_iters think (the converge loop)
     ttk_fwd = 1 + 1 + ttk_iters
-    ttk_wall = t_think1 + t_talk1 + t_ttk
+    ttk_model = m_th1 + m_ta1 + m_ttk                      # pure model forward time
+    ttk_wall = w_th1 + w_ta1 + w_ttk                       # model + I/O processing
 
     # ---- base_think = pure think decoded UNTIL CONVERGED (no talk) ----
     xb = x.clone()
     _sync(); _t = time.time()
-    base_logits, base_ids, base_iters = think_converge(think, emb, xb, bs, be, m, p, args.threshold, args.max_iters)
-    _sync(); t_base = time.time() - _t
+    base_logits, base_ids, base_iters, m_base = think_converge(think, emb, xb, bs, be, m, p, args.threshold, args.max_iters)
+    _sync(); w_base = time.time() - _t
     ab, cb = _conf(base_logits)
     base_still = masked & (base_ids == MASK_ID)
     base_fwd = base_iters                                  # all think (the converge loop)
@@ -176,20 +193,20 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     # ---- method C: think + think + talk... UNTIL CONVERGED (2 think seeds, then talk) ----
     xc = x.clone()
     _sync(); _t = time.time()
-    c_logits, c_ids, c_nth, c_ntk = mixed_converge(
+    c_logits, c_ids, c_nth, c_ntk, m_c = mixed_converge(
         think, talk, emb, xc, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
         args.max_iters, lambda i: "think" if i < 2 else "talk")
-    _sync(); t_c = time.time() - _t
+    _sync(); w_c = time.time() - _t
     ac, cc = _conf(c_logits)
     c_commit = masked & (c_ids != MASK_ID); c_still = masked & (c_ids == MASK_ID)
 
     # ---- method D: think + talk + think + talk + ... UNTIL CONVERGED (strictly alternating) ----
     xd = x.clone()
     _sync(); _t = time.time()
-    d_logits, d_ids, d_nth, d_ntk = mixed_converge(
+    d_logits, d_ids, d_nth, d_ntk, m_d = mixed_converge(
         think, talk, emb, xd, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
         args.max_iters, lambda i: "think" if i % 2 == 0 else "talk")
-    _sync(); t_d = time.time() - _t
+    _sync(); w_d = time.time() - _t
     ad, cd = _conf(d_logits)
     d_commit = masked & (d_ids != MASK_ID); d_still = masked & (d_ids == MASK_ID)
 
@@ -203,16 +220,16 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     print(f"  think_2   COMMITS +{int(cm2.sum())}: {dtxt(am2[0], cm2[0])!r}   (think_1 left {int(sm1.sum())} masked)")
     print(f"  think_2   STILL [{int(sm2.sum())}]: {dtxt(a2[0], sm2[0])!r}")
     print(f"  talk_think_converged: COMMIT[{int(ttk_commit.sum())}] STILL[{int(ttk_still.sum())}]  "
-          f"FWD = 1 think + 1 talk + {ttk_iters} think = {ttk_fwd} total | wall = {1e3 * ttk_wall:.0f} ms")
+          f"FWD = 1 think + 1 talk + {ttk_iters} think = {ttk_fwd} | model = {1e3 * ttk_model:.0f} ms | wall = {1e3 * ttk_wall:.0f} ms")
     print(f"      committed: {dtxt(ttk_ids[0], ttk_commit[0])!r}")
     print(f"  base_think  CONVERGED: COMMIT[{int((masked & (base_ids != MASK_ID)).sum())}] STILL[{int(base_still.sum())}]  "
-          f"FWD = {base_fwd} think | wall = {1e3 * t_base:.0f} ms")
+          f"FWD = {base_fwd} think | model = {1e3 * m_base:.0f} ms | wall = {1e3 * w_base:.0f} ms")
     print(f"      committed: {dtxt(base_ids[0], masked[0])!r}")
     print(f"  think+think+talk... CONVERGED: COMMIT[{int(c_commit.sum())}] STILL[{int(c_still.sum())}]  "
-          f"FWD = {c_nth} think + {c_ntk} talk = {c_nth + c_ntk} total | wall = {1e3 * t_c:.0f} ms")
+          f"FWD = {c_nth} think + {c_ntk} talk = {c_nth + c_ntk} | model = {1e3 * m_c:.0f} ms | wall = {1e3 * w_c:.0f} ms")
     print(f"      committed: {dtxt(c_ids[0], c_commit[0])!r}")
     print(f"  think+talk+think+talk... CONVERGED: COMMIT[{int(d_commit.sum())}] STILL[{int(d_still.sum())}]  "
-          f"FWD = {d_nth} think + {d_ntk} talk = {d_nth + d_ntk} total | wall = {1e3 * t_d:.0f} ms")
+          f"FWD = {d_nth} think + {d_ntk} talk = {d_nth + d_ntk} | model = {1e3 * m_d:.0f} ms | wall = {1e3 * w_d:.0f} ms")
     print(f"      committed: {dtxt(d_ids[0], d_commit[0])!r}")
 
     # ---- per-position table over the masked block ----
@@ -234,8 +251,10 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
             agg[name][1] += int(reg.sum())
     agg["ttk_vs_base"][0] += int((atk[0][masked[0]] == ab[0][masked[0]]).sum())
     agg["ttk_vs_base"][1] += int(masked.sum())
-    for key, val in (("ttk_fwd", ttk_fwd), ("ttk_wall", ttk_wall), ("base_fwd", base_fwd), ("base_wall", t_base),
-                     ("c_fwd", c_nth + c_ntk), ("c_wall", t_c), ("d_fwd", d_nth + d_ntk), ("d_wall", t_d)):
+    for key, val in (("ttk_fwd", ttk_fwd), ("ttk_model", ttk_model), ("ttk_wall", ttk_wall),
+                     ("base_fwd", base_fwd), ("base_model", m_base), ("base_wall", w_base),
+                     ("c_fwd", c_nth + c_ntk), ("c_model", m_c), ("c_wall", w_c),
+                     ("d_fwd", d_nth + d_ntk), ("d_model", m_d), ("d_wall", w_d)):
         agg[key][0] += val
         agg[key][1] += 1
     agg["c_vs_base"][0] += int((ac[0][masked[0]] == ab[0][masked[0]]).sum())
@@ -276,10 +295,21 @@ def main():
     emb = think.get_input_embeddings()
     B = args.block_length
 
+    # WARMUP: run a few think+talk forwards so the first TIMED forward doesn't pay CUDA cold-start /
+    # autotuning (a big single-shot timing noise source).
+    _wu = torch.full((1, B), MASK_ID, dtype=torch.long, device=args.device)
+    _wm = build_block_causal_mask(B, B, dtype, args.device)
+    _wp = torch.arange(B, device=args.device).unsqueeze(0)
+    for _ in range(3):
+        _fwd(think, emb(_wu), _wm, _wp)
+        _fwd(talk, emb(_wu), _wm, _wp)
+    _sync()
+
     agg = {"commit": [0, 0], "still": [0, 0], "ttk_vs_base": [0, 0],
-           "ttk_fwd": [0, 0], "ttk_wall": [0, 0], "base_fwd": [0, 0], "base_wall": [0, 0],
-           "c_fwd": [0, 0], "c_wall": [0, 0], "c_vs_base": [0, 0],
-           "d_fwd": [0, 0], "d_wall": [0, 0], "d_vs_base": [0, 0]}
+           "ttk_fwd": [0, 0], "ttk_model": [0, 0], "ttk_wall": [0, 0],
+           "base_fwd": [0, 0], "base_model": [0, 0], "base_wall": [0, 0],
+           "c_fwd": [0, 0], "c_model": [0, 0], "c_wall": [0, 0], "c_vs_base": [0, 0],
+           "d_fwd": [0, 0], "d_model": [0, 0], "d_wall": [0, 0], "d_vs_base": [0, 0]}
     rows = list(load_dataset("gsm8k", "main", split="test"))[:args.limit]
     for i, row in enumerate(rows):
         messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
@@ -316,18 +346,16 @@ def main():
     nb = max(1, agg["base_fwd"][1])
     print(f"[TOTAL] vs base_think agreement:  think+think+talk = {agg['c_vs_base'][0]/max(1,agg['c_vs_base'][1]):.3f}  "
           f"think+talk+talk... (alt) = {agg['d_vs_base'][0]/max(1,agg['d_vs_base'][1]):.3f}")
-    print(f"[TOTAL] avg FORWARDS/block (think+talk):")
-    print(f"          base_think           = {agg['base_fwd'][0]/nb:.1f}")
-    print(f"          talk_think_converged = {agg['ttk_fwd'][0]/nb:.1f}")
-    print(f"          think+think+talk...  = {agg['c_fwd'][0]/nb:.1f}")
-    print(f"          think+talk+think...  = {agg['d_fwd'][0]/nb:.1f}")
-    print(f"[TOTAL] avg WALL/block:  base_think = {1e3*agg['base_wall'][0]/nb:.0f} ms   "
-          f"talk_think = {1e3*agg['ttk_wall'][0]/nb:.0f} ms   "
-          f"think+think+talk = {1e3*agg['c_wall'][0]/nb:.0f} ms   "
-          f"think+talk+talk(alt) = {1e3*agg['d_wall'][0]/nb:.0f} ms")
-    print("Read: a mixed method WINS if it matches base_think's answer (high vs-base agreement) at LOWER wall "
-          "than base_think. Talk forwards are ~half a think's FLOPs, so wall is the honest cost; if a method "
-          "needs more total forwards but more of them are cheap talk passes, it can still be faster.")
+    print(f"[TOTAL] avg per block  (FWD = think+talk, INCL. the 1 convergence-check forward | "
+          f"model = pure forward ms | wall = +I/O ms):")
+    print(f"          base_think           : FWD {agg['base_fwd'][0]/nb:4.1f}  | model {1e3*agg['base_model'][0]/nb:5.0f} | wall {1e3*agg['base_wall'][0]/nb:5.0f}")
+    print(f"          talk_think_converged : FWD {agg['ttk_fwd'][0]/nb:4.1f}  | model {1e3*agg['ttk_model'][0]/nb:5.0f} | wall {1e3*agg['ttk_wall'][0]/nb:5.0f}")
+    print(f"          think+think+talk...  : FWD {agg['c_fwd'][0]/nb:4.1f}  | model {1e3*agg['c_model'][0]/nb:5.0f} | wall {1e3*agg['c_wall'][0]/nb:5.0f}")
+    print(f"          think+talk+think...  : FWD {agg['d_fwd'][0]/nb:4.1f}  | model {1e3*agg['d_model'][0]/nb:5.0f} | wall {1e3*agg['d_wall'][0]/nb:5.0f}")
+    print("Read: MODEL time = pure forward compute (the honest cost; methods with the same think/talk forward "
+          "mix should match here). WALL = model + I/O (soft-embed build, commit, emb, clone) -- a big wall-minus-"
+          "model gap is harness overhead, not the method. A mixed method WINS if it matches base_think's answer "
+          "(high vs-base agreement) at lower MODEL time. (talk forward ~= 0.5x think FLOPs.)")
 
 
 if __name__ == "__main__":
