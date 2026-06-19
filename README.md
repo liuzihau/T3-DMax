@@ -108,6 +108,90 @@ If PASS: the pipeline is end-to-end correct and you can either commit to the lon
 If FAIL: paste the report and the smoke log; the failure mode usually points at one
 specific layer of the stack (data, model init, optimizer, checkpoint).
 
+## Inference / GSM8K evaluation
+
+End-to-end decode + GSM8K scoring lives in
+[`dFactory/tasks/t3d_topk_eval_gsm8k.py`](./dFactory/tasks/t3d_topk_eval_gsm8k.py). It loads a
+frozen **think** (full DMax) and a trained **talk** checkpoint, decodes the whole response
+block-by-block, and reports accuracy + compute (`think/ex`, `talk/ex`, and the 20-layer-equivalent
+`20L-equiv/ex = think_fwd + 0.5*talk_fwd`). Baseline to beat: **84% @ gen512**.
+
+```bash
+cd dFactory
+export THINK=../DMax-Math-16B-moe-merge                                  # frozen full-DMax think
+export TALK=./t3_topk_stage2_onpolicy_outputs/checkpoints/<step>/hf_ckpt # trained talk
+#   (use ../merged_10L for the UNTRAINED talk = harness check + floor)
+```
+
+### Decode methods (`--decode_mode`)
+
+Two families. In **(A)** think never commits — it only supplies per-position top-K candidates and
+the **talk** does all committing. In **(B)** (ported from `t3d_probe_converged_teacher.mixed_converge`)
+**whichever model runs a step commits** its own confident left-to-right prefix (DMax rule).
+
+| `--decode_mode` | family | who commits | think cost / block | notes |
+|---|---|---|---|---|
+| `seed` (default) | A: think-as-candidate | talk only | `--seed_passes` (1 = once) | the H1 inference dynamic the training targets |
+| `cross` | B: think-as-decoder | whoever runs | every other step | `think→talk→think→talk…` |
+| `think_then_talk` | B: think-as-decoder | whoever runs | `--think_seed_count` leading commits | `think×N (commit) → talk…` |
+| `think_only` | B: pure baseline | think | every step | pure DMax decode-to-converge baseline |
+
+```bash
+# 1. seed — H1 target: think once/block, talk drives (Stage-2 training dynamic)
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode seed --seed_passes 1 --gen_length 512 --block_length 32 \
+  --threshold 0.3 --top_k 10 --limit 200
+
+# 2. cross — think→talk→think→talk (strict alternation)
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode cross --limit 200
+
+# 3. think_then_talk — think×2 commit, then talk to converge
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode think_then_talk --think_seed_count 2 --limit 200
+
+# 4. think_only — pure DMax baseline
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode think_only --limit 200
+```
+
+### Early-stop (DMax termination) and other knobs
+
+By default `seed` uses DMax's per-block Breakflag (all active ≥ 0.9 **or** no-change;
+`parallel_strategy.py:578-590`); the mixed modes (`cross` / `think_then_talk` / `think_only`)
+run each block to full convergence, capped at `--max_iters` (= `block_length` = 32). Add
+**`--early_stop`** to apply DMax's full termination to *all* modes — the per-block 0.9 / no-change
+gate **plus** the sequence-level EOS stop (stop generating once a block commits EOS,
+`--eos_id 156892`; batch-filtering is a no-op at batch=1). Turn it on for compute that is directly
+comparable across modes:
+
+```bash
+# Compute-fair sweep over all four modes (DMax-faithful termination)
+for M in seed cross think_then_talk think_only; do
+  python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+    --decode_mode $M --early_stop --eos_id 156892 --limit 200
+done
+```
+
+Other flags: `--threshold` (commit confidence, DMax default 0.3; the probe uses 0.6),
+`--top_k` (candidate set size, default 10), `--max_iters` (per-block cap, default 32),
+`--no_mask_residual` (feed talk the no-mask top-K — match a talk trained with
+`keep_mask_residual=false`), `--limit` (number of GSM8K test problems), `--debug_print`
+(dump the full generation per example).
+
+### Per-block diagnostic probe (no full decode)
+
+[`dFactory/tasks/t3d_probe_converged_teacher.py`](./dFactory/tasks/t3d_probe_converged_teacher.py)
+compares the strategies on two consecutive blocks of a few prompts, split into the committed
+prefix vs the still-masked tail, with per-position confidence + per-method think/talk forward
+counts and wall/model timing. Use it to see *where* a method diverges before paying for a full
+eval run.
+
+```bash
+python -m tasks.t3d_probe_converged_teacher --think_path $THINK --talk_path $TALK \
+  --block_length 32 --top_k 10 --threshold 0.6 --gen_block 1 --limit 5
+```
+
 ## Acknowledgements
 
 This repository builds on two prior projects:

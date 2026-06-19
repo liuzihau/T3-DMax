@@ -1,14 +1,27 @@
 """Block 4 — anchor-free top-K talk: GSM8K decode + eval.
 
-Scores a trained top-K talk against the full-DMax baseline. Decode paradigm
-(matches T3D_TOPK_TALK_PLAN.md):
-  per response block:
-    * THINK (full 20-layer) runs ONCE on [committed prefix + all-masked block]
-      -> per-position top-K candidates for the block.
-    * TALK (10-layer) iterates: still-masked positions are fed think's top-K
-      soft-embedding (keep_mask_residual=True, inference variant); committed
-      positions keep their token embedding. Commit at threshold 0.3 (DMax
-      decode_uniform rule), stop at 0.9 / no-change / block full.
+Scores a trained top-K talk against the full-DMax baseline over the WHOLE GSM8K
+response. Five decode methods are available via --decode_mode (see DECODE_MODES
+below). They fall into two families:
+
+  (A) think-as-CANDIDATE  [think never commits, TALK always commits]
+      * seed  : per block, THINK runs once (or --seed_passes times) producing
+                per-position top-K candidates; TALK iterates -- still-masked
+                positions fed think's (then its OWN) top-K soft-embedding,
+                committed positions keep their token embedding. Commit at the
+                DMax decode_uniform rule (--threshold), 0.9 early-stop. This is
+                the H1 inference dynamic the training targets (think once/block).
+
+  (B) think-as-DECODER  [whichever model runs that step COMMITS its own prefix]
+      ported from t3d_probe_converged_teacher.mixed_converge. Per block a
+      schedule(i)->'think'|'talk' picks the model for step i; a think step feeds
+      bare [MASK] at undecided positions, a talk step feeds the top-K soft-embed
+      of the PREVIOUS pass's logits (think's if the prev step was think, else the
+      talk's own). Loops UNTIL the block is fully committed, capped at --max_iters
+      (=block_length=32) decoding steps. Modes:
+      * cross           : think->talk->think->talk... (strict alternation)
+      * think_then_talk : think x N (commit) then talk... (N=--think_seed_count, default 2)
+      * think_only      : pure DMax baseline (think decoded alone to convergence)
 
 Compute: think_forwards (20-layer) + talk_forwards (10-layer). The 20-layer-
 equivalent cost = think_fwd + 0.5*talk_fwd, vs full DMax = iters*1.0.
@@ -17,7 +30,7 @@ Run:
   python -m tasks.t3d_topk_eval_gsm8k \
     --think_path ../DMax-Math-16B-moe-merge \
     --talk_path  ./t3_topk_talk_merged_only_outputs/<hf_ckpt>  (or ../merged_10L untrained baseline) \
-    --gen_length 512 --block_length 32 --threshold 0.3 --top_k 10 --limit 200
+    --decode_mode seed --gen_length 512 --block_length 32 --threshold 0.3 --top_k 10 --limit 200
 """
 
 from __future__ import annotations
@@ -67,12 +80,15 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
 @torch.no_grad()
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
-                     seed_passes=1):
+                     seed_passes=1, early_stop=False, eos_id=None):
     """Stage-2 inference dynamic (matches training): per block, think SEEDS the first
     `seed_passes` talk passes (think's top-K candidates); thereafter the talk iterates on its
     OWN previous-pass top-K (think is gone -> the H1 think-once-or-twice compute win). Commit =
     the talk's confident left-to-right prefix (DMax rule). seed_passes=1 -> think once/block;
-    2 -> twice. think_fwd = seed_passes-per-block (the cheap cost); talk_fwd = passes/block."""
+    2 -> twice. think_fwd = seed_passes-per-block (the cheap cost); talk_fwd = passes/block.
+    The per-block 0.9 / no-change Breakflag (DMax decode_uniform rule) is ALWAYS on here. With
+    early_stop+eos_id, also stop generating further blocks once a block commits EOS (DMax
+    generate_uniform's sequence-level stop; batch-filtering is a no-op at batch=1)."""
     P = prompt_ids.shape[1]
     L = ((P + gen_length + block_length - 1) // block_length) * block_length
     x = torch.full((1, L), mask_id, dtype=torch.long, device=device)
@@ -111,6 +127,92 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
             x[:, bs:be] = torch.where(high_conf, x0, block_x)
             if breakflag:
                 break
+        if early_stop and eos_id is not None and bool((x[:, bs:be] == eos_id).any()):
+            if be < L:                                          # EOS in this block -> rest of seq is done
+                x[:, be:] = eos_id
+            break
+    return x[:, P:P + gen_length], think_fwd, talk_fwd
+
+
+# ---- think-as-DECODER family (ported from t3d_probe_converged_teacher.mixed_converge) ----
+def _schedule(mode, think_seed_count):
+    """Return schedule(i)->'think'|'talk' for the think-as-decoder modes."""
+    if mode == "cross":            # think->talk->think->talk... (Method D)
+        return lambda i: "think" if i % 2 == 0 else "talk"
+    if mode == "think_then_talk":  # think x N (commit), then talk... (Method C, N default 2)
+        n = max(1, think_seed_count)
+        return lambda i: "think" if i < n else "talk"
+    if mode == "think_only":       # pure DMax baseline (think decoded alone to convergence)
+        return lambda i: "think"
+    raise ValueError(f"unknown mixed decode mode: {mode}")
+
+
+@torch.no_grad()
+def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length, block_length,
+                 threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
+                 early_stop=False, eos_id=None):
+    """Full-response decode where a per-block schedule(i)->'think'|'talk' picks the model for step i and
+    THAT model commits its own confident left-to-right prefix (DMax rule). think step = bare [MASK] at
+    undecided positions; talk step = top-K soft-embed of the PREVIOUS pass's logits (think's if the prev
+    step was think, else the talk's own). Ports mixed_converge to the whole sequence, but DROPS the
+    probe's extra convergence-check forward (the committed ids are the output -- no need to re-read them).
+
+    Block-end gate:
+      * early_stop=False (default): loop until the block is fully committed (no masked positions left),
+        capped at max_iters (=block_length) -- the dmax prefix rule commits >=1 position/step so a
+        32-token block converges in <=32 steps. This is the probe's 'until converged'.
+      * early_stop=True: ALSO end the block on DMax decode_uniform's Breakflag -- all active positions
+        >=0.9 OR nothing changed this step (parallel_strategy.py:578-590). Matches the seed path / DMax,
+        so compute is comparable across modes.
+    With early_stop+eos_id, also stop generating further blocks once a block commits EOS (DMax
+    generate_uniform's sequence-level stop; batch-filtering is a no-op at batch=1).
+    Returns (response_ids, think_fwd, talk_fwd)."""
+    P = prompt_ids.shape[1]
+    L = ((P + gen_length + block_length - 1) // block_length) * block_length
+    x = torch.full((1, L), mask_id, dtype=torch.long, device=device)
+    x[:, :P] = prompt_ids
+    attn = build_block_causal_mask(L, block_length, dtype, device)
+    pos = torch.arange(L, device=device).unsqueeze(0)
+    first_b, num_b = P // block_length, L // block_length
+    think_fwd = talk_fwd = 0
+
+    for b in range(first_b, num_b):
+        bs, be = b * block_length, (b + 1) * block_length
+        m, p = attn[:, :, :be, :be], pos[:, :be]
+        cand = None                                            # the previous pass's block logits (top-K src)
+        for it in range(max_iters):
+            block_x = x[:, bs:be]
+            mask_index = (block_x == mask_id)
+            if not bool(mask_index.any()):
+                break
+            if schedule(it) == "think":                        # THINK decodes: bare [MASK] input, think commits
+                logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
+                               position_ids=p, use_cache=False, return_dict=True).logits[:, bs:be]
+                think_fwd += 1
+            else:                                              # TALK decodes: fed prev pass's top-K, talk commits
+                src = cand
+                if src is None:                                # block STARTS on a talk step -> 1 bootstrap think
+                    src = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+                                use_cache=False, return_dict=True).logits[:, bs:be]
+                    think_fwd += 1
+                soft = build_topk_soft_embeds(src, emb, mask_id, top_k=top_k,
+                                              keep_mask_residual=keep_mask_residual)
+                inp = emb(x[:, :be]).clone()
+                inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)
+                logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
+                              use_cache=False, return_dict=True).logits[:, bs:be]
+                talk_fwd += 1
+            cand = logits                                      # feed this pass's top-K forward
+            x0, high_conf, _, breakflag = dmax_commit_uniform(logits, mask_index, mask_index, threshold)
+            new_block = torch.where(high_conf, x0, block_x)
+            changed = bool((new_block != block_x).any())
+            x[:, bs:be] = new_block
+            if early_stop and (breakflag or not changed):      # DMax Breakflag: all>=0.9 OR no-change
+                break
+        if early_stop and eos_id is not None and bool((x[:, bs:be] == eos_id).any()):
+            if be < L:                                          # EOS in this block -> rest of seq is done
+                x[:, be:] = eos_id
+            break
     return x[:, P:P + gen_length], think_fwd, talk_fwd
 
 
@@ -158,9 +260,25 @@ def main():
                     help="Feed the talk no-mask top-K (matches training keep_mask_residual=False). "
                          "Try this first — the mask-residual default is off-distribution for the talk.")
     ap.add_argument("--seed_passes", type=int, default=1,
-                    help="Stage-2 dynamic: think SEEDS the first N talk passes per block (think's top-K); "
+                    help="[seed mode] think SEEDS the first N talk passes per block (think's top-K); "
                          "thereafter the talk iterates on its OWN previous top-K (think gone). 1 = think "
                          "once/block (the H1 target), 2 = twice. think cost = N forwards/block.")
+    ap.add_argument("--decode_mode", default="seed",
+                    choices=["seed", "cross", "think_then_talk", "think_only"],
+                    help="seed = think-as-candidate / talk-commits (H1 dynamic, uses --seed_passes). "
+                         "cross/think_then_talk/think_only = think-as-decoder family (whoever runs commits; "
+                         "ported from t3d_probe_converged_teacher.mixed_converge, capped at --max_iters/block). "
+                         "cross = think->talk->think->talk; think_then_talk = think x N then talk "
+                         "(N=--think_seed_count); think_only = pure DMax baseline.")
+    ap.add_argument("--think_seed_count", type=int, default=2,
+                    help="[think_then_talk mode] number of leading think COMMIT passes before talk takes over.")
+    ap.add_argument("--early_stop", action="store_true",
+                    help="Apply DMax's full early termination: per-block end on all-active>=0.9 OR no-change "
+                         "(decode_uniform Breakflag), AND stop generating further blocks once EOS is committed "
+                         "(generate_uniform seq stop). For 'seed' the 0.9 gate is already always on; this flag "
+                         "adds the EOS stop. For the mixed modes it adds BOTH (else they run each block to full "
+                         "converge). Turn ON for compute comparable to seed/DMax.")
+    ap.add_argument("--eos_id", type=int, default=156892, help="EOS token id (DMax LLaDA-2.0 = 156892).")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -177,7 +295,9 @@ def main():
             for r in load_dataset("gsm8k", "main", split="test")]
     if args.limit:
         rows = rows[:args.limit]
-    print(f"[eval] {len(rows)} problems  gen={args.gen_length} block={args.block_length} top_k={args.top_k}")
+    sched = None if args.decode_mode == "seed" else _schedule(args.decode_mode, args.think_seed_count)
+    print(f"[eval] {len(rows)} problems  mode={args.decode_mode} gen={args.gen_length} "
+          f"block={args.block_length} top_k={args.top_k}")
 
     n_ok = tot_think = tot_talk = 0
     t0 = time.time()
@@ -185,12 +305,21 @@ def main():
         messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
         prompt_ids = tok.apply_chat_template(messages, add_generation_prompt=True,
                                              tokenize=True, return_tensors="pt").to(args.device)
-        resp, th, tk = decode_topk_talk(think, talk, emb, mask_id, prompt_ids,
+        if sched is None:                                      # seed mode: think-as-candidate / talk-commits
+            resp, th, tk = decode_topk_talk(think, talk, emb, mask_id, prompt_ids,
+                                            gen_length=args.gen_length, block_length=args.block_length,
+                                            threshold=args.threshold, top_k=args.top_k,
+                                            max_iters=args.max_iters, device=args.device, dtype=dtype,
+                                            keep_mask_residual=not args.no_mask_residual,
+                                            seed_passes=args.seed_passes,
+                                            early_stop=args.early_stop, eos_id=args.eos_id)
+        else:                                                  # think-as-decoder family (cross / think_then_talk / think_only)
+            resp, th, tk = decode_mixed(think, talk, emb, mask_id, prompt_ids, schedule=sched,
                                         gen_length=args.gen_length, block_length=args.block_length,
                                         threshold=args.threshold, top_k=args.top_k,
                                         max_iters=args.max_iters, device=args.device, dtype=dtype,
                                         keep_mask_residual=not args.no_mask_residual,
-                                        seed_passes=args.seed_passes)
+                                        early_stop=args.early_stop, eos_id=args.eos_id)
         text = tok.decode(resp[0], skip_special_tokens=True)
         gold, pred = gold_answer(row["answer"]), pred_answer(text)
         ok = is_correct(pred, gold)
@@ -207,7 +336,7 @@ def main():
     n = len(rows)
     cost20 = tot_think + 0.5 * tot_talk            # 20-layer-equivalent forwards
     print("=" * 70)
-    print(f"[eval] GSM8K acc = {n_ok}/{n} = {n_ok/n:.3f}")
+    print(f"[eval] mode={args.decode_mode}  GSM8K acc = {n_ok}/{n} = {n_ok/n:.3f}")
     print(f"[eval] mean think/ex={tot_think/n:.1f}  talk/ex={tot_talk/n:.1f}  "
           f"20L-equiv/ex={cost20/n:.1f}  (full DMax ≈ iters*1.0)")
     print(f"[eval] {time.time()-t0:.0f}s. Baseline to beat: 84% @ gen512.")
