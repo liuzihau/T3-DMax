@@ -171,6 +171,11 @@ Two `seed` knobs targeting the rollout collapse:
 - **`--soft_commit`**: feed COMMITTED positions as DMax's soft top-K(+mask-residual) blend
   (`decode_uniform`'s committed=`soft_cond` behavior, `parallel_strategy.py:597,662`) instead of the
   hard token — keeps the committed region revisable so the candidate set can still shift across passes.
+- **`--think_refresh_every M`**: every M talk passes, re-run think on the talk's committed state and
+  replace the candidate pool with think's **fresh** context-aware top-K (think doesn't commit; talk
+  does). Isolates the talk-rollout collapse cause: if talk's per-pass conf rises and overlap-with-iter0
+  drops (fresh tokens enter), the wall is **stale candidates**, not talk capacity — and points at the
+  proven partial-depth refresh as the efficient fix. Cost: +1 think fwd per M talk passes.
 
 ```bash
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \

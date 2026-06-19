@@ -152,7 +152,8 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold, fallback=Tr
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
                      seed_passes=1, early_stop=False, eos_id=None, trace=None,
-                     think_commit_threshold=0.0, think_commit_passes=1, soft_commit=False):
+                     think_commit_threshold=0.0, think_commit_passes=1, think_refresh_every=0,
+                     soft_commit=False):
     """The H1 inference dynamic. Per block, two phases:
 
       THINK-COMMIT (request 1; only if think_commit_threshold>0): think runs `think_commit_passes`
@@ -166,6 +167,12 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
       TALK: talk iterates the still-masked tail -- masked positions fed the top-K soft-embed of the
         current source logits (think's, then the talk's own), committing its confident prefix (DMax
         rule, WITH fallback so a block always finishes), 0.9/no-change Breakflag, until the block is full.
+
+      think_refresh_every M (>0): every M talk passes, RE-RUN think on the talk's current committed
+        state and replace the candidate source with think's FRESH (context-aware) top-K -- think does
+        NOT commit, talk still does. Tests whether the talk-rollout collapse is stale candidates (talk
+        frozen to iter-0's pool) vs talk capacity: if talk's conf rises and overlap-with-iter0 drops
+        (fresh tokens enter), stale candidates are the wall. Cost: +1 think fwd every M talk passes.
 
     soft_commit (request 2): feed COMMITTED positions to the model as the DMax soft top-K(+mask-residual)
       blend of their logits -- matching decode_uniform (parallel_strategy.py:597,662: committed = soft_cond
@@ -221,7 +228,7 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
                                   return_dict=True).logits[:, bs:be]
                 think_fwd += 1
                 prev_logits = th_logits
-                if trace is not None:
+                if trace is not None and think_topk is None:   # keep iter-0 as the overlap reference
                     think_topk = th_logits.topk(top_k, dim=-1).indices
                 x0, high_conf, _, _ = dmax_commit_uniform(th_logits, mask_index, mask_index,
                                                           think_commit_threshold, fallback=False)
@@ -235,12 +242,15 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
             mask_index = (block_x == mask_id)
             if not bool(mask_index.any()):
                 break
-            if think_commit_threshold == 0 and it < sp:        # legacy seed: think provides candidates
-                th_logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+            do_seed = (think_commit_threshold == 0 and it < sp)     # legacy seed: think provides candidates
+            do_refresh = (think_refresh_every > 0 and it > 0 and it % think_refresh_every == 0)
+            if do_seed or do_refresh:                               # (re)run think to REFRESH the candidate pool
+                th_in = emb(x[:, :be]) if do_seed else block_input(prev_logits, feed_masked_soft=False)
+                th_logits = think(inputs_embeds=th_in, attention_mask=m, position_ids=p,
                                   use_cache=False, return_dict=True).logits[:, bs:be]
                 think_fwd += 1
-                prev_logits = th_logits
-                if trace is not None:
+                prev_logits = th_logits                            # talk's next pass gets FRESH think candidates
+                if trace is not None and think_topk is None:       # keep iter-0 as the overlap reference
                     think_topk = th_logits.topk(top_k, dim=-1).indices
             talk_logits = talk(inputs_embeds=block_input(prev_logits, feed_masked_soft=True),
                                attention_mask=m, position_ids=p, use_cache=False,
@@ -464,6 +474,10 @@ def main():
                     help="[think-commit] number of think forwards in the commit phase. 1 (default) = think "
                          "ONCE/block (~16 think/ex, the H1 cost). >1 re-forwards think to commit more as "
                          "context fills (approaches think_only); stops early when a pass commits nothing.")
+    ap.add_argument("--think_refresh_every", type=int, default=0,
+                    help="[seed mode] >0: every M talk passes, re-run think on the committed state to REFRESH "
+                         "the candidate pool with fresh context-aware top-K (think doesn't commit; talk does). "
+                         "Isolates stale-candidates vs talk-capacity. Cost: +1 think fwd per M talk passes.")
     ap.add_argument("--soft_commit", action="store_true",
                     help="[seed mode] feed COMMITTED positions as the DMax soft top-K(+mask-residual) blend "
                          "(decode_uniform's committed=soft_cond behavior) instead of the hard token embedding "
@@ -506,6 +520,7 @@ def main():
                                             early_stop=args.early_stop, eos_id=args.eos_id, trace=trace,
                                             think_commit_threshold=args.think_commit_threshold,
                                             think_commit_passes=args.think_commit_passes,
+                                            think_refresh_every=args.think_refresh_every,
                                             soft_commit=args.soft_commit)
         else:                                                  # think-as-decoder family (cross / think_then_talk / think_only)
             resp, th, tk = decode_mixed(think, talk, emb, mask_id, prompt_ids, schedule=sched,
