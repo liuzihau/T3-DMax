@@ -31,10 +31,11 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./t3_topk_stage1_coldstart_outputs
+  output_dir: ./t3_topk_stage1_window8_outputs
 
   think_path: ../DMax-Math-16B-moe-merge
   t3_top_k: 10
+  t3_loss_window_k: 8                   # QUICK TRIAL: loss only on [block_start, last_revealed + 8] per block (0 = off)
   t3_train_layers: "5,6,7,8,9"          # CAPACITY: back half (~3.7B) — diagnostic showed 2 layers too weak.
                                         #   merged-only "6,8" (1.6B) ← here (5,6,7,8,9) ← all-10 "0,..,9" (7.4B, needs multi-GPU)
   t3_mask_token_id: 156895

@@ -121,6 +121,15 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "If use same token location labels. True: no shift, False: use next-token prediction shift."}
     )
+    t3_loss_window_k: int = field(
+        default=0,
+        metadata={"help": "Quick-trial loss window. >0: per block, count the loss ONLY on positions "
+                          "[block_start, last_revealed + k] (revealed/committed positions count too); "
+                          "positions beyond last_revealed+k are set to -100. last_revealed = the highest "
+                          "committed (non-mask) index in the block (block_start-1 if fully masked -> window = "
+                          "first k). Applied to Stage-1 CE (after gate-reveal) and Stage-2 KL (per pass). "
+                          "0 = off (loss on the whole response)."}
+    )
     # T3-D top-K talk ----------------------------------------------------------------
     think_path: str = field(
         default=None,
@@ -433,6 +442,32 @@ def _append_jsonl(path, record):
             fh.write(json.dumps(record) + "\n")
     except Exception as e:
         logger.warning_rank0(f"[t3d metrics] write failed {path}: {e}")
+
+
+def apply_loss_window(labels, ids, block_size, k, mask_id):
+    """Quick-trial loss window: per block, keep the loss ONLY on positions [block_start, last_revealed+k]
+    and set the rest of `labels` to -100. `revealed` = committed (non-mask) positions in `ids`; last_revealed
+    = the highest committed within-block index (-1 if the block is fully masked -> window = first k). Returns
+    a NEW labels tensor (the revealed prefix keeps its loss, since think's reveal is revised toward gold).
+    No-op when k<=0. `labels` and `ids` are aligned [B, L] (the noisy half)."""
+    if k <= 0:
+        return labels
+    B, L = ids.shape
+    dev = ids.device
+    pos = torch.arange(L, device=dev)
+    in_blk = pos % block_size                                          # [L] within-block index
+    blk_id = (pos // block_size).unsqueeze(0).expand(B, L)            # [B, L] block index
+    committed = ids != mask_id                                        # [B, L] revealed positions
+    cpos = torch.where(committed, in_blk.unsqueeze(0).expand(B, L),
+                       torch.full((B, L), -1, device=dev, dtype=torch.long))
+    n_blk = int((L + block_size - 1) // block_size)
+    last = torch.full((B, n_blk), -1, device=dev, dtype=torch.long)  # last committed in-block index per block
+    last.scatter_reduce_(1, blk_id, cpos, reduce="amax", include_self=True)
+    thr = last.gather(1, blk_id) + k                                  # [B, L] window upper bound (in-block)
+    keep = in_blk.unsqueeze(0) <= thr                                 # [B, L]
+    out = labels.clone()
+    out[~keep] = -100
+    return out
 
 
 @torch.no_grad()
@@ -1028,12 +1063,15 @@ def main():
                             logits_j = model(inputs_embeds=talk_in_j, attention_mask=_amask, position_ids=_pos,
                                              use_cache=False, output_router_logits=False).logits
                             nlj = logits_j[:, :L0].contiguous()
+                            # loss window (per pass: last_revealed grows as commits advance)
+                            _wlab = apply_loss_window(labels, _ids[:, :L0], args.train.block_size,
+                                                      args.train.t3_loss_window_k, mask_token_id)
                             if args.train.same_token_labels:
-                                _tl, _teach, _tlab = nlj, think_conv, labels
+                                _tl, _teach, _tlab = nlj, think_conv, _wlab
                             else:
                                 _tl = nlj[:, :-1, :].contiguous()
                                 _teach = think_conv[:, 1:].contiguous()
-                                _tlab = labels[:, 1:].contiguous()
+                                _tlab = _wlab[:, 1:].contiguous()
                             # KL to the CONVERGED think (think = gold); forward/reverse blend; NO gold CE.
                             kl_fwd = think_distill_loss(_tl, _teach, _tlab, temperature=_klT, reverse=False, kl_top_k=_kltk)
                             kl_rev = think_distill_loss(_tl, _teach, _tlab, temperature=_klT, reverse=True, kl_top_k=_kltk)
@@ -1071,6 +1109,8 @@ def main():
                         threshold=args.train.t3_commit_threshold, gate=_gate,
                         attention_mask=_amask, position_ids=_pos, max_iters=args.train.t3_converge_max_iters)
                     _ids[:, :L0] = _committed_ids                          # write think's gate-reveal into the noisy half
+                labels = apply_loss_window(labels, _ids[:, :L0], args.train.block_size,   # quick-trial loss window
+                                           args.train.t3_loss_window_k, mask_token_id)
                 if flag:                                                   # Path B: still-masked -> think top-K soft
                     talk_embeds = build_talk_inputs_embeds(
                         _ids, _gate_logits, think_emb, mask_token_id, mode="topk_soft",

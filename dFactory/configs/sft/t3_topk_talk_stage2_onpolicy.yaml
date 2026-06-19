@@ -20,8 +20,8 @@
 
 model:
   # <<< EDIT: point at the STAGE-1 checkpoint (the cold-start init), not merged_10L >>>
-  config_path: ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt
-  model_path:  ./t3_topk_stage1_coldstart_outputs/checkpoints/global_step_4000/hf_ckpt
+  config_path: ./t3_topk_stage1_window8_outputs/checkpoints/global_step_4000/hf_ckpt
+  model_path:  ./t3_topk_stage1_window8_outputs/checkpoints/global_step_4000/hf_ckpt
   tokenizer_path: ../merged_10L
   attn_implementation: sdpa
   moe_implementation: fused
@@ -38,10 +38,11 @@ data:
   num_workers: 16
 
 train:
-  output_dir: ./t3_topk_stage2_onpolicy_outputs
+  output_dir: ./t3_topk_stage2_window8_outputs
 
   think_path: ../DMax-Math-16B-moe-merge
   t3_top_k: 10
+  t3_loss_window_k: 8                   # QUICK TRIAL: loss only on [block_start, last_revealed + 8] per block (0 = off)
   t3_train_layers: "5,6,7,8,9"          # same capacity scope as Stage 1 (back half)
   t3_mask_token_id: 156895
 
