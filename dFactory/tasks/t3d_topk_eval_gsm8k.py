@@ -122,8 +122,13 @@ def build_block_causal_mask(L, block_length, dtype, device):
     return mask
 
 
-def dmax_commit_uniform(logits, mask_index, active_index, threshold):
-    """Left-to-right high-confidence prefix commit + 0.9 early-stop (DMax rule)."""
+def dmax_commit_uniform(logits, mask_index, active_index, threshold, fallback=True):
+    """Left-to-right high-confidence prefix commit + 0.9 early-stop (DMax rule).
+    fallback=True (DMax default): if NO masked position clears `threshold`, still commit the first
+    masked position (guarantees >=1 commit/pass -> a block always finishes). fallback=False: commit
+    ONLY the genuine >=threshold prefix, committing NOTHING when the leftmost masked position is
+    below threshold (used for the think-commit hand-off: think commits only what it's confident about
+    and leaves the uncertain tail to talk)."""
     x0 = logits.argmax(dim=-1)
     probs = F.softmax(logits.float(), dim=-1)
     max_probs = probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
@@ -131,10 +136,13 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
     is_low_conf = mask_index & (confidence < threshold)
     has_failed = torch.cumsum(is_low_conf.long(), dim=1) > 0
     candidates = mask_index & (~has_failed)
-    batch_has_sel = candidates.any(dim=-1, keepdim=True)
-    mask_cumsum = torch.cumsum(mask_index.long(), dim=1)
-    first_mask = (mask_cumsum == 1) & mask_index
-    high_conf = torch.where(batch_has_sel, candidates, first_mask)
+    if fallback:
+        batch_has_sel = candidates.any(dim=-1, keepdim=True)
+        mask_cumsum = torch.cumsum(mask_index.long(), dim=1)
+        first_mask = (mask_cumsum == 1) & mask_index
+        high_conf = torch.where(batch_has_sel, candidates, first_mask)
+    else:
+        high_conf = candidates
     breakflag = bool(active_index.any() and (max_probs[active_index] >= 0.9).all().item())
     return x0, high_conf, max_probs, breakflag
 
@@ -143,15 +151,27 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
 @torch.no_grad()
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
-                     seed_passes=1, early_stop=False, eos_id=None, trace=None):
-    """Stage-2 inference dynamic (matches training): per block, think SEEDS the first
-    `seed_passes` talk passes (think's top-K candidates); thereafter the talk iterates on its
-    OWN previous-pass top-K (think is gone -> the H1 think-once-or-twice compute win). Commit =
-    the talk's confident left-to-right prefix (DMax rule). seed_passes=1 -> think once/block;
-    2 -> twice. think_fwd = seed_passes-per-block (the cheap cost); talk_fwd = passes/block.
-    The per-block 0.9 / no-change Breakflag (DMax decode_uniform rule) is ALWAYS on here. With
-    early_stop+eos_id, also stop generating further blocks once a block commits EOS (DMax
-    generate_uniform's sequence-level stop; batch-filtering is a no-op at batch=1)."""
+                     seed_passes=1, early_stop=False, eos_id=None, trace=None,
+                     think_commit_threshold=0.0, soft_commit=False):
+    """The H1 inference dynamic. Per block, two phases:
+
+      THINK-COMMIT (request 1; only if think_commit_threshold>0): think iterates and COMMITS its own
+        confident left-to-right prefix at `think_commit_threshold` (e.g. 0.6), with NO fallback, until
+        a pass commits nothing new (think has exhausted what it's that-confident about). The uncertain
+        tail is left masked for talk. think's last logits seed talk's first pass. (think_commit_threshold
+        =0 -> legacy seed: think only SEEDS `seed_passes` talk passes with candidates, never commits.)
+      TALK: talk iterates the still-masked tail -- masked positions fed the top-K soft-embed of the
+        current source logits (think's, then the talk's own), committing its confident prefix (DMax
+        rule, WITH fallback so a block always finishes), 0.9/no-change Breakflag, until the block is full.
+
+    soft_commit (request 2): feed COMMITTED positions to the model as the DMax soft top-K(+mask-residual)
+      blend of their logits -- matching decode_uniform (parallel_strategy.py:597,662: committed = soft_cond
+      gets soft_embeds) -- instead of the hard token embedding. Keeps the committed region 'alive'/revisable
+      so the candidate set can still shift across passes.
+
+    With early_stop+eos_id, stop generating further blocks once a block commits EOS (DMax
+    generate_uniform's sequence-level stop; batch-filtering is a no-op at batch=1).
+    Returns (response_ids, think_fwd, talk_fwd)."""
     P = prompt_ids.shape[1]
     L = ((P + gen_length + block_length - 1) // block_length) * block_length
     x = torch.full((1, L), mask_id, dtype=torch.long, device=device)
@@ -165,31 +185,65 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
     for b in range(first_b, num_b):
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
-        prev_talk = None                                       # the talk's own previous block logits
+
+        def block_input(src_logits, feed_masked_soft):
+            """Build the talk/think input. committed positions: DMax soft blend if soft_commit else hard
+            token. masked positions: top-K candidate soft if feed_masked_soft (talk) else bare [MASK]
+            (think generates). src_logits = the block [1,B,V] whose top-K we blend; None -> all hard."""
+            inp = emb(x[:, :be]).clone()
+            if src_logits is None:
+                return inp
+            blk = inp[:, bs:be]
+            mi = (x[:, bs:be] == mask_id)
+            soft = build_topk_soft_embeds(src_logits, emb, mask_id, top_k=top_k,
+                                          keep_mask_residual=keep_mask_residual)
+            if soft_commit:
+                blk[~mi] = soft[~mi].to(inp.dtype)             # committed -> DMax soft mix
+            if feed_masked_soft:
+                blk[mi] = soft[mi].to(inp.dtype)               # masked -> top-K candidates
+            return inp
+
+        prev_logits = None                                     # source for the soft blend (think seed / talk prev)
         think_topk = None                                      # think's seed top-K ids [1,B,K] (drift ref)
         passes = 0
+
+        # ---- THINK-COMMIT PHASE (request 1) ----
+        if think_commit_threshold > 0:
+            for _ in range(max_iters):
+                mask_index = (x[:, bs:be] == mask_id)
+                if not bool(mask_index.any()):
+                    break
+                th_logits = think(inputs_embeds=block_input(prev_logits, feed_masked_soft=False),
+                                  attention_mask=m, position_ids=p, use_cache=False,
+                                  return_dict=True).logits[:, bs:be]
+                think_fwd += 1
+                prev_logits = th_logits
+                if trace is not None:
+                    think_topk = th_logits.topk(top_k, dim=-1).indices
+                x0, high_conf, _, _ = dmax_commit_uniform(th_logits, mask_index, mask_index,
+                                                          think_commit_threshold, fallback=False)
+                if not bool(high_conf.any()):                  # think exhausted its >=thr confidence -> talk
+                    break
+                x[:, bs:be] = torch.where(high_conf, x0, x[:, bs:be])
+
+        # ---- TALK PHASE ----
         for it in range(max_iters):
             block_x = x[:, bs:be]
             mask_index = (block_x == mask_id)
             if not bool(mask_index.any()):
                 break
-            if it < sp:                                        # THINK SEED: think's top-K on the current block
-                think_logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
-                                     position_ids=p, use_cache=False, return_dict=True).logits
+            if think_commit_threshold == 0 and it < sp:        # legacy seed: think provides candidates
+                th_logits = think(inputs_embeds=emb(x[:, :be]), attention_mask=m, position_ids=p,
+                                  use_cache=False, return_dict=True).logits[:, bs:be]
                 think_fwd += 1
-                soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, mask_id,
-                                              top_k=top_k, keep_mask_residual=keep_mask_residual)
-                if trace is not None:                          # snapshot think's seed top-K for the drift metric
-                    think_topk = think_logits[:, bs:be].topk(top_k, dim=-1).indices
-            else:                                              # TALK's OWN previous top-K (think gone)
-                soft = build_topk_soft_embeds(prev_talk, emb, mask_id,
-                                              top_k=top_k, keep_mask_residual=keep_mask_residual)
-            inp = emb(x[:, :be]).clone()                       # committed -> token embed
-            inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)        # masked -> candidates
-            talk_logits = talk(inputs_embeds=inp, attention_mask=m, position_ids=p,
-                               use_cache=False, return_dict=True).logits[:, bs:be]
+                prev_logits = th_logits
+                if trace is not None:
+                    think_topk = th_logits.topk(top_k, dim=-1).indices
+            talk_logits = talk(inputs_embeds=block_input(prev_logits, feed_masked_soft=True),
+                               attention_mask=m, position_ids=p, use_cache=False,
+                               return_dict=True).logits[:, bs:be]
             talk_fwd += 1
-            prev_talk = talk_logits                            # feed the talk's own top-K forward
+            prev_logits = talk_logits                          # feed the talk's own top-K forward
             x0, high_conf, max_probs, breakflag = dmax_commit_uniform(talk_logits, mask_index, mask_index, threshold)
             committed = high_conf & mask_index                 # newly committed this pass
             x[:, bs:be] = torch.where(high_conf, x0, block_x)
@@ -197,7 +251,7 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
             if trace is not None:
                 n_commit = int(committed.sum())
                 mean_conf = float(max_probs[mask_index].mean()) if bool(mask_index.any()) else float("nan")
-                if n_commit and think_topk is not None:        # overlap of committed tokens with think's seed top-K
+                if n_commit and think_topk is not None:        # overlap of committed tokens with think's top-K
                     in_topk = (think_topk[0] == x0[0].unsqueeze(-1)).any(-1)   # [B] bool
                     ovl = float(in_topk[committed[0]].float().mean())
                 else:
@@ -377,6 +431,14 @@ def main():
                     help="[seed mode only] collect a rollout-convergence trace (per-pass commits / talk "
                          "confidence / overlap-with-think-seed, per-block passes+repetition, no-EOS) to pin "
                          "the talk self-rollout collapse mode (starvation / drift / degeneracy).")
+    ap.add_argument("--think_commit_threshold", type=float, default=0.0,
+                    help="[seed mode] >0 turns on the think-commit hand-off: think commits its own >=thr "
+                         "confident prefix (no fallback) until it stalls, then talk does the uncertain tail. "
+                         "0 = legacy seed (think only seeds candidates, never commits). Try 0.6.")
+    ap.add_argument("--soft_commit", action="store_true",
+                    help="[seed mode] feed COMMITTED positions as the DMax soft top-K(+mask-residual) blend "
+                         "(decode_uniform's committed=soft_cond behavior) instead of the hard token embedding "
+                         "-- keeps the committed region revisable.")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -414,7 +476,9 @@ def main():
                                             max_iters=args.max_iters, device=args.device, dtype=dtype,
                                             keep_mask_residual=not args.no_mask_residual,
                                             seed_passes=args.seed_passes,
-                                            early_stop=args.early_stop, eos_id=args.eos_id, trace=trace)
+                                            early_stop=args.early_stop, eos_id=args.eos_id, trace=trace,
+                                            think_commit_threshold=args.think_commit_threshold,
+                                            soft_commit=args.soft_commit)
         else:                                                  # think-as-decoder family (cross / think_then_talk / think_only)
             resp, th, tk = decode_mixed(think, talk, emb, mask_id, prompt_ids, schedule=sched,
                                         gen_length=args.gen_length, block_length=args.block_length,

@@ -160,6 +160,21 @@ python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
   --decode_mode think_only --limit 200
 ```
 
+### Think-commit hand-off + soft-commit (`seed` mode)
+
+Two `seed` knobs targeting the rollout collapse:
+- **`--think_commit_threshold` (e.g. 0.6)**: think first COMMITS its own ≥-threshold confident prefix
+  (no fallback) until it stalls, then talk takes only the uncertain tail. think handles the reliable
+  bulk; talk is no longer starved on easy tokens. (`0` = legacy seed: think only seeds candidates.)
+- **`--soft_commit`**: feed COMMITTED positions as DMax's soft top-K(+mask-residual) blend
+  (`decode_uniform`'s committed=`soft_cond` behavior, `parallel_strategy.py:597,662`) instead of the
+  hard token — keeps the committed region revisable so the candidate set can still shift across passes.
+
+```bash
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode seed --think_commit_threshold 0.6 --soft_commit --trace --limit 50
+```
+
 ### Early-stop (DMax termination) and other knobs
 
 By default `seed` uses DMax's per-block Breakflag (all active ≥ 0.9 **or** no-change;
