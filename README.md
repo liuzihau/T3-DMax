@@ -197,6 +197,35 @@ python -m tasks.t3d_probe_converged_teacher --think_path $THINK --talk_path $TAL
   --block_length 32 --top_k 10 --threshold 0.6 --gen_block 1 --limit 5
 ```
 
+### Why is talk worse than think? — block-window diagnostics
+
+Two tools to test the hypothesis that **talk has a shorter reliable decode window than think**
+(so a smaller `block_size` would close the gap), *before* committing to a retrain.
+
+**A — block-size sweep** ([`scripts/sweep_block_size.sh`](./dFactory/scripts/sweep_block_size.sh)):
+runs the eval across `{block size} x {mode}` and tabulates acc + compute. The decisive read is the
+**gap** — if `think_only` barely moves 32→8 but `seed` (talk) improves a lot, talk has the shorter
+window and retraining at a smaller block is justified; if both move together it's just the generic
+quality/parallelism trade-off and block-8 won't help.
+
+```bash
+cd dFactory
+THINK=$THINK TALK=$TALK LIMIT=50 MODES="think_only seed" BLS="32 16 8" \
+  bash scripts/sweep_block_size.sh
+```
+
+**B — within-block-position profile**
+([`dFactory/tasks/t3d_position_profile.py`](./dFactory/tasks/t3d_position_profile.py)): on a
+fully-masked block, measures per within-block position `j` each model's single-forward confidence
+and agreement with think's converged decode (the per-token truth proxy). Prints a per-position +
+binned table and the **reliable window** (largest prefix with agreement ≥ `--window_floor`).
+`talk window << think window` confirms the hypothesis mechanistically.
+
+```bash
+python -m tasks.t3d_position_profile --think_path $THINK --talk_path $TALK \
+  --block_length 32 --top_k 10 --threshold 0.3 --gen_block 1 --limit 50
+```
+
 ## Acknowledgements
 
 This repository builds on two prior projects:
