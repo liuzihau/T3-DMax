@@ -325,6 +325,7 @@ def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length,
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
         cand = None                                            # the previous pass's block logits (top-K src)
+        block_topk = None                                      # the FIRST pass's (iter-0) top-K ids [1,B,K]
         passes = 0
         for it in range(max_iters):
             block_x = x[:, bs:be]
@@ -356,8 +357,16 @@ def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length,
             x[:, bs:be] = new_block
             passes += 1
             if trace is not None:                              # conf = the DECIDING model's conf at masked pos
+                if block_topk is None:                         # snapshot the FIRST pass's (iter-0) top-K as ref
+                    block_topk = logits.topk(top_k, dim=-1).indices
+                n_commit = int(committed.sum())
                 mean_conf = float(max_probs[mask_index].mean()) if bool(mask_index.any()) else float("nan")
-                trace.add_pass(it, int(committed.sum()), mean_conf, float("nan"))   # overlap n/a for mixed
+                if n_commit:                                   # overlap of commits with the FIRST iteration's top-K
+                    in_topk = (block_topk[0] == x0[0].unsqueeze(-1)).any(-1)       # [B] bool
+                    ovl = float(in_topk[committed[0]].float().mean())
+                else:
+                    ovl = float("nan")
+                trace.add_pass(it, n_commit, mean_conf, ovl)
             if early_stop and (breakflag or not changed):      # DMax Breakflag: all>=0.9 OR no-change
                 break
         if trace is not None:

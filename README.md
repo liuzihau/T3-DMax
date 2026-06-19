@@ -245,12 +245,14 @@ python -m tasks.t3d_position_profile --think_path $THINK --talk_path $TALK \
 
 **Rollout-collapse trace** (`--trace`): instruments the decode to pin *which* failure it is. Per
 within-block pass index it logs commits/pass, the deciding model's confidence, and **overlap of
-commits with think's seed top-K** (`seed` mode only); per block, passes-to-converge + adjacent-repeat
-fraction + cap-hit rate; per sequence, no-EOS. On `seed`: overlap falling = **coverage drift**;
-commits/pass ≈ 1 = **commit starvation**; high repeat fraction = **soft-embed degeneracy**. On
-`think_only` it gives the **baseline confidence distribution** at the same threshold — compare its
-per-pass conf (high, rising, converges in ~3–4 passes) against `seed`'s talk conf (low, flat,
-grinds 20–32 passes) to see the gap is fresh-vs-stale candidates, not the commit threshold.
+commits with the FIRST iteration's (iter-0) top-K** (think's seed in `seed` mode, pass-0 think in the
+mixed modes); per block, passes-to-converge + adjacent-repeat fraction + cap-hit rate; per sequence,
+no-EOS. On `seed`: overlap falling = **coverage drift**; commits/pass ≈ 1 = **commit starvation**;
+high repeat fraction = **soft-embed degeneracy**. On `think_only` it gives the **baseline confidence
+distribution** at the same threshold (per-pass conf high/holding, converges in ~3–4 passes vs `seed`'s
+flat-0.14 grind = fresh-vs-stale candidates, not the threshold); its **overlap** also shows whether
+think's refinement stays inside iter-0's top-K or pulls in fresh tokens (overlap < 1 = fresh
+candidates — exactly what talk's stale self-loop can't do).
 
 ```bash
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
