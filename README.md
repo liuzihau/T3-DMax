@@ -243,12 +243,14 @@ python -m tasks.t3d_position_profile --think_path $THINK --talk_path $TALK \
   --block_length 32 --top_k 10 --threshold 0.3 --gen_block 1 --limit 50
 ```
 
-**Rollout-collapse trace** (`--trace`, `seed` mode only): when the talk self-rollout collapses
-(`seed` → 0% / hundreds of talk passes), this instruments the decode to pin *which* failure it is.
-Per within-block pass index it logs commits/pass, talk confidence, and **overlap of talk's commits
-with think's seed top-K**; per block, passes-to-converge + adjacent-repeat fraction + cap-hit rate;
-per sequence, no-EOS. Signatures: overlap falling = **coverage drift**; commits/pass ≈ 1 =
-**commit starvation**; high repeat fraction = **soft-embed degeneracy**.
+**Rollout-collapse trace** (`--trace`): instruments the decode to pin *which* failure it is. Per
+within-block pass index it logs commits/pass, the deciding model's confidence, and **overlap of
+commits with think's seed top-K** (`seed` mode only); per block, passes-to-converge + adjacent-repeat
+fraction + cap-hit rate; per sequence, no-EOS. On `seed`: overlap falling = **coverage drift**;
+commits/pass ≈ 1 = **commit starvation**; high repeat fraction = **soft-embed degeneracy**. On
+`think_only` it gives the **baseline confidence distribution** at the same threshold — compare its
+per-pass conf (high, rising, converges in ~3–4 passes) against `seed`'s talk conf (low, flat,
+grinds 20–32 passes) to see the gap is fresh-vs-stale candidates, not the commit threshold.
 
 ```bash
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \

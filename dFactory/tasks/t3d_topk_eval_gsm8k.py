@@ -82,8 +82,8 @@ class RolloutTrace:
     def report(self):
         import statistics as st
         print("=" * 78)
-        print("[trace] seed-rollout convergence (per within-block pass index)")
-        print(f"  {'pass':>4} | {'n_blk':>5} | {'commits':>7} | {'talk_conf':>9} | {'overlap_w_think':>15}")
+        print("[trace] rollout convergence (per within-block pass index)")
+        print(f"  {'pass':>4} | {'n_blk':>5} | {'commits':>7} | {'conf':>9} | {'overlap_w_think':>15}")
         for it in sorted(self.p_n):
             n = self.p_n[it]
             ovl = self.p_ovl[it] / self.p_ovl_n[it] if self.p_ovl_n[it] else float("nan")
@@ -295,7 +295,7 @@ def _schedule(mode, think_seed_count, think_per_cycle=1, talk_per_cycle=1):
 @torch.no_grad()
 def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length, block_length,
                  threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
-                 early_stop=False, eos_id=None):
+                 early_stop=False, eos_id=None, trace=None):
     """Full-response decode where a per-block schedule(i)->'think'|'talk' picks the model for step i and
     THAT model commits its own confident left-to-right prefix (DMax rule). think step = bare [MASK] at
     undecided positions; talk step = top-K soft-embed of the PREVIOUS pass's logits (think's if the prev
@@ -325,6 +325,7 @@ def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length,
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
         cand = None                                            # the previous pass's block logits (top-K src)
+        passes = 0
         for it in range(max_iters):
             block_x = x[:, bs:be]
             mask_index = (block_x == mask_id)
@@ -348,16 +349,27 @@ def decode_mixed(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length,
                               use_cache=False, return_dict=True).logits[:, bs:be]
                 talk_fwd += 1
             cand = logits                                      # feed this pass's top-K forward
-            x0, high_conf, _, breakflag = dmax_commit_uniform(logits, mask_index, mask_index, threshold)
+            x0, high_conf, max_probs, breakflag = dmax_commit_uniform(logits, mask_index, mask_index, threshold)
+            committed = high_conf & mask_index
             new_block = torch.where(high_conf, x0, block_x)
             changed = bool((new_block != block_x).any())
             x[:, bs:be] = new_block
+            passes += 1
+            if trace is not None:                              # conf = the DECIDING model's conf at masked pos
+                mean_conf = float(max_probs[mask_index].mean()) if bool(mask_index.any()) else float("nan")
+                trace.add_pass(it, int(committed.sum()), mean_conf, float("nan"))   # overlap n/a for mixed
             if early_stop and (breakflag or not changed):      # DMax Breakflag: all>=0.9 OR no-change
                 break
+        if trace is not None:
+            blk = x[:, bs:be]
+            rep = float((blk[0, 1:] == blk[0, :-1]).float().mean()) if block_length > 1 else 0.0
+            trace.add_block(passes, capped=bool((blk == mask_id).any()) or passes >= max_iters, rep=rep)
         if early_stop and eos_id is not None and bool((x[:, bs:be] == eos_id).any()):
             if be < L:                                          # EOS in this block -> rest of seq is done
                 x[:, be:] = eos_id
             break
+    if trace is not None:
+        trace.add_seq(no_eos=(eos_id is not None and not bool((x[:, P:P + gen_length] == eos_id).any())))
     return x[:, P:P + gen_length], think_fwd, talk_fwd
 
 
@@ -431,9 +443,10 @@ def main():
                          "converge). Turn ON for compute comparable to seed/DMax.")
     ap.add_argument("--eos_id", type=int, default=156892, help="EOS token id (DMax LLaDA-2.0 = 156892).")
     ap.add_argument("--trace", action="store_true",
-                    help="[seed mode only] collect a rollout-convergence trace (per-pass commits / talk "
-                         "confidence / overlap-with-think-seed, per-block passes+repetition, no-EOS) to pin "
-                         "the talk self-rollout collapse mode (starvation / drift / degeneracy).")
+                    help="collect a rollout-convergence trace (per-pass commits / deciding-model confidence "
+                         "/ overlap-with-think-seed [seed mode only], per-block passes+repetition, no-EOS). "
+                         "Use on `seed` to pin the talk collapse, or on `think_only` for the think confidence "
+                         "baseline at the same threshold.")
     ap.add_argument("--think_commit_threshold", type=float, default=0.0,
                     help="[seed mode] >0 turns on the think-commit hand-off: think commits its own >=thr "
                          "confident prefix (no fallback), then talk does the uncertain tail. "
@@ -464,9 +477,7 @@ def main():
         rows = rows[:args.limit]
     sched = None if args.decode_mode == "seed" else _schedule(
         args.decode_mode, args.think_seed_count, args.think_per_cycle, args.talk_per_cycle)
-    trace = RolloutTrace() if (args.trace and sched is None) else None
-    if args.trace and sched is not None:
-        print("[eval] --trace only applies to --decode_mode seed; ignoring.")
+    trace = RolloutTrace() if args.trace else None             # works for seed AND the mixed modes
     print(f"[eval] {len(rows)} problems  mode={args.decode_mode} gen={args.gen_length} "
           f"block={args.block_length} top_k={args.top_k}")
 
@@ -493,7 +504,7 @@ def main():
                                         threshold=args.threshold, top_k=args.top_k,
                                         max_iters=args.max_iters, device=args.device, dtype=dtype,
                                         keep_mask_residual=not args.no_mask_residual,
-                                        early_stop=args.early_stop, eos_id=args.eos_id)
+                                        early_stop=args.early_stop, eos_id=args.eos_id, trace=trace)
         text = tok.decode(resp[0], skip_special_tokens=True)
         gold, pred = gold_answer(row["answer"]), pred_answer(text)
         ok = is_correct(pred, gold)
