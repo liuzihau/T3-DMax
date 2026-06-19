@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import re
 import time
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +49,66 @@ from tasks.t3d_topk_talk import load_causal_lm
 from tasks.t3d_topk_soft_embed import build_topk_soft_embeds
 
 GSM8K_USER_TEMPLATE = "Question: {question}\nLet's think step by step\nAnswer:"
+
+
+# ---- seed-rollout convergence trace (diagnoses the talk self-rollout collapse) -----------------
+class RolloutTrace:
+    """Accumulates per-pass / per-block / per-sequence stats of the `seed` decode to pin the collapse
+    mode. The three suspects and their signatures:
+      * commit STARVATION  -> commits/pass ~1 (only the first-mask fallback), passes-to-converge high.
+      * coverage DRIFT     -> overlap-with-think-seed falls across pass index (talk leaves think's support).
+      * soft-embed DEGENERACY/repetition -> high adjacent-repeat fraction in committed blocks.
+    overlap = of the tokens talk COMMITS this pass, the fraction that lie in THINK's original seed top-K
+    at that position (1.0 at the seed pass; a fall over later passes = drift)."""
+
+    def __init__(self):
+        self.p_commit = defaultdict(float); self.p_conf = defaultdict(float)
+        self.p_ovl = defaultdict(float); self.p_ovl_n = defaultdict(int); self.p_n = defaultdict(int)
+        self.block_passes = []; self.block_rep = []; self.n_blocks = 0; self.n_capped = 0
+        self.n_seq = 0; self.n_no_eos = 0
+
+    def add_pass(self, it, n_commit, mean_conf, ovl):
+        self.p_commit[it] += n_commit; self.p_conf[it] += mean_conf; self.p_n[it] += 1
+        if ovl == ovl:                                              # not NaN (commits happened)
+            self.p_ovl[it] += ovl; self.p_ovl_n[it] += 1
+
+    def add_block(self, passes, capped, rep):
+        self.block_passes.append(passes); self.block_rep.append(rep)
+        self.n_blocks += 1; self.n_capped += int(capped)
+
+    def add_seq(self, no_eos):
+        self.n_seq += 1; self.n_no_eos += int(no_eos)
+
+    def report(self):
+        import statistics as st
+        print("=" * 78)
+        print("[trace] seed-rollout convergence (per within-block pass index)")
+        print(f"  {'pass':>4} | {'n_blk':>5} | {'commits':>7} | {'talk_conf':>9} | {'overlap_w_think':>15}")
+        for it in sorted(self.p_n):
+            n = self.p_n[it]
+            ovl = self.p_ovl[it] / self.p_ovl_n[it] if self.p_ovl_n[it] else float("nan")
+            print(f"  {it:>4} | {n:>5} | {self.p_commit[it]/n:>7.2f} | {self.p_conf[it]/n:>9.3f} | {ovl:>15.3f}")
+        bp = self.block_passes or [0]
+        print("-" * 78)
+        print(f"[trace] blocks={self.n_blocks}  passes/block: mean={st.mean(bp):.1f} max={max(bp)}  "
+              f"capped(hit max_iters)={self.n_capped}/{self.n_blocks} ({self.n_capped/max(1,self.n_blocks):.1%})")
+        print(f"[trace] adjacent-repeat frac/block: mean={st.mean(self.block_rep or [0]):.3f}  "
+              f"no-EOS seqs={self.n_no_eos}/{self.n_seq} ({self.n_no_eos/max(1,self.n_seq):.1%})")
+        # heuristic verdict
+        its = sorted(self.p_n)
+        early = [i for i in its if i < max(1, len(its)//3)]; late = [i for i in its if i >= 2*len(its)//3]
+        def _m(d, keys, dn=None):
+            num = sum(d[i] for i in keys); den = sum((dn or self.p_n)[i] for i in keys)
+            return num/den if den else float("nan")
+        ovl_e = _m(self.p_ovl, early, self.p_ovl_n); ovl_l = _m(self.p_ovl, late, self.p_ovl_n)
+        commits_l = _m(self.p_commit, late)
+        rep = st.mean(self.block_rep or [0])
+        print("-" * 78)
+        print(f"[trace] signals: overlap early={ovl_e:.3f} -> late={ovl_l:.3f} (DRIFT if falling); "
+              f"late commits/pass={commits_l:.2f} (STARVATION if ~1); rep={rep:.3f} (DEGENERACY if high)")
+
+
+# ---- proven decode helpers (copied from dinfer.decoding.generate_t3d) ----------
 
 
 # ---- proven decode helpers (copied from dinfer.decoding.generate_t3d) ----------
@@ -82,7 +143,7 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold):
 @torch.no_grad()
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
-                     seed_passes=1, early_stop=False, eos_id=None):
+                     seed_passes=1, early_stop=False, eos_id=None, trace=None):
     """Stage-2 inference dynamic (matches training): per block, think SEEDS the first
     `seed_passes` talk passes (think's top-K candidates); thereafter the talk iterates on its
     OWN previous-pass top-K (think is gone -> the H1 think-once-or-twice compute win). Commit =
@@ -105,6 +166,8 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
         bs, be = b * block_length, (b + 1) * block_length
         m, p = attn[:, :, :be, :be], pos[:, :be]
         prev_talk = None                                       # the talk's own previous block logits
+        think_topk = None                                      # think's seed top-K ids [1,B,K] (drift ref)
+        passes = 0
         for it in range(max_iters):
             block_x = x[:, bs:be]
             mask_index = (block_x == mask_id)
@@ -116,6 +179,8 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
                 think_fwd += 1
                 soft = build_topk_soft_embeds(think_logits[:, bs:be], emb, mask_id,
                                               top_k=top_k, keep_mask_residual=keep_mask_residual)
+                if trace is not None:                          # snapshot think's seed top-K for the drift metric
+                    think_topk = think_logits[:, bs:be].topk(top_k, dim=-1).indices
             else:                                              # TALK's OWN previous top-K (think gone)
                 soft = build_topk_soft_embeds(prev_talk, emb, mask_id,
                                               top_k=top_k, keep_mask_residual=keep_mask_residual)
@@ -125,14 +190,31 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
                                use_cache=False, return_dict=True).logits[:, bs:be]
             talk_fwd += 1
             prev_talk = talk_logits                            # feed the talk's own top-K forward
-            x0, high_conf, _, breakflag = dmax_commit_uniform(talk_logits, mask_index, mask_index, threshold)
+            x0, high_conf, max_probs, breakflag = dmax_commit_uniform(talk_logits, mask_index, mask_index, threshold)
+            committed = high_conf & mask_index                 # newly committed this pass
             x[:, bs:be] = torch.where(high_conf, x0, block_x)
+            passes += 1
+            if trace is not None:
+                n_commit = int(committed.sum())
+                mean_conf = float(max_probs[mask_index].mean()) if bool(mask_index.any()) else float("nan")
+                if n_commit and think_topk is not None:        # overlap of committed tokens with think's seed top-K
+                    in_topk = (think_topk[0] == x0[0].unsqueeze(-1)).any(-1)   # [B] bool
+                    ovl = float(in_topk[committed[0]].float().mean())
+                else:
+                    ovl = float("nan")
+                trace.add_pass(it, n_commit, mean_conf, ovl)
             if breakflag:
                 break
+        if trace is not None:
+            blk = x[:, bs:be]
+            rep = float((blk[0, 1:] == blk[0, :-1]).float().mean()) if block_length > 1 else 0.0
+            trace.add_block(passes, capped=bool((blk == mask_id).any()) or passes >= max_iters, rep=rep)
         if early_stop and eos_id is not None and bool((x[:, bs:be] == eos_id).any()):
             if be < L:                                          # EOS in this block -> rest of seq is done
                 x[:, be:] = eos_id
             break
+    if trace is not None:
+        trace.add_seq(no_eos=(eos_id is not None and not bool((x[:, P:P + gen_length] == eos_id).any())))
     return x[:, P:P + gen_length], think_fwd, talk_fwd
 
 
@@ -291,6 +373,10 @@ def main():
                          "adds the EOS stop. For the mixed modes it adds BOTH (else they run each block to full "
                          "converge). Turn ON for compute comparable to seed/DMax.")
     ap.add_argument("--eos_id", type=int, default=156892, help="EOS token id (DMax LLaDA-2.0 = 156892).")
+    ap.add_argument("--trace", action="store_true",
+                    help="[seed mode only] collect a rollout-convergence trace (per-pass commits / talk "
+                         "confidence / overlap-with-think-seed, per-block passes+repetition, no-EOS) to pin "
+                         "the talk self-rollout collapse mode (starvation / drift / degeneracy).")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -309,6 +395,9 @@ def main():
         rows = rows[:args.limit]
     sched = None if args.decode_mode == "seed" else _schedule(
         args.decode_mode, args.think_seed_count, args.think_per_cycle, args.talk_per_cycle)
+    trace = RolloutTrace() if (args.trace and sched is None) else None
+    if args.trace and sched is not None:
+        print("[eval] --trace only applies to --decode_mode seed; ignoring.")
     print(f"[eval] {len(rows)} problems  mode={args.decode_mode} gen={args.gen_length} "
           f"block={args.block_length} top_k={args.top_k}")
 
@@ -325,7 +414,7 @@ def main():
                                             max_iters=args.max_iters, device=args.device, dtype=dtype,
                                             keep_mask_residual=not args.no_mask_residual,
                                             seed_passes=args.seed_passes,
-                                            early_stop=args.early_stop, eos_id=args.eos_id)
+                                            early_stop=args.early_stop, eos_id=args.eos_id, trace=trace)
         else:                                                  # think-as-decoder family (cross / think_then_talk / think_only)
             resp, th, tk = decode_mixed(think, talk, emb, mask_id, prompt_ids, schedule=sched,
                                         gen_length=args.gen_length, block_length=args.block_length,
@@ -353,6 +442,8 @@ def main():
     print(f"[eval] mean think/ex={tot_think/n:.1f}  talk/ex={tot_talk/n:.1f}  "
           f"20L-equiv/ex={cost20/n:.1f}  (full DMax ≈ iters*1.0)")
     print(f"[eval] {time.time()-t0:.0f}s. Baseline to beat: 84% @ gen512.")
+    if trace is not None:
+        trace.report()
 
 
 if __name__ == "__main__":
