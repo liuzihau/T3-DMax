@@ -127,8 +127,8 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold, fallback=Tr
     fallback=True (DMax default): if NO masked position clears `threshold`, still commit the first
     masked position (guarantees >=1 commit/pass -> a block always finishes). fallback=False: commit
     ONLY the genuine >=threshold prefix, committing NOTHING when the leftmost masked position is
-    below threshold (used for the think-commit hand-off: think commits only what it's confident about
-    and leaves the uncertain tail to talk)."""
+    below threshold (used for the think-commit hand-off: think commits its confident DMax prefix and
+    leaves the uncertain tail to talk)."""
     x0 = logits.argmax(dim=-1)
     probs = F.softmax(logits.float(), dim=-1)
     max_probs = probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
@@ -152,14 +152,17 @@ def dmax_commit_uniform(logits, mask_index, active_index, threshold, fallback=Tr
 def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block_length,
                      threshold, top_k, max_iters, device, dtype, keep_mask_residual=True,
                      seed_passes=1, early_stop=False, eos_id=None, trace=None,
-                     think_commit_threshold=0.0, soft_commit=False):
+                     think_commit_threshold=0.0, think_commit_passes=1, soft_commit=False):
     """The H1 inference dynamic. Per block, two phases:
 
-      THINK-COMMIT (request 1; only if think_commit_threshold>0): think iterates and COMMITS its own
-        confident left-to-right prefix at `think_commit_threshold` (e.g. 0.6), with NO fallback, until
-        a pass commits nothing new (think has exhausted what it's that-confident about). The uncertain
-        tail is left masked for talk. think's last logits seed talk's first pass. (think_commit_threshold
-        =0 -> legacy seed: think only SEEDS `seed_passes` talk passes with candidates, never commits.)
+      THINK-COMMIT (request 1; only if think_commit_threshold>0): think runs `think_commit_passes`
+        forward(s) (default 1 = think ONCE/block, the H1 cost) and COMMITS its own confident
+        left-to-right prefix at `think_commit_threshold` (e.g. 0.6) via the DMax rule (no fallback),
+        stopping at the first sub-threshold (forking) position. The uncertain tail is left masked for
+        talk; think's last logits seed talk's first pass. think_commit_passes>1 re-forwards think to
+        extend the prefix as the committed context fills (DMax's native iterate, approaching
+        think_only); it stops early once a pass commits nothing. think_commit_threshold=0 -> legacy
+        seed: think only SEEDS `seed_passes` talk passes with candidates, never commits.
       TALK: talk iterates the still-masked tail -- masked positions fed the top-K soft-embed of the
         current source logits (think's, then the talk's own), committing its confident prefix (DMax
         rule, WITH fallback so a block always finishes), 0.9/no-change Breakflag, until the block is full.
@@ -209,7 +212,7 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
 
         # ---- THINK-COMMIT PHASE (request 1) ----
         if think_commit_threshold > 0:
-            for _ in range(max_iters):
+            for _ in range(max(1, think_commit_passes)):
                 mask_index = (x[:, bs:be] == mask_id)
                 if not bool(mask_index.any()):
                     break
@@ -222,7 +225,7 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
                     think_topk = th_logits.topk(top_k, dim=-1).indices
                 x0, high_conf, _, _ = dmax_commit_uniform(th_logits, mask_index, mask_index,
                                                           think_commit_threshold, fallback=False)
-                if not bool(high_conf.any()):                  # think exhausted its >=thr confidence -> talk
+                if not bool(high_conf.any()):                  # prefix stalled at a forking token -> talk
                     break
                 x[:, bs:be] = torch.where(high_conf, x0, x[:, bs:be])
 
@@ -433,8 +436,12 @@ def main():
                          "the talk self-rollout collapse mode (starvation / drift / degeneracy).")
     ap.add_argument("--think_commit_threshold", type=float, default=0.0,
                     help="[seed mode] >0 turns on the think-commit hand-off: think commits its own >=thr "
-                         "confident prefix (no fallback) until it stalls, then talk does the uncertain tail. "
+                         "confident prefix (no fallback), then talk does the uncertain tail. "
                          "0 = legacy seed (think only seeds candidates, never commits). Try 0.6.")
+    ap.add_argument("--think_commit_passes", type=int, default=1,
+                    help="[think-commit] number of think forwards in the commit phase. 1 (default) = think "
+                         "ONCE/block (~16 think/ex, the H1 cost). >1 re-forwards think to commit more as "
+                         "context fills (approaches think_only); stops early when a pass commits nothing.")
     ap.add_argument("--soft_commit", action="store_true",
                     help="[seed mode] feed COMMITTED positions as the DMax soft top-K(+mask-residual) blend "
                          "(decode_uniform's committed=soft_cond behavior) instead of the hard token embedding "
@@ -478,6 +485,7 @@ def main():
                                             seed_passes=args.seed_passes,
                                             early_stop=args.early_stop, eos_id=args.eos_id, trace=trace,
                                             think_commit_threshold=args.think_commit_threshold,
+                                            think_commit_passes=args.think_commit_passes,
                                             soft_commit=args.soft_commit)
         else:                                                  # think-as-decoder family (cross / think_then_talk / think_only)
             resp, th, tk = decode_mixed(think, talk, emb, mask_id, prompt_ids, schedule=sched,

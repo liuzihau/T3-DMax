@@ -163,9 +163,11 @@ python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
 ### Think-commit hand-off + soft-commit (`seed` mode)
 
 Two `seed` knobs targeting the rollout collapse:
-- **`--think_commit_threshold` (e.g. 0.6)**: think first COMMITS its own ≥-threshold confident prefix
-  (no fallback) until it stalls, then talk takes only the uncertain tail. think handles the reliable
-  bulk; talk is no longer starved on easy tokens. (`0` = legacy seed: think only seeds candidates.)
+- **`--think_commit_threshold` (e.g. 0.6)**: think COMMITS its own confident left-to-right prefix
+  (DMax rule, no fallback) and hands the uncertain tail to talk. Think runs **once/block** by default
+  (`--think_commit_passes 1`, ~16 think/ex = the H1 cost); raise it to re-forward and extend the
+  prefix as committed context fills (DMax's native iterate). (`0` = legacy seed: think only seeds
+  candidates, never commits.)
 - **`--soft_commit`**: feed COMMITTED positions as DMax's soft top-K(+mask-residual) blend
   (`decode_uniform`'s committed=`soft_cond` behavior, `parallel_strategy.py:597,662`) instead of the
   hard token — keeps the committed region revisable so the candidate set can still shift across passes.
