@@ -134,6 +134,7 @@ the **talk** does all committing. In **(B)** (ported from `t3d_probe_converged_t
 | `seed` (default) | A: think-as-candidate | talk only | `--seed_passes` (1 = once) | the H1 inference dynamic the training targets |
 | `cross` | B: think-as-decoder | whoever runs | every other step | `think→talk→think→talk…` |
 | `think_then_talk` | B: think-as-decoder | whoever runs | `--think_seed_count` leading commits | `think×N (commit) → talk…` |
+| `cycle` | B: think-as-decoder | whoever runs | `--think_per_cycle : --talk_per_cycle` | repeating `(think×A, talk×B)`, e.g. `2,1` = `think,think,talk…` (think-heavy cross) |
 | `think_only` | B: pure baseline | think | every step | pure DMax decode-to-converge baseline |
 
 ```bash
@@ -150,7 +151,11 @@ python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
   --decode_mode think_then_talk --think_seed_count 2 --limit 200
 
-# 4. think_only — pure DMax baseline
+# 4. cycle — think-heavy repeating schedule: think,think,talk,think,think,talk…
+python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
+  --decode_mode cycle --think_per_cycle 2 --talk_per_cycle 1 --limit 200
+
+# 5. think_only — pure DMax baseline
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
   --decode_mode think_only --limit 200
 ```

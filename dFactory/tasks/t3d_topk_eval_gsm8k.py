@@ -21,6 +21,8 @@ below). They fall into two families:
       (=block_length=32) decoding steps. Modes:
       * cross           : think->talk->think->talk... (strict alternation)
       * think_then_talk : think x N (commit) then talk... (N=--think_seed_count, default 2)
+      * cycle           : REPEATING (think x A, talk x B); A=--think_per_cycle, B=--talk_per_cycle
+                          (e.g. 2,1 = think,think,talk,think,think,talk... -- a think-heavy cross)
       * think_only      : pure DMax baseline (think decoded alone to convergence)
 
 Compute: think_forwards (20-layer) + talk_forwards (10-layer). The 20-layer-
@@ -135,13 +137,17 @@ def decode_topk_talk(think, talk, emb, mask_id, prompt_ids, *, gen_length, block
 
 
 # ---- think-as-DECODER family (ported from t3d_probe_converged_teacher.mixed_converge) ----
-def _schedule(mode, think_seed_count):
+def _schedule(mode, think_seed_count, think_per_cycle=1, talk_per_cycle=1):
     """Return schedule(i)->'think'|'talk' for the think-as-decoder modes."""
     if mode == "cross":            # think->talk->think->talk... (Method D)
         return lambda i: "think" if i % 2 == 0 else "talk"
     if mode == "think_then_talk":  # think x N (commit), then talk... (Method C, N default 2)
         n = max(1, think_seed_count)
         return lambda i: "think" if i < n else "talk"
+    if mode == "cycle":            # REPEATING (think x A, talk x B): A=2,B=1 -> think,think,talk,think,think,talk...
+        a = max(1, think_per_cycle)
+        period = a + max(1, talk_per_cycle)
+        return lambda i: "think" if (i % period) < a else "talk"
     if mode == "think_only":       # pure DMax baseline (think decoded alone to convergence)
         return lambda i: "think"
     raise ValueError(f"unknown mixed decode mode: {mode}")
@@ -264,14 +270,20 @@ def main():
                          "thereafter the talk iterates on its OWN previous top-K (think gone). 1 = think "
                          "once/block (the H1 target), 2 = twice. think cost = N forwards/block.")
     ap.add_argument("--decode_mode", default="seed",
-                    choices=["seed", "cross", "think_then_talk", "think_only"],
+                    choices=["seed", "cross", "think_then_talk", "cycle", "think_only"],
                     help="seed = think-as-candidate / talk-commits (H1 dynamic, uses --seed_passes). "
-                         "cross/think_then_talk/think_only = think-as-decoder family (whoever runs commits; "
-                         "ported from t3d_probe_converged_teacher.mixed_converge, capped at --max_iters/block). "
-                         "cross = think->talk->think->talk; think_then_talk = think x N then talk "
-                         "(N=--think_seed_count); think_only = pure DMax baseline.")
+                         "cross/think_then_talk/cycle/think_only = think-as-decoder family (whoever runs "
+                         "commits; ported from t3d_probe_converged_teacher.mixed_converge, capped at "
+                         "--max_iters/block). cross = think->talk->think->talk; think_then_talk = think x N "
+                         "then talk (N=--think_seed_count); cycle = REPEATING (think x A, talk x B) per cycle "
+                         "(A=--think_per_cycle, B=--talk_per_cycle; e.g. 2,1 = think,think,talk repeating); "
+                         "think_only = pure DMax baseline.")
     ap.add_argument("--think_seed_count", type=int, default=2,
                     help="[think_then_talk mode] number of leading think COMMIT passes before talk takes over.")
+    ap.add_argument("--think_per_cycle", type=int, default=2,
+                    help="[cycle mode] think COMMIT passes per repeating cycle (the 'A' in think x A, talk x B).")
+    ap.add_argument("--talk_per_cycle", type=int, default=1,
+                    help="[cycle mode] talk COMMIT passes per repeating cycle (the 'B' in think x A, talk x B).")
     ap.add_argument("--early_stop", action="store_true",
                     help="Apply DMax's full early termination: per-block end on all-active>=0.9 OR no-change "
                          "(decode_uniform Breakflag), AND stop generating further blocks once EOS is committed "
@@ -295,7 +307,8 @@ def main():
             for r in load_dataset("gsm8k", "main", split="test")]
     if args.limit:
         rows = rows[:args.limit]
-    sched = None if args.decode_mode == "seed" else _schedule(args.decode_mode, args.think_seed_count)
+    sched = None if args.decode_mode == "seed" else _schedule(
+        args.decode_mode, args.think_seed_count, args.think_per_cycle, args.talk_per_cycle)
     print(f"[eval] {len(rows)} problems  mode={args.decode_mode} gen={args.gen_length} "
           f"block={args.block_length} top_k={args.top_k}")
 
