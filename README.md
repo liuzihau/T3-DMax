@@ -125,143 +125,70 @@ export TALK=./t3_topk_stage2_onpolicy_outputs/checkpoints/<step>/hf_ckpt # train
 
 ### Decode methods (`--decode_mode`)
 
-Two families. In **(A)** think never commits — it only supplies per-position top-K candidates and
-the **talk** does all committing. In **(B)** (ported from `t3d_probe_converged_teacher.mixed_converge`)
-**whichever model runs a step commits** its own confident left-to-right prefix (DMax rule).
+Three methods, all in one unified decoder (`decode_t3d`). A per-block schedule picks think|talk each
+step; **whichever model runs commits** its own confident left-to-right prefix (the single DMax
+threshold rule, + EOS). Per-forward input is fixed — no flags: **committed** positions always get the
+DMax soft top-K(+mask-residual) blend of the latest logits; **masked** positions get bare `[MASK]` for
+a think step, or the top-K soft blend (+mask residual) of the previous pass's logits for a talk step.
 
-| `--decode_mode` | family | who commits | think cost / block | notes |
-|---|---|---|---|---|
-| `seed` (default) | A: think-as-candidate | talk only | `--seed_passes` (1 = once) | the H1 inference dynamic the training targets |
-| `cross` | B: think-as-decoder | whoever runs | every other step | `think→talk→think→talk…` |
-| `think_then_talk` | B: think-as-decoder | whoever runs | `--think_seed_count` leading commits | `think×N (commit) → talk…` |
-| `cycle` | B: think-as-decoder | whoever runs | `--think_per_cycle : --talk_per_cycle` | repeating `(think×A, talk×B)`, e.g. `2,1` = `think,think,talk…` (think-heavy cross) |
-| `think_only` | B: pure baseline | think | every step | pure DMax decode-to-converge baseline |
+| `--decode_mode` | schedule | knob |
+|---|---|---|
+| `base_think` | `T T T T …` — think only (DMax baseline) | — |
+| `think_then_talk` | `T×a` then `t t t …` — think commits `a`, talk takes over to converge | `--think_passes a` |
+| `interleave` | repeating `T×t, t` — e.g. `t=3` → `TTTt TTTt …` (`t=1` = strict alternation) | `--think_per_talk t` |
 
 ```bash
-# 1. seed — H1 target: think once/block, talk drives (Stage-2 training dynamic)
+# base think — pure DMax baseline
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode seed --seed_passes 1 --gen_length 512 --block_length 32 \
-  --threshold 0.3 --top_k 10 --limit 200
+  --decode_mode base_think --gen_length 512 --block_length 32 --threshold 0.3 --limit 200
 
-# 2. cross — think→talk→think→talk (strict alternation)
+# think_then_talk — think commits 1 pass, then talk to converge
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode cross --limit 200
+  --decode_mode think_then_talk --think_passes 1 --limit 200
 
-# 3. think_then_talk — think×2 commit, then talk to converge
+# interleave — think think think talk, repeating
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode think_then_talk --think_seed_count 2 --limit 200
-
-# 4. cycle — think-heavy repeating schedule: think,think,talk,think,think,talk…
-python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode cycle --think_per_cycle 2 --talk_per_cycle 1 --limit 200
-
-# 5. think_only — pure DMax baseline
-python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode think_only --limit 200
+  --decode_mode interleave --think_per_talk 3 --limit 200
 ```
 
-### Think-commit hand-off + soft-commit (`seed` mode)
+### Early-stop and other knobs
 
-Two `seed` knobs targeting the rollout collapse:
-- **`--think_commit_threshold` (e.g. 0.6)**: think COMMITS its own confident left-to-right prefix
-  (DMax rule, no fallback) and hands the uncertain tail to talk. Think runs **once/block** by default
-  (`--think_commit_passes 1`, ~16 think/ex = the H1 cost); raise it to re-forward and extend the
-  prefix as committed context fills (DMax's native iterate). (`0` = legacy seed: think only seeds
-  candidates, never commits.)
-- **`--soft_commit`**: feed COMMITTED positions as DMax's soft top-K(+mask-residual) blend
-  (`decode_uniform`'s committed=`soft_cond` behavior, `parallel_strategy.py:597,662`) instead of the
-  hard token — keeps the committed region revisable so the candidate set can still shift across passes.
-- **`--think_refresh_every M`**: every M talk passes, re-run think on the talk's committed state and
-  replace the candidate pool with think's **fresh** context-aware top-K (think doesn't commit; talk
-  does). Isolates the talk-rollout collapse cause: if talk's per-pass conf rises and overlap-with-iter0
-  drops (fresh tokens enter), the wall is **stale candidates**, not talk capacity — and points at the
-  proven partial-depth refresh as the efficient fix. Cost: +1 think fwd per M talk passes.
+By default each block runs to full convergence (capped at `--max_iters` = `block_length`). Add
+**`--early_stop`** for DMax's termination — per-block Breakflag (all active ≥ 0.9 or no-change,
+`parallel_strategy.py:578-590`) plus the sequence-level EOS stop (`--eos_id 156892`; batch-filtering
+is a no-op at batch=1). Other flags: `--threshold` (commit confidence, default 0.3), `--top_k`
+(candidate set, default 10), `--max_iters` (per-block cap, default 32), `--limit`, `--debug_print`.
+
+### `--trace` (rollout diagnostics)
+
+Instruments the decode: per within-block pass index it logs commits/pass, the deciding model's
+confidence, and **overlap of commits with the iter-0 top-K** (overlap < 1 = fresh tokens entering the
+pool); per block, passes-to-converge + adjacent-repeat fraction + cap-hit rate; per sequence, no-EOS.
+On `base_think` it's the think confidence baseline (high/holding, converges in ~3–4 passes); on
+`think_then_talk`/`interleave` it shows talk's per-pass confidence and whether think re-forwards inject
+fresh candidates (overlap dropping).
 
 ```bash
 python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode seed --think_commit_threshold 0.6 --soft_commit --trace --limit 50
+  --decode_mode base_think --trace --limit 50
 ```
 
-### Early-stop (DMax termination) and other knobs
+### Diagnostics (per-block probe, position profile, block-size sweep)
 
-By default `seed` uses DMax's per-block Breakflag (all active ≥ 0.9 **or** no-change;
-`parallel_strategy.py:578-590`); the mixed modes (`cross` / `think_then_talk` / `think_only`)
-run each block to full convergence, capped at `--max_iters` (= `block_length` = 32). Add
-**`--early_stop`** to apply DMax's full termination to *all* modes — the per-block 0.9 / no-change
-gate **plus** the sequence-level EOS stop (stop generating once a block commits EOS,
-`--eos_id 156892`; batch-filtering is a no-op at batch=1). Turn it on for compute that is directly
-comparable across modes:
-
-```bash
-# Compute-fair sweep over all four modes (DMax-faithful termination)
-for M in seed cross think_then_talk think_only; do
-  python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-    --decode_mode $M --early_stop --eos_id 156892 --limit 200
-done
-```
-
-Other flags: `--threshold` (commit confidence, DMax default 0.3; the probe uses 0.6),
-`--top_k` (candidate set size, default 10), `--max_iters` (per-block cap, default 32),
-`--no_mask_residual` (feed talk the no-mask top-K — match a talk trained with
-`keep_mask_residual=false`), `--limit` (number of GSM8K test problems), `--debug_print`
-(dump the full generation per example).
-
-### Per-block diagnostic probe (no full decode)
-
-[`dFactory/tasks/t3d_probe_converged_teacher.py`](./dFactory/tasks/t3d_probe_converged_teacher.py)
-compares the strategies on two consecutive blocks of a few prompts, split into the committed
-prefix vs the still-masked tail, with per-position confidence + per-method think/talk forward
-counts and wall/model timing. Use it to see *where* a method diverges before paying for a full
-eval run.
+- [`t3d_probe_converged_teacher.py`](./dFactory/tasks/t3d_probe_converged_teacher.py) — per-block
+  comparison with a per-position confidence table (committed prefix vs still-masked tail).
+- [`t3d_position_profile.py`](./dFactory/tasks/t3d_position_profile.py) — per within-block-position
+  single-forward confidence + agreement-with-think-converged, and the **reliable window** readout.
+- [`scripts/sweep_block_size.sh`](./dFactory/scripts/sweep_block_size.sh) — sweeps `--decode_mode ×
+  block_size`, tabulating acc + compute.
 
 ```bash
 python -m tasks.t3d_probe_converged_teacher --think_path $THINK --talk_path $TALK \
   --block_length 32 --top_k 10 --threshold 0.6 --gen_block 1 --limit 5
-```
-
-### Why is talk worse than think? — block-window diagnostics
-
-Two tools to test the hypothesis that **talk has a shorter reliable decode window than think**
-(so a smaller `block_size` would close the gap), *before* committing to a retrain.
-
-**A — block-size sweep** ([`scripts/sweep_block_size.sh`](./dFactory/scripts/sweep_block_size.sh)):
-runs the eval across `{block size} x {mode}` and tabulates acc + compute. The decisive read is the
-**gap** — if `think_only` barely moves 32→8 but `seed` (talk) improves a lot, talk has the shorter
-window and retraining at a smaller block is justified; if both move together it's just the generic
-quality/parallelism trade-off and block-8 won't help.
-
-```bash
-cd dFactory
-THINK=$THINK TALK=$TALK LIMIT=50 MODES="think_only seed" BLS="32 16 8" \
-  bash scripts/sweep_block_size.sh
-```
-
-**B — within-block-position profile**
-([`dFactory/tasks/t3d_position_profile.py`](./dFactory/tasks/t3d_position_profile.py)): on a
-fully-masked block, measures per within-block position `j` each model's single-forward confidence
-and agreement with think's converged decode (the per-token truth proxy). Prints a per-position +
-binned table and the **reliable window** (largest prefix with agreement ≥ `--window_floor`).
-`talk window << think window` confirms the hypothesis mechanistically.
-
-```bash
 python -m tasks.t3d_position_profile --think_path $THINK --talk_path $TALK \
   --block_length 32 --top_k 10 --threshold 0.3 --gen_block 1 --limit 50
-```
-
-**Rollout-collapse trace** (`--trace`): instruments the decode to pin *which* failure it is. Per
-within-block pass index it logs commits/pass, the deciding model's confidence, and **overlap of
-commits with the FIRST iteration's (iter-0) top-K** (think's seed in `seed` mode, pass-0 think in the
-mixed modes); per block, passes-to-converge + adjacent-repeat fraction + cap-hit rate; per sequence,
-no-EOS. On `seed`: overlap falling = **coverage drift**; commits/pass ≈ 1 = **commit starvation**;
-high repeat fraction = **soft-embed degeneracy**. On `think_only` it gives the **baseline confidence
-distribution** at the same threshold (per-pass conf high/holding, converges in ~3–4 passes vs `seed`'s
-flat-0.14 grind = fresh-vs-stale candidates, not the threshold); its **overlap** also shows whether
-think's refinement stays inside iter-0's top-K or pulls in fresh tokens (overlap < 1 = fresh
-candidates — exactly what talk's stale self-loop can't do).
-
-```bash
-python -m tasks.t3d_topk_eval_gsm8k --think_path $THINK --talk_path $TALK \
-  --decode_mode seed --seed_passes 1 --trace --limit 50
+THINK=$THINK TALK=$TALK LIMIT=50 MODES="base_think think_then_talk" BLS="32 16 8" \
+  bash scripts/sweep_block_size.sh
 ```
 
 ## Acknowledgements

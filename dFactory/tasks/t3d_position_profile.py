@@ -65,7 +65,7 @@ def profile_example(think, talk, emb, x, bs, be, B, m, p, top_k, threshold, max_
 
     # ref -- think decoded to convergence on a CLONE (the per-token truth proxy)
     xref = x.clone()
-    _, ref_ids, _, _ = think_converge(think, emb, xref, bs, be, m, p, threshold, max_iters)
+    _, ref_ids, _, _ = think_converge(think, emb, xref, bs, be, m, p, threshold, max_iters, top_k)
 
     for j in range(B):
         if not bool(masked[0, j]):
@@ -105,11 +105,10 @@ def main():
     ap.add_argument("--window_floor", type=float, default=0.5,
                     help="agreement threshold defining the 'reliable window' (largest prefix >= floor).")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--no_mask_residual", action="store_true")
     args = ap.parse_args()
     dtype = torch.bfloat16
     B = args.block_length
-    kmr = not args.no_mask_residual
+    kmr = True                                                  # inference always blends the talk soft with the mask residual
 
     from transformers import AutoTokenizer
     from datasets import load_dataset
@@ -140,7 +139,7 @@ def main():
         for b in range(first_b, target_b):
             be0 = (b + 1) * B
             think_converge(think, emb, x, b * B, be0, attn[:, :, :be0, :be0], pos[:, :be0],
-                           args.threshold, args.max_iters)
+                           args.threshold, args.max_iters, args.top_k)
         bs, be = target_b * B, (target_b + 1) * B
         profile_example(think, talk, emb, x, bs, be, B, attn[:, :, :be, :be], pos[:, :be],
                         args.top_k, args.threshold, args.max_iters, kmr, acc)

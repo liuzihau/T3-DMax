@@ -19,7 +19,7 @@ set -euo pipefail
 THINK=${THINK:?set THINK=/path/to/think}
 TALK=${TALK:?set TALK=/path/to/talk_ckpt}
 LIMIT=${LIMIT:-50}
-MODES=${MODES:-"think_only seed"}
+MODES=${MODES:-"base_think think_then_talk"}
 BLS=${BLS:-"32 16 8"}
 EXTRA=${EXTRA:-}
 

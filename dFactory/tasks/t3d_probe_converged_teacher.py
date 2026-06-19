@@ -35,7 +35,7 @@ import time
 import torch
 
 from tasks.t3d_topk_talk import load_causal_lm, confident_prefix_commit
-from tasks.t3d_topk_soft_embed import build_topk_soft_embeds
+from tasks.t3d_topk_soft_embed import build_topk_soft_embeds, build_block_input
 from tasks.t3d_topk_eval_gsm8k import build_block_causal_mask, dmax_commit_uniform, GSM8K_USER_TEMPLATE
 
 MASK_ID = 156895
@@ -65,33 +65,34 @@ def _conf(logits):
 
 
 @torch.no_grad()
-def think_converge(think, emb, x, bs, be, m, p, threshold, max_iters):
+def think_converge(think, emb, x, bs, be, m, p, threshold, max_iters, top_k):
     """Run think's DMax decode_uniform on block [bs:be] UNTIL no masked positions remain (or max_iters).
-    Mutates x[:, bs:be] in place (commits think's own argmax each iter). Returns
-    (final_logits[block], committed_ids[block], n_think, model_seconds). n_think and model_seconds
-    INCLUDE the final convergence-check forward (a think here)."""
+    Committed positions are fed the DMax soft top-K blend (build_block_input, the shared inference rule),
+    still-masked positions bare [MASK]. Mutates x[:, bs:be] in place. Returns (final_logits[block],
+    committed_ids[block], n_think, model_seconds); counts INCLUDE the final convergence-check forward."""
     n = 0
     tm = 0.0
+    cand = None
     while bool((x[:, bs:be] == MASK_ID).any()) and n < max_iters:
         block = x[:, bs:be]
         mask_index = block == MASK_ID
-        logits, dt = _fwd(think, emb(x[:, :be]), m, p); tm += dt
-        x0, high_conf, _, _ = dmax_commit_uniform(logits[:, bs:be], mask_index, mask_index, threshold)
+        logits, dt = _fwd(think, build_block_input(x, bs, be, emb, cand, "think", MASK_ID, top_k), m, p); tm += dt
+        cand = logits[:, bs:be]
+        x0, high_conf, _, _ = dmax_commit_uniform(cand, mask_index, mask_index, threshold)
         x[:, bs:be] = torch.where(high_conf, x0, block)
         n += 1
-    fl, dt = _fwd(think, emb(x[:, :be]), m, p); tm += dt; n += 1   # convergence-check forward (COUNTED)
+    fl, dt = _fwd(think, build_block_input(x, bs, be, emb, cand, "think", MASK_ID, top_k), m, p); tm += dt; n += 1
     return fl[:, bs:be], x[:, bs:be].clone(), n, tm
 
 
 @torch.no_grad()
-def mixed_converge(think, talk, emb, x, bs, be, m, p, threshold, top_k, kmr, max_iters, schedule):
+def mixed_converge(think, talk, emb, x, bs, be, m, p, threshold, top_k, max_iters, schedule):
     """Decode block [bs:be] UNTIL CONVERGED with a MIXED think/talk schedule: schedule(i) -> 'think'|'talk'
-    for iteration i. A think step runs think on the committed state (bare [MASK] at undecided). A talk step
-    runs the talk fed the top-K soft-embed of the PREVIOUS pass's logits (think's if the prev step was think,
-    the talk's own otherwise -- the inference dynamic). Commits the confident prefix each step. Mutates
-    x[:, bs:be]. Returns (final_logits[block], ids[block], n_think, n_talk, model_seconds). The counts and
-    model_seconds INCLUDE the final convergence-check forward, which follows the schedule's NEXT step (so
-    for a talk-ending schedule the check is a cheaper talk -- methods differ here, by design)."""
+    for iteration i. Both steps use the shared inference input rule (build_block_input): COMMITTED
+    positions get the DMax soft top-K blend; a THINK step feeds [MASK] at undecided positions, a TALK step
+    feeds the top-K soft blend of the PREVIOUS pass's logits. Commits the confident prefix each step.
+    Mutates x[:, bs:be]. Returns (final_logits[block], ids[block], n_think, n_talk, model_seconds); counts
+    INCLUDE the final convergence-check forward, which follows the schedule's NEXT step."""
     cand = None
     nth = ntk = 0
     tm = 0.0
@@ -99,24 +100,23 @@ def mixed_converge(think, talk, emb, x, bs, be, m, p, threshold, top_k, kmr, max
         block = x[:, bs:be]
         mask_index = block == MASK_ID
         if schedule(nth + ntk) == "think":
-            logits, dt = _fwd(think, emb(x[:, :be]), m, p); nth += 1
+            logits, dt = _fwd(think, build_block_input(x, bs, be, emb, cand, "think", MASK_ID, top_k), m, p); nth += 1
         else:
-            src = cand if cand is not None else think(inputs_embeds=emb(x[:, :be]), attention_mask=m,
-                                                      position_ids=p, use_cache=False, return_dict=True).logits
-            soft = build_topk_soft_embeds(src[:, bs:be], emb, MASK_ID, top_k=top_k, keep_mask_residual=kmr)
-            inp = emb(x[:, :be]).clone()
-            inp[:, bs:be][mask_index] = soft[mask_index].to(inp.dtype)
-            logits, dt = _fwd(talk, inp, m, p); ntk += 1
+            src = cand
+            if src is None:                                       # block starts on talk -> 1 bootstrap think
+                src = think(inputs_embeds=build_block_input(x, bs, be, emb, None, "think", MASK_ID, top_k),
+                            attention_mask=m, position_ids=p, use_cache=False, return_dict=True).logits[:, bs:be]
+            logits, dt = _fwd(talk, build_block_input(x, bs, be, emb, src, "talk", MASK_ID, top_k), m, p); ntk += 1
         tm += dt
-        cand = logits
-        x0, high_conf, _, _ = dmax_commit_uniform(logits[:, bs:be], mask_index, mask_index, threshold)
+        cand = logits[:, bs:be]
+        x0, high_conf, _, _ = dmax_commit_uniform(cand, mask_index, mask_index, threshold)
         x[:, bs:be] = torch.where(high_conf, x0, block)
-    # convergence-check forward follows the schedule's NEXT step (COUNTED) -- may be a (cheaper) talk.
-    # At convergence there are no masked positions, so the talk just reads the committed tokens (no soft).
+    # convergence-check forward follows the schedule's NEXT step (COUNTED). At convergence there are no
+    # masked positions, so build_block_input feeds the committed soft blend (no masked region to fill).
     if schedule(nth + ntk) == "think":
-        fl, dt = _fwd(think, emb(x[:, :be]), m, p); nth += 1
+        fl, dt = _fwd(think, build_block_input(x, bs, be, emb, cand, "think", MASK_ID, top_k), m, p); nth += 1
     else:
-        fl, dt = _fwd(talk, emb(x[:, :be]), m, p); ntk += 1
+        fl, dt = _fwd(talk, build_block_input(x, bs, be, emb, cand, "talk", MASK_ID, top_k), m, p); ntk += 1
     tm += dt
     return fl[:, bs:be], x[:, bs:be].clone(), nth, ntk, tm
 
@@ -147,7 +147,7 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     # ---- talk_1 (one think + one talk) ----  [wall includes the soft-embed build; model is the talk fwd]
     _sync(); _t = time.time()
     soft = build_topk_soft_embeds(th1, emb, MASK_ID, top_k=args.top_k,
-                                  keep_mask_residual=not args.no_mask_residual)
+                                  keep_mask_residual=True)
     inp = emb(x[:, :be]).clone()
     inp[:, bs:be][masked] = soft[masked].to(inp.dtype)
     ta1_full, m_ta1 = _fwd(talk, inp, m, p)
@@ -157,11 +157,11 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     amT, cmT = confident_prefix_commit(ta1, masked, B, args.threshold)
     smT = masked & (~cmT)
 
-    # ---- think_2 = think_1 -> commit think_1's prefix (hard) -> think ----
+    # ---- think_2 = think_1 -> commit think_1's prefix -> think (committed fed DMax soft from th1) ----
     x1 = x.clone()
     x1[:, bs:be] = torch.where(cm1, am1, x1[:, bs:be])
-    th2 = think(inputs_embeds=emb(x1[:, :be]), attention_mask=m, position_ids=p,
-                use_cache=False, return_dict=True).logits[:, bs:be]
+    th2 = think(inputs_embeds=build_block_input(x1, bs, be, emb, th1, "think", MASK_ID, args.top_k),
+                attention_mask=m, position_ids=p, use_cache=False, return_dict=True).logits[:, bs:be]
     a2, c2 = _conf(th2)
     mask2 = (x1[:, bs:be] == MASK_ID)
     am2, cm2 = confident_prefix_commit(th2, mask2, B, args.threshold)
@@ -171,7 +171,7 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     xt = x.clone()
     xt[:, bs:be] = torch.where(cmT, amT, xt[:, bs:be])
     _sync(); _t = time.time()
-    ttk_logits, ttk_ids, ttk_iters, m_ttk = think_converge(think, emb, xt, bs, be, m, p, args.threshold, args.max_iters)
+    ttk_logits, ttk_ids, ttk_iters, m_ttk = think_converge(think, emb, xt, bs, be, m, p, args.threshold, args.max_iters, args.top_k)
     _sync(); w_ttk = time.time() - _t
     atk, ctk = _conf(ttk_logits)
     ttk_commit = masked & (ttk_ids != MASK_ID)
@@ -184,7 +184,7 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     # ---- base_think = pure think decoded UNTIL CONVERGED (no talk) ----
     xb = x.clone()
     _sync(); _t = time.time()
-    base_logits, base_ids, base_iters, m_base = think_converge(think, emb, xb, bs, be, m, p, args.threshold, args.max_iters)
+    base_logits, base_ids, base_iters, m_base = think_converge(think, emb, xb, bs, be, m, p, args.threshold, args.max_iters, args.top_k)
     _sync(); w_base = time.time() - _t
     ab, cb = _conf(base_logits)
     base_still = masked & (base_ids == MASK_ID)
@@ -194,7 +194,7 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     xc = x.clone()
     _sync(); _t = time.time()
     c_logits, c_ids, c_nth, c_ntk, m_c = mixed_converge(
-        think, talk, emb, xc, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
+        think, talk, emb, xc, bs, be, m, p, args.threshold, args.top_k,
         args.max_iters, lambda i: "think" if i < 2 else "talk")
     _sync(); w_c = time.time() - _t
     ac, cc = _conf(c_logits)
@@ -204,7 +204,7 @@ def probe_block(think, talk, emb, tok, x, bs, be, B, m, p, args, agg, tag):
     xd = x.clone()
     _sync(); _t = time.time()
     d_logits, d_ids, d_nth, d_ntk, m_d = mixed_converge(
-        think, talk, emb, xd, bs, be, m, p, args.threshold, args.top_k, not args.no_mask_residual,
+        think, talk, emb, xd, bs, be, m, p, args.threshold, args.top_k,
         args.max_iters, lambda i: "think" if i % 2 == 0 else "talk")
     _sync(); w_d = time.time() - _t
     ad, cd = _conf(d_logits)
@@ -283,7 +283,6 @@ def main():
                          "earlier blocks). The probe does THIS block and the NEXT one.")
     ap.add_argument("--limit", type=int, default=5)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--no_mask_residual", action="store_true", help="match a talk trained with keep_mask_residual=false")
     args = ap.parse_args()
     dtype = torch.bfloat16
 
@@ -326,7 +325,7 @@ def main():
         # decode the blocks BEFORE the first probed block with think (clean preceding context)
         for b in range(first_b, target_b):
             be0 = (b + 1) * B
-            think_converge(think, emb, x, b * B, be0, attn[:, :, :be0, :be0], pos[:, :be0], args.threshold, args.max_iters)
+            think_converge(think, emb, x, b * B, be0, attn[:, :, :be0, :be0], pos[:, :be0], args.threshold, args.max_iters, args.top_k)
 
         print("=" * 118)
         print(f"[{i}] Q: {row['question'][:96]}…")

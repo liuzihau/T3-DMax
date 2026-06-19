@@ -93,6 +93,28 @@ def inject_soft_embeds(inputs_embeds, soft_embeds, positions):
     return out
 
 
+@torch.no_grad()
+def build_block_input(x, bs, be, embedding, src_logits, model, mask_id, top_k):
+    """THE single T3-D inference per-forward block input (shared by decode_t3d + the diagnostics, so
+    they never drift). Returns inputs_embeds [1, be, D] for a forward over the prefix up to `be`:
+      * COMMITTED positions within [bs:be]: ALWAYS the DMax soft top-K(+mask-residual) blend of
+        `src_logits` (decode_uniform's soft_cond) -- never hard tokens.
+      * MASKED positions within [bs:be]: bare [MASK] when model=='think' (think generates), or the
+        same top-K soft blend when model=='talk'.
+      * Earlier blocks (< bs) stay hard token embeddings (already committed context).
+    src_logits = the block's logits [1, be-bs, V] whose top-K to blend; None -> all hard (first pass,
+    nothing committed within the block yet)."""
+    inp = embedding(x[:, :be]).clone()
+    if src_logits is None:
+        return inp
+    mi = (x[:, bs:be] == mask_id)
+    soft = build_topk_soft_embeds(src_logits, embedding, mask_id, top_k=top_k, keep_mask_residual=True)
+    inp[:, bs:be][~mi] = soft[~mi].to(inp.dtype)          # committed -> DMax soft (always)
+    if model == "talk":
+        inp[:, bs:be][mi] = soft[mi].to(inp.dtype)        # talk masked -> top-K candidates
+    return inp
+
+
 # --------------------------------------------------------------------------- test
 def _selftest():
     torch.manual_seed(0)
@@ -132,6 +154,20 @@ def _selftest():
     emb = torch.nn.Embedding(V, D); emb.weight.data = W.clone()
     soft_mod = build_topk_soft_embeds(logits, emb, mask_id, top_k=K, keep_mask_residual=True)
     assert torch.allclose(soft_mod, soft_inf, atol=1e-4)
+
+    # build_block_input: committed within-block softened; think masked=[MASK]; talk masked softened; earlier hard
+    be, bs = 6, 3
+    xb = torch.full((1, be), mask_id, dtype=torch.long); xb[0, :bs] = torch.randint(0, V - 1, (bs,))
+    xb[0, bs] = 1                                            # one committed position inside the block
+    blk_logits = torch.randn(1, be - bs, V)
+    hard = emb(xb[:, :be]); mi = (xb[0, bs:be] == mask_id)
+    ti = build_block_input(xb, bs, be, emb, blk_logits, "think", mask_id, K)
+    ta = build_block_input(xb, bs, be, emb, blk_logits, "talk", mask_id, K)
+    assert torch.allclose(ti[0, :bs], hard[0, :bs])                                   # earlier blocks hard
+    assert not torch.allclose(ti[0, bs:be][~mi], hard[0, bs:be][~mi])                 # committed softened
+    assert torch.allclose(ti[0, bs:be][mi], hard[0, bs:be][mi])                       # think masked = [MASK]
+    assert not torch.allclose(ta[0, bs:be][mi], hard[0, bs:be][mi])                   # talk masked softened
+    assert torch.allclose(build_block_input(xb, bs, be, emb, None, "think", mask_id, K), hard)  # None -> hard
     print("t3d_topk_soft_embed selftest OK")
 
 
