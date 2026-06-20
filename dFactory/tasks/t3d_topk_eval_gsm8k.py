@@ -48,19 +48,25 @@ class RolloutTrace:
       * commit STARVATION  -> commits/pass ~1 (only the first-mask fallback), passes-to-converge high.
       * coverage DRIFT     -> overlap-with-iter0 falls across pass index (commits leave iter-0's pool).
       * soft-embed DEGENERACY/repetition -> high adjacent-repeat fraction in committed blocks.
-    overlap = of the tokens COMMITTED this pass, the fraction that lie in the FIRST pass's (iter-0) top-K
-    (1.0 at pass 0; a fall = fresh tokens entering the pool, e.g. think re-forwarding with context)."""
+    overlap_iter0 = of the tokens COMMITTED this pass, the fraction that lie in the FIRST pass's (iter-0)
+    top-K (1.0 at pass 0; a fall = fresh tokens entering the pool, e.g. think re-forwarding with context).
+    overlap_lastT = same fraction but against the PREVIOUS think pass's top-K (a warm, just-recomputed ref).
+    iter0 falling while lastT stays high = pure STALENESS (each fresh think agrees with the last one; a
+    refresh recovers). BOTH falling = genuine churn (commits leave even the latest think's pool)."""
 
     def __init__(self):
         self.p_commit = defaultdict(float); self.p_conf = defaultdict(float)
         self.p_ovl = defaultdict(float); self.p_ovl_n = defaultdict(int); self.p_n = defaultdict(int)
+        self.p_ovl2 = defaultdict(float); self.p_ovl2_n = defaultdict(int)
         self.block_passes = []; self.block_rep = []; self.n_blocks = 0; self.n_capped = 0
         self.n_seq = 0; self.n_no_eos = 0
 
-    def add_pass(self, it, n_commit, mean_conf, ovl):
+    def add_pass(self, it, n_commit, mean_conf, ovl, ovl2=float("nan")):
         self.p_commit[it] += n_commit; self.p_conf[it] += mean_conf; self.p_n[it] += 1
         if ovl == ovl:                                              # not NaN (commits happened)
             self.p_ovl[it] += ovl; self.p_ovl_n[it] += 1
+        if ovl2 == ovl2:                                            # not NaN (a prior think pass existed)
+            self.p_ovl2[it] += ovl2; self.p_ovl2_n[it] += 1
 
     def add_block(self, passes, capped, rep):
         self.block_passes.append(passes); self.block_rep.append(rep)
@@ -73,11 +79,12 @@ class RolloutTrace:
         import statistics as st
         print("=" * 78)
         print("[trace] rollout convergence (per within-block pass index)")
-        print(f"  {'pass':>4} | {'n_blk':>5} | {'commits':>7} | {'conf':>9} | {'overlap_iter0':>15}")
+        print(f"  {'pass':>4} | {'n_blk':>5} | {'commits':>7} | {'conf':>9} | {'overlap_iter0':>15} | {'overlap_lastT':>15}")
         for it in sorted(self.p_n):
             n = self.p_n[it]
             ovl = self.p_ovl[it] / self.p_ovl_n[it] if self.p_ovl_n[it] else float("nan")
-            print(f"  {it:>4} | {n:>5} | {self.p_commit[it]/n:>7.2f} | {self.p_conf[it]/n:>9.3f} | {ovl:>15.3f}")
+            ovl2 = self.p_ovl2[it] / self.p_ovl2_n[it] if self.p_ovl2_n[it] else float("nan")
+            print(f"  {it:>4} | {n:>5} | {self.p_commit[it]/n:>7.2f} | {self.p_conf[it]/n:>9.3f} | {ovl:>15.3f} | {ovl2:>15.3f}")
         bp = self.block_passes or [0]
         print("-" * 78)
         print(f"[trace] blocks={self.n_blocks}  passes/block: mean={st.mean(bp):.1f} max={max(bp)}  "
@@ -90,10 +97,12 @@ class RolloutTrace:
             num = sum(d[i] for i in keys); den = sum((dn or self.p_n)[i] for i in keys)
             return num/den if den else float("nan")
         ovl_e = _m(self.p_ovl, early, self.p_ovl_n); ovl_l = _m(self.p_ovl, late, self.p_ovl_n)
+        ovl2_e = _m(self.p_ovl2, early, self.p_ovl2_n); ovl2_l = _m(self.p_ovl2, late, self.p_ovl2_n)
         commits_l = _m(self.p_commit, late)
         rep = st.mean(self.block_rep or [0])
         print("-" * 78)
-        print(f"[trace] signals: overlap iter0 early={ovl_e:.3f} -> late={ovl_l:.3f} (fresh tokens if falling); "
+        print(f"[trace] signals: overlap iter0 early={ovl_e:.3f} -> late={ovl_l:.3f} (STALENESS if falling); "
+              f"overlap lastT early={ovl2_e:.3f} -> late={ovl2_l:.3f} (CHURN if also falling, else refresh recovers); "
               f"late commits/pass={commits_l:.2f} (STARVATION if ~1); rep={rep:.3f} (DEGENERACY if high)")
 
 
@@ -173,6 +182,7 @@ def decode_t3d(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length, b
 
         cand = None                                                # the previous pass's block logits
         block_topk = None                                          # iter-0 top-K ids [1,B,K] (overlap ref)
+        last_think_topk = None                                     # previous think pass's top-K ids [1,B,K]
         passes = 0
         for it in range(max_iters):
             block_x = x[:, bs:be]
@@ -204,11 +214,18 @@ def decode_t3d(think, talk, emb, mask_id, prompt_ids, *, schedule, gen_length, b
                 n_commit = int(committed.sum())
                 mean_conf = float(max_probs[mask_index].mean()) if bool(mask_index.any()) else float("nan")
                 if n_commit:
-                    in_topk = (block_topk[0] == x0[0].unsqueeze(-1)).any(-1)       # [B] bool
+                    in_topk = (block_topk[0] == x0[0].unsqueeze(-1)).any(-1)       # [B] bool, vs iter-0
                     ovl = float(in_topk[committed[0]].float().mean())
+                    if last_think_topk is not None:                # vs the PREVIOUS think pass's top-K
+                        in_topk2 = (last_think_topk[0] == x0[0].unsqueeze(-1)).any(-1)
+                        ovl2 = float(in_topk2[committed[0]].float().mean())
+                    else:
+                        ovl2 = float("nan")
                 else:
-                    ovl = float("nan")
-                trace.add_pass(it, n_commit, mean_conf, ovl)
+                    ovl = ovl2 = float("nan")
+                trace.add_pass(it, n_commit, mean_conf, ovl, ovl2)
+                if schedule(it) == "think":                        # refresh the rolling think ref AFTER scoring
+                    last_think_topk = logits.topk(top_k, dim=-1).indices
             if early_stop and (breakflag or not changed):
                 break
         if trace is not None:
