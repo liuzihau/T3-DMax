@@ -115,7 +115,7 @@ def process_mdm_sft_example(
         "noisy_input_ids": noisy_input_ids,
         "attention_mask": torch.ones_like(input_ids),
         "labels": labels,
-        "flag": torch.tensor(example["flag"]),
+        "flag": torch.tensor(example.get("flag", False)),   # DBet ignores flag; optional so flag-less data is OK
     }]
 
 
