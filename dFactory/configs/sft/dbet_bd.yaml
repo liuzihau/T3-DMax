@@ -7,7 +7,7 @@
 model:
   config_path: ./dbet_init          # the init checkpoint dir from build_dbet_init.py (config.json + weights)
   model_path: ./dbet_init           # same dir: heavy.* (DMax) + draft.* (warm-started) keys
-  tokenizer_path: <DMax-Math-16B-moe-merge>
+  tokenizer_path: ../DMax-Math-16B-moe-merge   # the DMax checkpoint dir (it holds the tokenizer); EDIT to your path
   attn_implementation: sdpa         # use flex_attention only once a flex BlockMask path is wired
   moe_implementation: fused
 
