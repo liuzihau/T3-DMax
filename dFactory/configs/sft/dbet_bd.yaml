@@ -1,0 +1,65 @@
+# DBet drafter training (frozen DMax heavy + trainable Δh drafter).
+# Build the init checkpoint first:
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
+#       --heavy_path <DMax-Math-16B-moe-merge> --out_dir ./dbet_init --block_size 32
+# Then launch:
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH sh train.sh tasks/train_dbet.py configs/sft/dbet_bd.yaml
+model:
+  config_path: ./dbet_init          # the init checkpoint dir from build_dbet_init.py (config.json + weights)
+  model_path: ./dbet_init           # same dir: heavy.* (DMax) + draft.* (warm-started) keys
+  tokenizer_path: <DMax-Math-16B-moe-merge>
+  attn_implementation: sdpa         # use flex_attention only once a flex BlockMask path is wired
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl   # the OPUT math golden trajectories (build_dataset_oput.py)
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75             # mask ratio sigma -> left-to-right reveal of (1-sigma) per block
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./dbet_outputs
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 2
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 1.0e-4                        # drafter is trained from (warm-start) init -> higher LR than backbone SFT
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true          # shard the frozen 16B heavy; build_optimizer trains only requires_grad (drafter)
+  enable_fsdp_offload: true
+  enable_activation_offload: false
+  init_device: meta
+  broadcast_model_weights_from_rank0: true
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+  # --- DBet block-diffusion + drafter knobs ---
+  block_diffusion_mode: true       # REQUIRED: builds the dual-stream [noisy|clean] + block mask
+  block_size: 32
+  heavy_commit_threshold: 0.9      # frozen heavy one-pass decode_uniform commit (high -> drafter does more)
+  conf_loss_weight: 1.0            # confidence-head BCE weight vs token CE
+  same_token_labels: true          # (unused by DBet loss; kept for arg compatibility)
+  use_wandb: false
+  log_steps: 1

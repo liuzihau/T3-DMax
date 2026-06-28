@@ -46,7 +46,11 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.models.registry import ModelRegistry
-ModelRegistry.register_modeling_path("models.dbet")   # DBet drafter (was models.llada2_moe)
+ModelRegistry.register_modeling_path("models.dbet")   # model class resolved via architectures=[DbetForDraftDecoding]
+from transformers import AutoConfig, AutoModelForCausalLM
+from models.dbet import DbetConfig, DbetForDraftDecoding
+AutoConfig.register("dbet", DbetConfig)               # so config.json model_type="dbet" resolves to DbetConfig
+AutoModelForCausalLM.register(DbetConfig, DbetForDraftDecoding)
 from dataset.data_transform_dbet import process_mdm_tokenized_example, process_mdm_sft_example
 from dataset import build_local_dataset
 from dbet_train_core import dbet_train_step

@@ -522,11 +522,10 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
     @torch.no_grad()
     def init_draft_layers_warmstart(self) -> None:
         """Copy the heavy's bottom-L decoder-layer weights into the L draft layers (shape-permitting), then
-        re-zero the Δh head. No-op if disabled. NOTE: only valid when a heavy bottom layer is DENSE and the
-        draft widths match the heavy (the default). MoE heavy layers / thinner drafts need separate handling
-        (open decision in the design doc)."""
-        if not self.config.warmstart_from_heavy_bottom:
-            return
+        re-zero the Δh head. Always does the copy when CALLED (the `__init__` auto-call is gated by
+        config.warmstart_from_heavy_bottom; the offline init builder calls this explicitly). NOTE: only valid
+        when a heavy bottom layer is DENSE and the draft widths match the heavy; MoE heavy layers copy only
+        their attention/norms (dense MLP stays init) — open decision in the design doc."""
         heavy_layers = self.heavy.model.layers
         for i, draft_layer in enumerate(self.draft.layers):
             if i >= len(heavy_layers):
