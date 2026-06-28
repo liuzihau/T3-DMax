@@ -28,8 +28,8 @@ train:
   tensor_parallel_size: 1
   ulysses_parallel_size: 1
   expert_parallel_size: 1
-  global_batch_size: 8
-  micro_batch_size: 1
+  global_batch_size: 1             # 1-GPU smoke: grad-accum = gbs/(mbs*world) must be 1 when enable_fsdp_offload
+  micro_batch_size: 1              #   is true. For multi-GPU/accumulation, raise gbs AND set enable_fsdp_offload: false.
   num_train_epochs: 2
   rmpad: false
   rmpad_with_pos_ids: false
