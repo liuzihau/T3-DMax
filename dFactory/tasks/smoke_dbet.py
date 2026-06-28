@@ -25,17 +25,19 @@ for _p in (_DFACTORY,):
         sys.path.insert(0, _p)
 
 from models.dbet import DbetConfig, DbetForDraftDecoding          # noqa: E402
-from dataset.data_transform_dbet import block_left_to_right_reveal, build_block_diffusion_attn_mask, MASK_TOKEN_ID  # noqa: E402
+from dataset.data_transform_dbet import block_left_to_right_reveal, build_block_diffusion_attn_mask  # noqa: E402
 from dbet_train_core import dbet_train_step                       # noqa: E402
 
 
 def build_tiny_model(device, dtype):
+    # Small ids so the heavy's embedding fits (padding_idx = pad_token_id must be < vocab_size).
     cfg = DbetConfig(
         vocab_size=64, hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
         num_key_value_heads=2, intermediate_size=128, max_position_embeddings=64,
         first_k_dense_replace=8,            # >= num_hidden_layers -> all-dense heavy (no MoE)
         draft_num_layers=2, sel_layers="1,2,3", warmstart_from_heavy_bottom=False,
-        use_confidence_head=True, mask_token_id=MASK_TOKEN_ID,
+        use_confidence_head=True,
+        pad_token_id=0, bos_token_id=1, eos_token_id=2, mask_token_id=63,   # all within vocab=64
     )
     model = DbetForDraftDecoding(cfg).to(device=device, dtype=dtype)
     model._apply_freeze_flags()
@@ -43,11 +45,11 @@ def build_tiny_model(device, dtype):
     return model, cfg
 
 
-def make_batch(B, L, block_size, prompt_len, vocab, device):
-    clean = torch.randint(0, vocab, (B, L))
+def make_batch(B, L, block_size, prompt_len, vocab, device, mask_id):
+    clean = torch.randint(0, mask_id, (B, L))                  # 0..mask_id-1 so clean tokens != mask_id
     maskable = torch.arange(L) >= prompt_len
     noisy = torch.stack([
-        block_left_to_right_reveal(clean[b], (0.5, 0.5), maskable, MASK_TOKEN_ID, block_size)
+        block_left_to_right_reveal(clean[b], (0.5, 0.5), maskable, mask_id, block_size)
         for b in range(B)
     ])
     full = torch.cat([noisy, clean], dim=1).to(device)            # [B, 2L] = [noisy | clean]
@@ -75,11 +77,12 @@ def main():
     print(f"[smoke] trainable={n_train:,}  heavy frozen OK")
 
     opt = AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
-    batch = make_batch(B, L, block_size, prompt_len, vocab, device)
+    mask_id = cfg.mask_token_id
+    batch = make_batch(B, L, block_size, prompt_len, vocab, device, mask_id)
 
     first = None
     for step in range(30):
-        loss, m = dbet_train_step(model, batch, n_micro_batches=1, args=args, return_metrics=True)
+        loss, m = dbet_train_step(model, batch, n_micro_batches=1, args=args, mask_id=mask_id, return_metrics=True)
         opt.zero_grad(); loss.backward(); opt.step()
         assert torch.isfinite(loss), f"non-finite loss at step {step}"
         if step == 0:
