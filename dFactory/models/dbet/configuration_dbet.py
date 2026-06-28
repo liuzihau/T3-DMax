@@ -17,7 +17,9 @@ from ..llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
 class DbetConfig(LLaDA2MoeConfig):
     """Configuration for `DbetForDraftDecoding`. See module docstring for the inheritance rationale."""
 
-    model_type = "dbet"
+    # ends in "_veomni" so the heavy's LLaDA2MoeSparseMoeBlock uses the FUSED experts layout that matches
+    # DMax's merged-MoE checkpoints (LLaDA2MoeSparseMoeBlock keys off model_type.endswith("_veomni")).
+    model_type = "dbet_veomni"
 
     def __init__(
         self,

@@ -409,9 +409,14 @@ class DbetDraftStack(nn.Module):
     def __init__(self, config: DbetConfig, frozen_embed: nn.Embedding, frozen_lm_head: nn.Linear, frozen_final_norm: nn.Module):
         super().__init__()
         self.config = config
-        self.frozen_embed = frozen_embed
-        self.frozen_lm_head = frozen_lm_head
-        self.frozen_final_norm = frozen_final_norm
+        # Hold the heavy's embed/lm_head/final-norm as PLAIN attributes (object.__setattr__ bypasses
+        # nn.Module registration), so they are NOT duplicated in the drafter's state_dict — they already
+        # live under `heavy.*`. Avoids the shared-tensor error in save_pretrained(safetensors) and a second
+        # copy of those weights. Runtime access (self.frozen_embed(...)) and .parameters() still work; the
+        # heavy owns their device/dtype.
+        object.__setattr__(self, "frozen_embed", frozen_embed)
+        object.__setattr__(self, "frozen_lm_head", frozen_lm_head)
+        object.__setattr__(self, "frozen_final_norm", frozen_final_norm)
         self.conditioning = HeavyModelConditioning(config)
         self.prefix_fuse = PrefixFuse(config)   # one shared trunk -> L per-layer features (or 1 shared)
         self.rotary_emb = LLaDA2MoeRotaryEmbedding(config)

@@ -49,7 +49,7 @@ from veomni.models.registry import ModelRegistry
 ModelRegistry.register_modeling_path("models.dbet")   # model class resolved via architectures=[DbetForDraftDecoding]
 from transformers import AutoConfig, AutoModelForCausalLM
 from models.dbet import DbetConfig, DbetForDraftDecoding
-AutoConfig.register("dbet", DbetConfig)               # so config.json model_type="dbet" resolves to DbetConfig
+AutoConfig.register(DbetConfig.model_type, DbetConfig)   # resolve config.json model_type ("dbet_veomni") -> DbetConfig
 AutoModelForCausalLM.register(DbetConfig, DbetForDraftDecoding)
 from dataset.data_transform_dbet import process_mdm_tokenized_example, process_mdm_sft_example
 from dataset import build_local_dataset

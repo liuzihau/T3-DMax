@@ -38,8 +38,8 @@ from models.dbet import DbetConfig, DbetForDraftDecoding         # noqa: E402
 from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM    # noqa: E402
 from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig  # noqa: E402
 
-# make `model_type: "dbet"` resolvable by AutoConfig/AutoModel (mirrors train_dbet.py)
-AutoConfig.register("dbet", DbetConfig)
+# make the DBet model_type resolvable by AutoConfig/AutoModel (mirrors train_dbet.py)
+AutoConfig.register(DbetConfig.model_type, DbetConfig)
 AutoModelForCausalLM.register(DbetConfig, DbetForDraftDecoding)
 
 
@@ -53,8 +53,15 @@ def main():
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
 
-    # 1) DBet config = heavy config fields + drafter overrides (model_type stays the class default "dbet")
+    # 1) heavy config: ensure model_type ends "_veomni" + moe_implementation "fused" so the FUSED expert
+    #    layout matches DMax's merged-MoE checkpoint (else experts load random). Mirrors load_t3d_model.
     heavy_cfg = LLaDA2MoeConfig.from_pretrained(args.heavy_path, trust_remote_code=True)
+    if not str(heavy_cfg.model_type).endswith("_veomni"):
+        heavy_cfg.model_type = str(heavy_cfg.model_type) + "_veomni"
+    if getattr(heavy_cfg, "moe_implementation", None) != "fused":
+        heavy_cfg.moe_implementation = "fused"
+
+    # DBet config = heavy fields + drafter overrides (model_type -> DbetConfig's "dbet_veomni" default)
     hd = heavy_cfg.to_dict()
     for k in ("model_type", "architectures", "auto_map", "_name_or_path", "transformers_version"):
         hd.pop(k, None)
@@ -65,12 +72,13 @@ def main():
         warmstart_from_heavy_bottom=False,          # we warm-start MANUALLY below; saved config stays False so
         heavy_path=args.heavy_path,                  # the trainer doesn't re-warmstart on meta at load time
     )
-    print(f"[build_dbet_init] DbetConfig: hidden={cfg.hidden_size} heavy_layers={cfg.num_hidden_layers} "
-          f"draft_layers={cfg.draft_num_layers} sel={cfg.sel_layers_list} m={cfg.m}")
+    print(f"[build_dbet_init] DbetConfig: model_type={cfg.model_type} hidden={cfg.hidden_size} "
+          f"heavy_layers={cfg.num_hidden_layers} draft_layers={cfg.draft_num_layers} sel={cfg.sel_layers_list} m={cfg.m}")
 
-    # 2) load the heavy ONCE (real DMax weights, no random 16B init) and INJECT it; the drafter is small and
+    # 2) load the heavy ONCE (real DMax weights, FUSED experts) and INJECT it; the drafter is small and
     #    built+initialized normally. warmstart auto-call skipped (cfg flag False) -> we call it explicitly below.
-    heavy = LLaDA2MoeModelLM.from_pretrained(args.heavy_path, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    heavy = LLaDA2MoeModelLM.from_pretrained(
+        args.heavy_path, config=heavy_cfg, dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation="sdpa")
     model = DbetForDraftDecoding(cfg, _heavy=heavy).to(device=args.device, dtype=torch.bfloat16)
 
     # 3) warm-start drafter from the (real) heavy bottom + zero Δh; freeze the heavy/reused pieces
