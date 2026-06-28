@@ -45,7 +45,7 @@ def build_tiny_model(device, dtype):
     return model, cfg
 
 
-def make_batch(B, L, block_size, prompt_len, vocab, device, mask_id):
+def make_batch(B, L, block_size, prompt_len, device, mask_id):
     clean = torch.randint(0, mask_id, (B, L))                  # 0..mask_id-1 so clean tokens != mask_id
     maskable = torch.arange(L) >= prompt_len
     noisy = torch.stack([
@@ -64,7 +64,7 @@ def make_batch(B, L, block_size, prompt_len, vocab, device, mask_id):
 def main():
     torch.manual_seed(0)
     device, dtype = "cpu", torch.float32
-    B, L, block_size, prompt_len, vocab = 2, 16, 8, 4, 64
+    B, L, block_size, prompt_len = 2, 16, 8, 4
 
     model, cfg = build_tiny_model(device, dtype)
     args = SimpleNamespace(train=SimpleNamespace(block_size=block_size, heavy_commit_threshold=0.9, conf_loss_weight=1.0))
@@ -78,7 +78,7 @@ def main():
 
     opt = AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
     mask_id = cfg.mask_token_id
-    batch = make_batch(B, L, block_size, prompt_len, vocab, device, mask_id)
+    batch = make_batch(B, L, block_size, prompt_len, device, mask_id)
 
     first = None
     for step in range(30):
