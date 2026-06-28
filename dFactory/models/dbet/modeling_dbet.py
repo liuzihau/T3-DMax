@@ -473,9 +473,11 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
     config_class = DbetConfig
     _no_split_modules = ["DbetDecoderLayer"]
 
-    def __init__(self, config: DbetConfig):
+    def __init__(self, config: DbetConfig, _heavy: Optional[nn.Module] = None):
         super().__init__(config)
-        self.heavy = LLaDA2MoeModelLM(config)
+        # `_heavy`: inject an already-loaded heavy (e.g. LLaDA2MoeModelLM.from_pretrained) to avoid a wasteful
+        # random 16B init that would just be overwritten. Training (VeOmni meta path) leaves it None.
+        self.heavy = _heavy if _heavy is not None else LLaDA2MoeModelLM(config)
         embed = self.heavy.get_input_embeddings()
         lm_head = self.heavy.get_output_embeddings()
         final_norm = self.heavy.model.norm

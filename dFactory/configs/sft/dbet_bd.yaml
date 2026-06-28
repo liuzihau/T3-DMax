@@ -1,7 +1,7 @@
 # DBet drafter training (frozen DMax heavy + trainable Δh drafter).
 # Build the init checkpoint first:
 #   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
-#       --heavy_path <DMax-Math-16B-moe-merge> --out_dir ./dbet_init --block_size 32
+#       --heavy_path <DMax-Math-16B-moe-merge> --out_dir ./dbet_init --draft_num_layers 5 --sel_layers 1,10,19
 # Then launch:
 #   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH sh train.sh tasks/train_dbet.py configs/sft/dbet_bd.yaml
 model:

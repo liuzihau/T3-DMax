@@ -17,7 +17,8 @@ Needs enough RAM/VRAM for ~2x the heavy briefly (random heavy + the loaded DMax 
 
     PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
         --heavy_path /path/to/DMax-Math-16B-moe-merge --out_dir ./dbet_init \
-        --draft_num_layers 5 --sel_layers 1,10,19 --block_size 32
+        --draft_num_layers 5 --sel_layers 1,10,19
+(block_size is a TRAINING/data knob -> it lives in the yaml, not in the model checkpoint.)
 """
 
 import argparse
@@ -67,16 +68,12 @@ def main():
     print(f"[build_dbet_init] DbetConfig: hidden={cfg.hidden_size} heavy_layers={cfg.num_hidden_layers} "
           f"draft_layers={cfg.draft_num_layers} sel={cfg.sel_layers_list} m={cfg.m}")
 
-    # 2) build model (random heavy + drafter); warmstart auto-call skipped (flag False)
-    model = DbetForDraftDecoding(cfg).to(device=args.device, dtype=torch.bfloat16)
+    # 2) load the heavy ONCE (real DMax weights, no random 16B init) and INJECT it; the drafter is small and
+    #    built+initialized normally. warmstart auto-call skipped (cfg flag False) -> we call it explicitly below.
+    heavy = LLaDA2MoeModelLM.from_pretrained(args.heavy_path, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    model = DbetForDraftDecoding(cfg, _heavy=heavy).to(device=args.device, dtype=torch.bfloat16)
 
-    # 3) load the frozen DMax heavy weights IN PLACE (keeps draft.frozen_* refs valid)
-    dmax = LLaDA2MoeModelLM.from_pretrained(args.heavy_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
-    missing, unexpected = model.heavy.load_state_dict(dmax.state_dict(), strict=False)
-    print(f"[build_dbet_init] heavy load: {len(missing)} missing, {len(unexpected)} unexpected (expect ~0)")
-    del dmax
-
-    # 4) warm-start drafter from the real heavy bottom + zero Δh; freeze
+    # 3) warm-start drafter from the (real) heavy bottom + zero Δh; freeze the heavy/reused pieces
     model.init_draft_layers_warmstart()
     model._apply_freeze_flags()
 
