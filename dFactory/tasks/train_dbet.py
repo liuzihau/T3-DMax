@@ -157,6 +157,16 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default="0.1,0.3,0.5,0.7,0.9",
         metadata={"help": "DBet: comma-separated mask ratios swept during eval (acc/AUC-vs-mask-ratio)."}
     )
+    eval_tpf: int = field(
+        default=6,
+        metadata={"help": "DBet: heavy tokens-per-forward window. acc6/top*_6/h2_acc6 average over the first "
+                          "eval_tpf remaining positions per block (the decision-relevant span)."}
+    )
+    eval_heavy_second: bool = field(
+        default=True,
+        metadata={"help": "DBet: also run a heavy SECOND forward pass in eval (re-forward on the committed "
+                          "sequence) to report h2_acc/h2_acc6 -- the teacher ceiling. ~2x eval cost."}
+    )
     eval_at_start: bool = field(
         default=True,
         metadata={"help": "DBet: also run one eval before training (step 0 baseline) for the figures."}

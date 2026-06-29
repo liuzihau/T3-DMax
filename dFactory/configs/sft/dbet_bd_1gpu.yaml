@@ -86,6 +86,8 @@ train:
   eval_holdout_size: 128            # tail examples of the train file held out for validation
   eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
   eval_at_start: true               # step-0 baseline (untrained drafter) point for the figures
+  eval_tpf: 6                       # heavy tokens/forward window: acc6/top*_6/h2_acc6 avg over first 6 positions
+  eval_heavy_second: true           # also report heavy 2nd-pass acc (teacher ceiling); ~2x eval cost
   # metrics_path: ""                # default -> <output_dir>/dbet_metrics.jsonl
   #
   skip_nonfinite_steps: true        # bf16 stability guard: skip optimizer step on NaN/Inf grad (don't poison weights)

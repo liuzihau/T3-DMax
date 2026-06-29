@@ -54,12 +54,14 @@ def decay_weights(remaining_mask, block_size):
     return w.view(B, L)
 
 
-def dbet_forward(core, micro_batch, args, mask_id=MASK_ID):
+def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=False):
     """Shared FROZEN-heavy -> commit -> drafter forward (no loss). Used by BOTH `dbet_train_step` (with grad on
     the drafter) and the eval pass (wrapped in no_grad) so the two can never drift apart.
     `core` is the UNWRAPPED model; micro_batch carries the dual stream (input_ids=[noisy|clean] [B,2L],
     attention_mask=[B,1,2L,2L] block prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
-    Returns: logits [B,L,V], conf [B,L] (or None), remaining [B,L] bool, clean_ids [B,L] (golden)."""
+    Returns: logits [B,L,V], conf [B,L] (or None), remaining [B,L] bool, clean_ids [B,L] (golden).
+    If return_post_commit: also returns post_commit [B,L] (heavy pass-1 committed ids) as a 5th element
+    (the eval uses it to run a heavy SECOND pass)."""
     cfg = core.config
     bs, thr = args.train.block_size, args.train.heavy_commit_threshold
 
@@ -87,6 +89,8 @@ def dbet_forward(core, micro_batch, args, mask_id=MASK_ID):
         h_sel_denoise=noisy_h_sel, h_last_denoise=noisy_h_last, h_sel_prefix=clean_h_sel,
         attention_mask=derive_drafter_mask(attn, L), position_ids=pos, denoise_mask=None, tau=None,
     )
+    if return_post_commit:
+        return out["logits"], out["conf"], remaining, clean_ids, post_commit
     return out["logits"], out["conf"], remaining, clean_ids
 
 

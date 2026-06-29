@@ -112,6 +112,22 @@ def main():
         ax.grid(alpha=0.3)
         _save(fig, out_dir, "acc_by_position")
 
+        # ---- top-1/2/3 coverage + heavy 2nd-pass vs block position ----
+        ptk = last.get("acc_by_pos_topk", [])        # [[k, top1, top2, top3, h2, count], ...]
+        if ptk:
+            ks = [r[0] for r in ptk]
+            fig, ax = plt.subplots(figsize=(7, 4.2))
+            ax.plot(ks, [r[1] for r in ptk], "o-", color="tab:blue", lw=1.6, ms=3, label="drafter top-1")
+            ax.plot(ks, [r[2] for r in ptk], "o-", color="tab:green", lw=1.4, ms=3, label="drafter top-2")
+            ax.plot(ks, [r[3] for r in ptk], "o-", color="tab:olive", lw=1.4, ms=3, label="drafter top-3")
+            if any(r[4] > 0 for r in ptk):
+                ax.plot(ks, [r[4] for r in ptk], "s--", color="tab:red", lw=1.4, ms=3, label="heavy 2nd pass")
+            ax.set_xlabel("distance into block (remaining-position index k)")
+            ax.set_ylabel("accuracy / coverage"); ax.set_ylim(0, 1)
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            ax.set_title(f"DBet: top-k coverage & heavy 2nd-pass by position (step {last['step']})")
+            _save(fig, out_dir, "topk_by_position")
+
         sg = last.get("acc_by_sigma", [])
         ag = {s: a for s, a, _ in sg}
         au = {s: a for s, a in last.get("auc_by_sigma", [])}

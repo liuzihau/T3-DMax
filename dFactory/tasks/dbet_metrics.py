@@ -147,21 +147,35 @@ def _build_dual_stream(noisy_ids, clean_ids, mask_proto, device):
 def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_ID,
                   sigmas=(0.1, 0.3, 0.5, 0.7, 0.9)):
     """Held-out eval over `holdout` (list of (clean_ids, prompt_len)) re-noised at each sigma in `sigmas`.
-    Returns (scalar_metrics, detail) where:
-      scalar_metrics: acc, auc, tok (decayed CE, train-equivalent), conf (BCE), n + per-sigma acc/auc scalars
-      detail: acc_by_pos [[k,acc,count]...], acc_by_sigma [[s,acc,count]...], auc_by_sigma [[s,auc]...]
-    `acc` is UNWEIGHTED fraction of remaining-masked positions where drafter argmax == golden (headline)."""
+    Returns (scalar_metrics, detail).
+
+    Metrics on the remaining-masked positions (drafter argmax/top-k vs golden):
+      acc                      pooled top-1 accuracy over ALL remaining positions (headline)
+      top2 / top3              pooled top-2 / top-3 coverage (golden in the drafter's top-k) -- "if we suggest
+                               3 tokens at a position, does golden appear?"
+      acc6 / top2_6 / top3_6   the same but over the FIRST `eval_tpf` (default 6) remaining positions per block,
+                               averaged ACROSS positions (per-position acc, then mean over k<tpf). The heavy
+                               commits ~3-7 tokens/forward (~6 TPF), so this is the decision-relevant window.
+      h2_acc / h2_acc6         HEAVY second-pass top-1 accuracy (re-forward the heavy on the committed sequence)
+                               over all remaining / the first-tpf window -- the teacher ceiling the drafter
+                               approximates (only when eval_heavy_second).
+      auc / conf / tok         confidence-head ROC-AUC, conf BCE, decayed token CE.
+    detail: acc_by_pos, acc_by_pos_topk, acc_by_sigma, auc_by_sigma, acc_by_pos_sigma."""
     from dataset.data_transform_dbet import block_left_to_right_reveal
     bs = args.train.block_size
     L = args.data.max_seq_len
+    tpf = int(getattr(args.train, "eval_tpf", 6))                      # heavy tokens/forward window
+    heavy_second = bool(getattr(args.train, "eval_heavy_second", True))
 
     all_conf, all_accept = [], []
     tok_num = tok_den = 0.0
     conf_num = conf_den = 0.0
-    pos_correct = defaultdict(float)
     pos_total = defaultdict(float)
-    ps_correct = defaultdict(float)        # joint (sigma, k) -> correct count  (for the acc heatmap)
-    ps_total = defaultdict(float)          # joint (sigma, k) -> total count
+    pos_top1 = defaultdict(float); pos_top2 = defaultdict(float); pos_top3 = defaultdict(float)
+    pos_h2 = defaultdict(float)
+    ps_correct = defaultdict(float)        # joint (sigma, k) -> top-1 correct count  (for the acc heatmap)
+    ps_total = defaultdict(float)
+    pool = {"t1": 0.0, "t2": 0.0, "t3": 0.0, "h2": 0.0, "n": 0.0}
     sig_correct = {s: 0.0 for s in sigmas}
     sig_total = {s: 0.0 for s in sigmas}
     sig_conf = {s: [] for s in sigmas}
@@ -175,32 +189,51 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
         for sigma in sigmas:
             noisy = block_left_to_right_reveal(clean_ids.clone(), (sigma, sigma), maskable, mask_id, bs)
             mb = _build_dual_stream(noisy.unsqueeze(0), clean_ids.unsqueeze(0), mask_proto, device)
-            logits, conf, remaining, golden = dbet_forward(core, mb, args, mask_id)
+            out = dbet_forward(core, mb, args, mask_id, return_post_commit=heavy_second)
+            if heavy_second:
+                logits, conf, remaining, golden, post_commit = out
+            else:
+                logits, conf, remaining, golden = out
             rem = remaining[0]
             if int(rem.sum()) == 0:
                 continue
-            pred = logits[0].argmax(-1)
-            correct = ((pred == golden[0]) & rem)
+            g = golden[0]
+            top3_idx = logits[0].topk(3, dim=-1).indices                  # [L,3]
+            in1 = top3_idx[:, 0] == g
+            in2 = (top3_idx[:, :2] == g.unsqueeze(-1)).any(-1)
+            in3 = (top3_idx == g.unsqueeze(-1)).any(-1)
+            correct = in1 & rem                                            # top-1 (== existing acc/heatmap)
+
+            # heavy SECOND pass: re-forward the heavy with the committed tokens revealed -> teacher ceiling
+            if heavy_second:
+                mb2 = _build_dual_stream(post_commit, golden.unsqueeze(0) if golden.dim() == 1 else golden,
+                                         mask_proto, device)
+                h2 = core.heavy(input_ids=mb2["input_ids"], attention_mask=mb2["attention_mask"],
+                                position_ids=mb2["position_ids"], use_cache=False, return_dict=True)
+                h2_correct = (h2.logits[0, :L].argmax(-1) == g) & rem
 
             # decayed CE + BCE (train-equivalent aggregate, for the loss curve)
             w = decay_weights(remaining, bs)[0]
             denom = float(w.sum().clamp_min(1.0))
-            ce = F.cross_entropy(logits[0], golden[0], reduction="none")
+            ce = F.cross_entropy(logits[0], g, reduction="none")
             tok_num += float((ce * w).sum()); tok_den += denom
 
             # per-block distance index k (0 at first remaining pos in block)
             nb = L // bs
-            rem_b = rem.view(nb, bs)
-            k = (torch.cumsum(rem_b.long(), dim=-1) - 1).clamp(min=0).view(L)
-            corr_b = correct.float()
+            k = (torch.cumsum(rem.view(nb, bs).long(), dim=-1) - 1).clamp(min=0).view(L)
             idxs = torch.nonzero(rem, as_tuple=False).flatten()
-            for p in idxs.tolist():
-                kk = int(k[p])
-                cval = float(corr_b[p])
-                pos_total[kk] += 1.0
-                pos_correct[kk] += cval
-                ps_total[(float(sigma), kk)] += 1.0          # joint (sigma, k) for the heatmap
-                ps_correct[(float(sigma), kk)] += cval
+            kk = k[idxs].tolist()
+            c1 = in1[idxs].tolist(); c2 = in2[idxs].tolist(); c3 = in3[idxs].tolist()
+            hh = h2_correct[idxs].tolist() if heavy_second else [0.0] * len(kk)
+            for j, p_k in enumerate(kk):
+                pos_total[p_k] += 1.0
+                pos_top1[p_k] += c1[j]; pos_top2[p_k] += c2[j]; pos_top3[p_k] += c3[j]; pos_h2[p_k] += hh[j]
+                ps_total[(float(sigma), p_k)] += 1.0
+                ps_correct[(float(sigma), p_k)] += c1[j]
+            pool["t1"] += float(in1[rem].sum()); pool["t2"] += float(in2[rem].sum())
+            pool["t3"] += float(in3[rem].sum()); pool["n"] += float(rem.sum())
+            if heavy_second:
+                pool["h2"] += float(h2_correct[rem].sum())
 
             sig_correct[sigma] += float(correct.sum())
             sig_total[sigma] += float(rem.sum())
@@ -209,23 +242,32 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
                 avals = correct[rem].float()
                 all_conf.append(cvals); all_accept.append(avals)
                 sig_conf[sigma].append(cvals); sig_accept[sigma].append(avals)
-                c = conf[0][rem].clamp(1e-5, 1 - 1e-5)
+                c = conf[0][rem].float().clamp(1e-5, 1 - 1e-5)
                 a = correct[rem].float()
                 bce = -(a * c.log() + (1 - a) * (1 - c).log())
                 conf_num += float((bce * w[rem]).sum()); conf_den += denom
     if was_training:
         core.train()
 
-    tot_correct = sum(sig_correct.values())
-    tot_total = sum(sig_total.values()) or 1.0
+    n = pool["n"] or 1.0
+
+    def _avg_pos(table):  # avg-of-position over the first-tpf window (per-position rate, then mean over k<tpf)
+        ks = [k for k in pos_total if k < tpf]
+        return (sum(table[k] / pos_total[k] for k in ks) / len(ks)) if ks else float("nan")
+
     scalar = {
-        "acc": tot_correct / tot_total,
+        "acc": pool["t1"] / n,                       # pooled top-1 over all remaining (headline)
+        "top2": pool["t2"] / n, "top3": pool["t3"] / n,
+        "acc6": _avg_pos(pos_top1),                  # first-tpf window, avg across positions
+        "top2_6": _avg_pos(pos_top2), "top3_6": _avg_pos(pos_top3),
         "tok": tok_num / (tok_den or 1.0),
-        "n": int(tot_total),
+        "n": int(pool["n"]),
     }
+    if heavy_second:
+        scalar["h2_acc"] = pool["h2"] / n
+        scalar["h2_acc6"] = _avg_pos(pos_h2)
     if all_conf:
-        conf_cat = torch.cat(all_conf); accept_cat = torch.cat(all_accept)
-        scalar["auc"] = roc_auc(conf_cat, accept_cat)
+        scalar["auc"] = roc_auc(torch.cat(all_conf), torch.cat(all_accept))
         scalar["conf"] = conf_num / (conf_den or 1.0)
 
     acc_by_sigma, auc_by_sigma = [], []
@@ -239,11 +281,12 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
             auc_by_sigma.append([float(s), auc_s])
             scalar[f"auc_sig{s}"] = auc_s
 
-    acc_by_pos = [[k, pos_correct[k] / pos_total[k], int(pos_total[k])]
-                  for k in sorted(pos_total.keys())]
-    # joint (sigma, k) accuracy grid for the heatmap: [[sigma, k, acc, count], ...] (empty cells simply absent)
+    acc_by_pos = [[k, pos_top1[k] / pos_total[k], int(pos_total[k])] for k in sorted(pos_total.keys())]
+    # richer per-position table: [k, top1, top2, top3, h2, count]
+    acc_by_pos_topk = [[k, pos_top1[k] / pos_total[k], pos_top2[k] / pos_total[k], pos_top3[k] / pos_total[k],
+                        pos_h2[k] / pos_total[k], int(pos_total[k])] for k in sorted(pos_total.keys())]
     acc_by_pos_sigma = [[s, k, ps_correct[(s, k)] / ps_total[(s, k)], int(ps_total[(s, k)])]
                         for (s, k) in sorted(ps_total.keys())]
-    detail = {"acc_by_pos": acc_by_pos, "acc_by_sigma": acc_by_sigma, "auc_by_sigma": auc_by_sigma,
-              "acc_by_pos_sigma": acc_by_pos_sigma}
+    detail = {"acc_by_pos": acc_by_pos, "acc_by_pos_topk": acc_by_pos_topk, "acc_by_sigma": acc_by_sigma,
+              "auc_by_sigma": auc_by_sigma, "acc_by_pos_sigma": acc_by_pos_sigma}
     return scalar, detail
