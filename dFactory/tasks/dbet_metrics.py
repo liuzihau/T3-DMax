@@ -160,6 +160,8 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
     conf_num = conf_den = 0.0
     pos_correct = defaultdict(float)
     pos_total = defaultdict(float)
+    ps_correct = defaultdict(float)        # joint (sigma, k) -> correct count  (for the acc heatmap)
+    ps_total = defaultdict(float)          # joint (sigma, k) -> total count
     sig_correct = {s: 0.0 for s in sigmas}
     sig_total = {s: 0.0 for s in sigmas}
     sig_conf = {s: [] for s in sigmas}
@@ -194,8 +196,11 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
             idxs = torch.nonzero(rem, as_tuple=False).flatten()
             for p in idxs.tolist():
                 kk = int(k[p])
+                cval = float(corr_b[p])
                 pos_total[kk] += 1.0
-                pos_correct[kk] += float(corr_b[p])
+                pos_correct[kk] += cval
+                ps_total[(float(sigma), kk)] += 1.0          # joint (sigma, k) for the heatmap
+                ps_correct[(float(sigma), kk)] += cval
 
             sig_correct[sigma] += float(correct.sum())
             sig_total[sigma] += float(rem.sum())
@@ -236,5 +241,9 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
 
     acc_by_pos = [[k, pos_correct[k] / pos_total[k], int(pos_total[k])]
                   for k in sorted(pos_total.keys())]
-    detail = {"acc_by_pos": acc_by_pos, "acc_by_sigma": acc_by_sigma, "auc_by_sigma": auc_by_sigma}
+    # joint (sigma, k) accuracy grid for the heatmap: [[sigma, k, acc, count], ...] (empty cells simply absent)
+    acc_by_pos_sigma = [[s, k, ps_correct[(s, k)] / ps_total[(s, k)], int(ps_total[(s, k)])]
+                        for (s, k) in sorted(ps_total.keys())]
+    detail = {"acc_by_pos": acc_by_pos, "acc_by_sigma": acc_by_sigma, "auc_by_sigma": auc_by_sigma,
+              "acc_by_pos_sigma": acc_by_pos_sigma}
     return scalar, detail

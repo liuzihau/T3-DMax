@@ -127,6 +127,35 @@ def main():
             ax.grid(alpha=0.3)
             _save(fig, out_dir, "acc_by_sigma")
 
+        # ---- accuracy heatmap over (mask ratio sigma, block position k) ----
+        grid = last.get("acc_by_pos_sigma", [])
+        if grid:
+            import numpy as np
+            sigmas = sorted({row[0] for row in grid})
+            ks = sorted({row[1] for row in grid})
+            si = {s: i for i, s in enumerate(sigmas)}
+            ki = {k: i for i, k in enumerate(ks)}
+            acc = np.full((len(ks), len(sigmas)), np.nan)        # rows = k, cols = sigma; empty cells stay NaN
+            cnt = np.zeros((len(ks), len(sigmas)))
+            for s, k, a, n in grid:
+                acc[ki[k], si[s]] = a
+                cnt[ki[k], si[s]] = n
+            masked = np.ma.masked_invalid(acc)                   # empty (no-data) cells -> "bad" color
+            fig, ax = plt.subplots(figsize=(1.4 * len(sigmas) + 2.5, 0.32 * len(ks) + 2))
+            cmap = plt.cm.viridis.copy(); cmap.set_bad("lightgray")
+            im = ax.imshow(masked, aspect="auto", origin="lower", cmap=cmap, vmin=0, vmax=1)
+            ax.set_xticks(range(len(sigmas))); ax.set_xticklabels([f"{s:g}" for s in sigmas])
+            ax.set_yticks(range(len(ks))); ax.set_yticklabels([str(k) for k in ks])
+            ax.set_xlabel("mask ratio sigma"); ax.set_ylabel("block position index k")
+            ax.set_title(f"DBet: drafter accuracy by (sigma, position)  step {last['step']}\n(grey = no data)")
+            for r in range(len(ks)):
+                for c in range(len(sigmas)):
+                    if not masked.mask[r, c]:
+                        ax.text(c, r, f"{acc[r, c]:.2f}", ha="center", va="center", fontsize=6,
+                                color="white" if acc[r, c] < 0.55 else "black")
+            fig.colorbar(im, ax=ax, label="accuracy", fraction=0.046, pad=0.04)
+            _save(fig, out_dir, "acc_heatmap")
+
     print("done.")
 
 
