@@ -55,7 +55,11 @@ train:
   lr_decay_ratio: 1.0
   weight_decay: 0.01
   max_grad_norm: 1.0
-  enable_mixed_precision: true      # model.float(): heavy upcast to fp32 (~64GB) -> set false if OOM (keeps bf16 ~32GB)
+  enable_mixed_precision: false     # MUST be false on 1 GPU: true builds fp32 (train_dbet.py:295) + model.float(),
+                                    #   but the FUSED MoE Triton kernel asserts bf16/fp16 weights (group_gemm.py:189)
+                                    #   and there's no FSDP MixedPrecision to cast back. false -> bf16 end-to-end
+                                    #   (~32GB, kernel-compatible). Drafter trains in bf16 (no fp32 master) -- OK for
+                                    #   validation; use the multi-GPU FSDP dbet_bd.yaml for the real fp32-master run.
   enable_gradient_checkpointing: true
   enable_full_shard: false          # 1-GPU: no FSDP sharding
   enable_fsdp_offload: false        # 1-GPU: offload is FSDP-only -> must be false
