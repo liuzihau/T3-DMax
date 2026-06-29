@@ -1,0 +1,75 @@
+# DBet drafter training -- SINGLE-GPU variant (validation / pipeline smoke on one H200).
+#
+# Why a separate file: VeOmni only enables FSDP when fsdp_size = world_size/(pp*tp) > 1. On 1 GPU FSDP is
+# OFF, which FORBIDS init_device=meta and enable_fsdp_offload (build_parallelize_model raises
+# "Only FSDP training supports init_device=cpu or init_device=meta"). So on 1 GPU we must build eagerly on
+# cuda (the loader loads weights directly) and not shard/offload. The frozen 16B heavy fits: its forward runs
+# under torch.no_grad() (no retained activations); fp32 heavy ~64GB + drafter + Adam ~ fits in 140GB.
+# Because the model is returned UNWRAPPED on 1 GPU, dbet_train_step's model.heavy/model.draft access just works.
+#
+# For the real MULTI-GPU run use configs/sft/dbet_bd.yaml (meta + fsdp2 + offload), launched on N>1 GPUs.
+#
+# Build the init checkpoint first (once):
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
+#       --heavy_path ../DMax-Math-16B-moe-merge --out_dir ./dbet_init --draft_num_layers 5 --sel_layers 1,10,19
+# Then launch:
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dbet.py configs/sft/dbet_bd_1gpu.yaml
+model:
+  config_path: ./dbet_init
+  model_path: ./dbet_init
+  tokenizer_path: ../DMax-Math-16B-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl   # EDIT to your real OPUT math data (build_dataset_oput.py)
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./dbet_outputs
+  data_parallel_mode: fsdp2        # ignored on 1 GPU (FSDP not enabled); kept so a multi-GPU launch still shards
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  num_train_epochs: 2
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true      # model.float(): heavy upcast to fp32 (~64GB) -> set false if OOM (keeps bf16 ~32GB)
+  enable_gradient_checkpointing: true
+  enable_full_shard: false          # 1-GPU: no FSDP sharding
+  enable_fsdp_offload: false        # 1-GPU: offload is FSDP-only -> must be false
+  enable_activation_offload: false
+  init_device: cuda                 # 1-GPU: build + load weights eagerly on GPU (meta is FSDP-only)
+  broadcast_model_weights_from_rank0: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+  # --- DBet block-diffusion + drafter knobs ---
+  block_diffusion_mode: true
+  block_size: 32
+  heavy_commit_threshold: 0.9
+  conf_loss_weight: 1.0
+  same_token_labels: true
+  use_wandb: false
+  log_steps: 1
