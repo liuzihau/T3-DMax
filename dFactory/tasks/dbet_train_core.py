@@ -43,15 +43,43 @@ def derive_drafter_mask(dual_mask, L):
     return torch.cat([noisy_rows[:, :, :, L:2 * L], noisy_rows[:, :, :, :L]], dim=-1)
 
 
-def decay_weights(remaining_mask, block_size):
-    """Per-block left-to-right decay over remaining positions: w[k] = max(0.9^k, 0.1), k=0 at the first
-    remaining position in the block, 0 outside remaining. remaining_mask [B,L] -> w [B,L]."""
+def decay_weights(remaining_mask, block_size, mode="dbet", base=0.9, floor=0.1,
+                  head=0.95, tail=0.8, window=6, gamma=14.0):
+    """Per-block left-to-right loss-weight over remaining positions. k=0 at the first remaining position in the
+    block; weight is 0 outside remaining. `mode` selects the schedule (config.loss_decay_mode):
+      - "dbet"          : w[k] = max(base^k, floor)                              (original; base 0.9, floor 0.1)
+      - "dbet_twophase" : gentle head^k for k<window, then steeper tail decay -> concentrate weight on the first
+                          `window` tokens. w[k<W]=head^k ; w[k>=W]=head^(W-1)*tail^(k-W+1) ; floored at `floor`.
+      - "dflash"        : w[k] = exp(-k/gamma)  (DFlash Eq.4 with 0-based k == their 1-based exp(-(k-1)/γ);
+                          floored at `floor`). gamma ~ block_size/2 (paper: 7@bs16, 5@bs10, 4@bs8).
+    remaining_mask [B,L] -> w [B,L]."""
     B, L = remaining_mask.shape
     nb = L // block_size
     rem = remaining_mask.view(B, nb, block_size)
-    k = (torch.cumsum(rem.long(), dim=-1) - 1).clamp(min=0)
-    w = torch.clamp(0.9 ** k.float(), min=0.1) * rem.float()
+    k = (torch.cumsum(rem.long(), dim=-1) - 1).clamp(min=0).float()
+    if mode == "dflash":
+        wk = torch.exp(-k / gamma)
+    elif mode == "dbet_twophase":
+        boundary = head ** (window - 1)
+        wk = torch.where(k < window, head ** k, boundary * tail ** (k - (window - 1)).clamp(min=0.0))
+    else:  # "dbet" (default, original)
+        wk = base ** k
+    w = torch.clamp(wk, min=floor) * rem.float()
     return w.view(B, L)
+
+
+def decay_kwargs(args):
+    """Extract the loss-decay schedule kwargs from args.train (all optional; safe defaults == original 'dbet')."""
+    t = args.train
+    return dict(
+        mode=getattr(t, "loss_decay_mode", "dbet"),
+        base=getattr(t, "loss_decay_base", 0.9),
+        floor=getattr(t, "loss_decay_floor", 0.1),
+        head=getattr(t, "loss_decay_head", 0.95),
+        tail=getattr(t, "loss_decay_tail", 0.8),
+        window=getattr(t, "loss_decay_window", 6),
+        gamma=getattr(t, "loss_decay_gamma", 14.0),
+    )
 
 
 def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=False):
@@ -120,7 +148,7 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
     logits, conf, remaining, clean_ids = dbet_forward(core, micro_batch, args, mask_id)
 
     # decayed CE + confidence BCE on the remaining-masked positions vs golden
-    w = decay_weights(remaining, bs)
+    w = decay_weights(remaining, bs, **decay_kwargs(args))
     denom = w.sum().clamp_min(1.0)
     # CE in fp32: bf16 logsumexp can overflow for large drafter logits (NaN). logits.float() is the stable path.
     ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), clean_ids.reshape(-1),

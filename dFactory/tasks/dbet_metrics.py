@@ -23,7 +23,7 @@ from collections import defaultdict, deque
 import torch
 import torch.nn.functional as F
 
-from dbet_train_core import MASK_ID, dbet_forward, decay_weights
+from dbet_train_core import MASK_ID, dbet_forward, decay_weights, decay_kwargs
 
 
 # ----------------------------------------------------------------------------- AUC (dependency-free)
@@ -213,7 +213,7 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
                 h2_correct = (h2.logits[0, :L].argmax(-1) == g) & rem
 
             # decayed CE + BCE (train-equivalent aggregate, for the loss curve)
-            w = decay_weights(remaining, bs)[0]
+            w = decay_weights(remaining, bs, **decay_kwargs(args))[0]
             denom = float(w.sum().clamp_min(1.0))
             ce = F.cross_entropy(logits[0], g, reduction="none")
             tok_num += float((ce * w).sum()); tok_den += denom

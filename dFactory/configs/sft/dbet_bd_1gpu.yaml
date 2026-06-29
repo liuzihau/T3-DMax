@@ -28,8 +28,10 @@ data:
   dataloader_type: native
   max_seq_len: 2048
   text_keys: messages
-  noise_range_low: 0.75
-  noise_range_high: 0.75
+  noise_range_low: 0.4              # mask ratio sigma in [low,high]; reveal = 1-sigma. [0.4,1.0] -> reveal 0%-60%
+  noise_range_high: 1.0            #   (dynamic reveal; was fixed 0.75/0.75 = 25% reveal)
+  revealed_corrupt_rate: 0.0       # EAGLE-style aug: prob to corrupt each revealed answer token (noisy stream).
+                                   #   0 = off; try 0.05-0.15 so the drafter is robust to heavy-decode errors.
   num_workers: 16
 
 train:
@@ -78,6 +80,14 @@ train:
   block_size: 32
   heavy_commit_threshold: 0.9
   conf_loss_weight: 1.0
+  # --- loss-weight schedule over remaining positions (pick one via loss_decay_mode) ---
+  loss_decay_mode: dbet            # 'dbet' (max(base^k,floor)) | 'dbet_twophase' | 'dflash' (exp(-k/gamma))
+  loss_decay_base: 0.9             # 'dbet'
+  loss_decay_floor: 0.1            #   (set 0.025 for the twophase method)
+  loss_decay_head: 0.95            # 'dbet_twophase' gentle decay for first `window` tokens
+  loss_decay_tail: 0.8             # 'dbet_twophase' steep decay after `window`
+  loss_decay_window: 6             # 'dbet_twophase' first-T boundary
+  loss_decay_gamma: 14.0           # 'dflash' exp(-k/gamma); ~block_size/2 (paper 7@bs16)
   same_token_labels: true
   # --- metrics + held-out validation (figures via scripts/plot_dbet_metrics.py) ---
   use_wandb: false                  # set true to also stream to Weights & Biases (wandb_project/wandb_name)

@@ -90,6 +90,12 @@ class LLaDA2DataArguments(DataArguments):
         default=0.8,
         metadata={"help": "Noise level for random flip input_ids to mask_ids"}
     )
+    revealed_corrupt_rate: float = field(
+        default=0.0,
+        metadata={"help": "DBet (EAGLE-style aug): prob of corrupting each REVEALED answer token to a random "
+                          "token in the NOISY stream, so the heavy hidden is imperfect and the drafter must "
+                          "reconstruct (mimics heavy-decoded context at inference). 0 disables; try ~0.05-0.15."}
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -141,6 +147,18 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default=1.0,
         metadata={"help": "DBet: weight of the confidence-head BCE relative to the token CE."}
     )
+    loss_decay_mode: str = field(
+        default="dbet",
+        metadata={"help": "DBet loss-weight schedule over remaining positions: 'dbet' (max(base^k,floor); "
+                          "original), 'dbet_twophase' (gentle head^k for first `window`, then steep tail decay), "
+                          "or 'dflash' (exp(-k/gamma), DFlash Eq.4)."}
+    )
+    loss_decay_base: float = field(default=0.9, metadata={"help": "'dbet' per-position decay base."})
+    loss_decay_floor: float = field(default=0.1, metadata={"help": "Minimum weight floor (try 0.025 for twophase)."})
+    loss_decay_head: float = field(default=0.95, metadata={"help": "'dbet_twophase' gentle decay for k<window."})
+    loss_decay_tail: float = field(default=0.8, metadata={"help": "'dbet_twophase' steep decay for k>=window."})
+    loss_decay_window: int = field(default=6, metadata={"help": "'dbet_twophase' head/tail boundary (first-T)."})
+    loss_decay_gamma: float = field(default=14.0, metadata={"help": "'dflash' decay rate gamma (~block_size/2)."})
     log_steps: int = field(
         default=10,
         metadata={"help": "DBet: write a train-metrics record (loss/tok/conf/acc/grad_norm/lr/tok_s) every N steps."}
@@ -273,6 +291,11 @@ def main():
 
     logger.info_rank0("Prepare data")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
+    # EAGLE-style robustness aug: corrupt a fraction of revealed answer tokens (noisy stream only).
+    _corrupt_rate = getattr(args.data, "revealed_corrupt_rate", 0.0)
+    _vocab_size = len(tokenizer) if _corrupt_rate > 0 else None
+    if _corrupt_rate > 0:
+        logger.info_rank0(f"Revealed-token corruption ON: rate={_corrupt_rate}, vocab={_vocab_size} (noisy stream).")
     if args.data.data_type == "conversation":
         if not tokenizer.chat_template:
             raise ValueError(f"No chat template found in the tokenizer.")
@@ -285,6 +308,7 @@ def main():
             text_keys=args.data.text_keys,
             noise_range=(args.data.noise_range_low, args.data.noise_range_high),
             mask_token_id=156895,
+            corrupt_rate=_corrupt_rate, vocab_size=_vocab_size,
         )
     elif args.data.data_type == "tokenid":
         transform = partial(
@@ -294,6 +318,7 @@ def main():
             text_keys=args.data.text_keys,
             noise_range=(args.data.noise_range_low, args.data.noise_range_high),
             mask_token_id=156895,
+            corrupt_rate=_corrupt_rate, vocab_size=_vocab_size,
         )
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")

@@ -14,6 +14,8 @@ The dual-stream `[noisy|clean]` + the block-diffusion mask (M_BD | M_OBC | M_BC)
 (data-independent, once per run) — `build_block_diffusion_attn_mask` here is the shared source of that mask.
 """
 
+import random as _random
+
 import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union  # noqa: F401
 
@@ -38,14 +40,20 @@ def _sample_sigma(noise_range, progress_state=None, sigma_gate=0.0):
 
 
 def block_left_to_right_reveal(x_0, noise_range, maskable_mask, mask_token_id, block_size,
-                               progress_state=None, sigma_gate=0.0):
+                               progress_state=None, sigma_gate=0.0, corrupt_rate=0.0, vocab_size=None):
     """Noise transition by LEFT-TO-RIGHT per-block reveal (the DBet replacement for random `sft_noise_transition`).
     Grid-aligned blocks from position 0; per block, keep the leftmost round((1-σ)·#maskable) maskable tokens and
-    mask the rest. Drop-in signature (adds `block_size`). x_0 [L] -> x_t [L]."""
+    mask the rest. Drop-in signature (adds `block_size`). x_0 [L] -> x_t [L].
+
+    If `corrupt_rate`>0 (EAGLE-style robustness aug): each REVEALED answer token is, with prob corrupt_rate,
+    replaced by a uniformly random token in [0,vocab_size) (!= mask_token_id). This makes the heavy's hidden
+    imperfect at training (mimicking heavy-DECODED context at inference), so the drafter must reconstruct from
+    noisy signal. Applied to the NOISY stream only -- the clean stream / labels stay golden."""
     sigma = _sample_sigma(noise_range, progress_state, sigma_gate)
     reveal_ratio = max(0.0, min(1.0, 1.0 - sigma))
     L = x_0.shape[0]
     x_t = x_0.clone()
+    do_corrupt = corrupt_rate > 0.0 and vocab_size is not None
     for bs in range(0, L, block_size):
         be = min(bs + block_size, L)
         maskable = [p for p in range(bs, be) if bool(maskable_mask[p])]
@@ -54,6 +62,11 @@ def block_left_to_right_reveal(x_0, noise_range, maskable_mask, mask_token_id, b
         keep = int(round(reveal_ratio * len(maskable)))
         for p in maskable[keep:]:                      # mask everything past the revealed left prefix
             x_t[p] = mask_token_id
+        if do_corrupt:
+            for p in maskable[:keep]:                   # corrupt a fraction of the REVEALED answer tokens
+                if _random.random() < corrupt_rate:
+                    r = _random.randrange(vocab_size)
+                    x_t[p] = r if r != mask_token_id else (r + 1) % vocab_size
     return x_t
 
 
@@ -71,9 +84,12 @@ def process_mdm_sft_example(
     source_name: Optional[str] = None,
     progress_state: Optional[Any] = None,
     sigma_gate: float = 0.0,
+    corrupt_rate: float = 0.0,
+    vocab_size: Optional[int] = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     """messages -> chat-template tokens -> (input_ids clean, noisy_input_ids left-to-right reveal, labels,
-    attention_mask=ones, flag). Same as data_transform.process_mdm_sft_example except the noise transition."""
+    attention_mask=ones, flag). Same as data_transform.process_mdm_sft_example except the noise transition.
+    `corrupt_rate`>0 corrupts a fraction of revealed answer tokens in the NOISY stream (EAGLE-style aug)."""
     if isinstance(text_keys, str):
         messages = example[text_keys]
     elif isinstance(text_keys, list):
@@ -94,6 +110,7 @@ def process_mdm_sft_example(
     noisy_input_ids = block_left_to_right_reveal(
         input_ids.clone(), noise_range, maskable_mask, mask_token_id, block_size,
         progress_state=progress_state, sigma_gate=sigma_gate,
+        corrupt_rate=corrupt_rate, vocab_size=vocab_size,
     )
 
     loss_mask = noisy_input_ids == mask_token_id
@@ -129,6 +146,8 @@ def process_mdm_tokenized_example(
     source_name: Optional[str] = None,
     progress_state: Optional[Any] = None,
     sigma_gate: float = 0.0,
+    corrupt_rate: float = 0.0,
+    vocab_size: Optional[int] = None,
 ) -> List[Dict[str, "torch.Tensor"]]:
     """Pre-tokenized variant (input_ids + prompt_lengths). Same output schema (no flag), left-to-right reveal."""
     if isinstance(text_keys, str):
@@ -152,6 +171,7 @@ def process_mdm_tokenized_example(
     noisy_input_ids = block_left_to_right_reveal(
         input_ids.clone(), noise_range, maskable_mask, mask_token_id, block_size,
         progress_state=progress_state, sigma_gate=sigma_gate,
+        corrupt_rate=corrupt_rate, vocab_size=vocab_size,
     )
     loss_mask = noisy_input_ids == mask_token_id
     labels[~loss_mask] = -100
