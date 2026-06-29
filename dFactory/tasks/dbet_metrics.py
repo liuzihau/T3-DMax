@@ -30,8 +30,9 @@ from dbet_train_core import MASK_ID, dbet_forward, decay_weights
 def roc_auc(scores, labels) -> float:
     """ROC-AUC via the Mann-Whitney U statistic with average ranks for ties. Returns nan if a class is absent.
     scores: 1D float tensor/list of predicted positives; labels: 0/1."""
-    s = torch.as_tensor(scores, dtype=torch.float64).flatten()
-    y = torch.as_tensor(labels, dtype=torch.float64).flatten()
+    # force CPU: AUC is cheap and ranking on CPU avoids device-mismatch when indexing (scores/labels are on cuda)
+    s = torch.as_tensor(scores, dtype=torch.float64).flatten().cpu()
+    y = torch.as_tensor(labels, dtype=torch.float64).flatten().cpu()
     n = y.numel()
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
