@@ -158,7 +158,7 @@ def main():
             ax.grid(alpha=0.3)
             _save(fig, out_dir, "acc_by_sigma")
 
-        # ---- accuracy heatmap over (mask ratio sigma, block position k) ----
+        # ---- accuracy heatmap: x = position k (distance from last revealed token), y = mask ratio sigma ----
         grid = last.get("acc_by_pos_sigma", [])
         if grid:
             import numpy as np
@@ -166,25 +166,23 @@ def main():
             ks = sorted({row[1] for row in grid})
             si = {s: i for i, s in enumerate(sigmas)}
             ki = {k: i for i, k in enumerate(ks)}
-            acc = np.full((len(ks), len(sigmas)), np.nan)        # rows = k, cols = sigma; empty cells stay NaN
-            cnt = np.zeros((len(ks), len(sigmas)))
+            acc = np.full((len(sigmas), len(ks)), np.nan)        # rows = sigma, cols = k; empty cells stay NaN
             for s, k, a, n in grid:
-                acc[ki[k], si[s]] = a
-                cnt[ki[k], si[s]] = n
+                acc[si[s], ki[k]] = a
             masked = np.ma.masked_invalid(acc)                   # empty (no-data) cells -> "bad" color
-            fig, ax = plt.subplots(figsize=(1.4 * len(sigmas) + 2.5, 0.32 * len(ks) + 2))
+            fig, ax = plt.subplots(figsize=(0.4 * len(ks) + 3, 0.4 * len(sigmas) + 2.5))
             cmap = plt.cm.viridis.copy(); cmap.set_bad("lightgray")
-            im = ax.imshow(masked, aspect="auto", origin="lower", cmap=cmap, vmin=0, vmax=1)
-            ax.set_xticks(range(len(sigmas))); ax.set_xticklabels([f"{s:g}" for s in sigmas])
-            ax.set_yticks(range(len(ks))); ax.set_yticklabels([str(k) for k in ks])
-            ax.set_xlabel("mask ratio sigma"); ax.set_ylabel("block position index k")
-            ax.set_title(f"DBet: drafter accuracy by (sigma, position)  step {last['step']}\n(grey = no data)")
-            for r in range(len(ks)):
-                for c in range(len(sigmas)):
+            im = ax.imshow(masked, aspect="equal", origin="lower", cmap=cmap, vmin=0, vmax=1)  # square cells
+            ax.set_xticks(range(len(ks))); ax.set_xticklabels([str(k) for k in ks], fontsize=7)
+            ax.set_yticks(range(len(sigmas))); ax.set_yticklabels([f"{s:g}" for s in sigmas])
+            ax.set_xlabel("position k (distance from last revealed token)"); ax.set_ylabel("mask ratio sigma")
+            ax.set_title(f"DBet: drafter accuracy by (position, sigma)  step {last['step']}  (grey = no data)")
+            for r in range(len(sigmas)):
+                for c in range(len(ks)):
                     if not masked.mask[r, c]:
-                        ax.text(c, r, f"{acc[r, c]:.2f}", ha="center", va="center", fontsize=6,
+                        ax.text(c, r, f"{acc[r, c]:.2f}", ha="center", va="center", fontsize=5,
                                 color="white" if acc[r, c] < 0.55 else "black")
-            fig.colorbar(im, ax=ax, label="accuracy", fraction=0.046, pad=0.04)
+            fig.colorbar(im, ax=ax, label="accuracy", fraction=0.025, pad=0.02)
             _save(fig, out_dir, "acc_heatmap")
 
     print("done.")
