@@ -354,6 +354,21 @@ def main():
         model.clip_grad_norm_ = types.MethodType(
             lambda self, max_norm: torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm), model)
 
+    # fp32 training (enable_mixed_precision=true) upcasts the whole model, but the fused MoE Triton kernel
+    # (group_gemm) asserts bf16/fp16 EXPERT weights -- it already casts activations to bf16 internally
+    # (ops/fused_moe.py). So keep ONLY the routed-expert weights bf16 and let everything else (incl. the trainable
+    # drafter + its optimizer) stay fp32. This gives stable fp32 training on 1 GPU without bf16 master-weight drift.
+    _n_cast = 0
+    for _m in model.modules():
+        if type(_m).__name__ == "LLaDA2MoeExperts":
+            for _pn in ("gate_proj", "up_proj", "down_proj"):
+                _p = getattr(_m, _pn, None)
+                if isinstance(_p, torch.nn.Parameter) and _p.dtype != torch.bfloat16:
+                    _p.data = _p.data.to(torch.bfloat16); _n_cast += 1
+    if _n_cast:
+        logger.info_rank0(f"[DBet] kept {_n_cast} fused-expert params in bf16 for the group_gemm kernel "
+                          f"(rest of the model fp32 for stable training).")
+
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,

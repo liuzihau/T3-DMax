@@ -49,18 +49,19 @@ train:
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 5.0e-5                         # bf16 (no fp32 master on 1 GPU) is divergence-prone: lr 1e-4 NaN'd ~87k steps.
-                                    #   5e-5 + skip_nonfinite_steps is stable here; fp32-master multi-GPU run can go higher.
+  lr: 1.0e-4                         # fp32 training is stable at higher lr (bf16 NaN'd at 1e-4 ~87k steps; fp32 won't).
+                                    #   DFlash trains its draft model at 6e-4 (cosine, warmup 0.04) -- can push toward
+                                    #   that in fp32. If running bf16 (enable_mixed_precision:false) drop to ~5e-5.
   lr_warmup_ratio: 0.03
   lr_decay_style: cosine
   lr_decay_ratio: 1.0
   weight_decay: 0.01
   max_grad_norm: 1.0
-  enable_mixed_precision: false     # MUST be false on 1 GPU: true builds fp32 (train_dbet.py:295) + model.float(),
-                                    #   but the FUSED MoE Triton kernel asserts bf16/fp16 weights (group_gemm.py:189)
-                                    #   and there's no FSDP MixedPrecision to cast back. false -> bf16 end-to-end
-                                    #   (~32GB, kernel-compatible). Drafter trains in bf16 (no fp32 master) -- OK for
-                                    #   validation; use the multi-GPU FSDP dbet_bd.yaml for the real fp32-master run.
+  enable_mixed_precision: true      # FP32 TRAINING on 1 GPU: builds fp32 + model.float(); train_dbet.py then keeps
+                                    #   ONLY the routed-expert weights bf16 (the fused MoE kernel needs bf16 experts
+                                    #   but casts activations itself), so the trainable drafter + optimizer are fp32.
+                                    #   Stable (no bf16 weight drift) but ~62GB peak at load and slower than bf16.
+                                    #   Set FALSE for the faster/lighter bf16 path (~32GB; needs low lr + skip guard).
   enable_gradient_checkpointing: true
   enable_full_shard: false          # 1-GPU: no FSDP sharding
   enable_fsdp_offload: false        # 1-GPU: offload is FSDP-only -> must be false
