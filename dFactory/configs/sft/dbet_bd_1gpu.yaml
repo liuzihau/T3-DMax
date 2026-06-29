@@ -34,7 +34,9 @@ data:
 
 train:
   output_dir: ./dbet_outputs
-  data_parallel_mode: fsdp2        # ignored on 1 GPU (FSDP not enabled); kept so a multi-GPU launch still shards
+  data_parallel_mode: ddp          # MUST be ddp here: fsdp2 asserts init_device==meta (arguments.py:599).
+                                   #   On 1 GPU fsdp_enabled=False so no DDP wrap happens -> model stays unwrapped.
+                                   #   For the real multi-GPU run use dbet_bd.yaml (fsdp2 + meta) instead.
   tensor_parallel_size: 1
   ulysses_parallel_size: 1
   expert_parallel_size: 1
