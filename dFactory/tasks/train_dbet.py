@@ -316,6 +316,14 @@ def main():
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0
     )
 
+    # On 1-GPU/non-FSDP the model is returned unwrapped, so the FSDP clip_grad_norm_ is never registered and the
+    # train loop would log "Can NOT find regitsered clip_grad_norm_" every step. Attach the standard clip so the
+    # hasattr branch is taken silently (identical numerics to the fallback).
+    if not hasattr(model, "clip_grad_norm_"):
+        import types
+        model.clip_grad_norm_ = types.MethodType(
+            lambda self, max_norm: torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm), model)
+
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
