@@ -226,6 +226,14 @@ def block_diffusion_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
     return block_diagonal | offset_block_causal | block_causal
 
 
+def _drafter_only_state_dict(state_dict):
+    """Drop the frozen heavy (heavy.*) from an exported state dict -- it's the DMax-Math-16B, fully recoverable
+    from its source checkpoint, so there's no reason to duplicate ~16B params in every DBet export. Keep only the
+    trained drafter (draft.*). To reload for inference: rebuild the heavy from the DMax source and
+    `DbetForDraftDecoding(cfg, _heavy=heavy).load_state_dict(this, strict=False)` (same pattern as build_dbet_init)."""
+    return {k: v for k, v in state_dict.items() if not k.startswith("heavy.")}
+
+
 def main():
     dist.init_process_group(backend=get_nccl_backend())
     args = parse_args(Arguments)
@@ -673,8 +681,12 @@ def main():
                             output_dir=args.train.output_dir,
                             ckpt_manager=args.train.ckpt_manager,
                         )
+                        _n0 = len(model_state_dict)
+                        model_state_dict = _drafter_only_state_dict(model_state_dict)   # skip frozen heavy.*
+                        logger.info_rank0(f"HF export: {len(model_state_dict)} drafter tensors "
+                                          f"(dropped {_n0 - len(model_state_dict)} frozen heavy.* from DMax source).")
                         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
-                        
+
                         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
                         
                         # Delete large objects immediately after use to free up memory for the next training epoch
@@ -726,6 +738,10 @@ def main():
             output_dir=args.train.output_dir,
             ckpt_manager=args.train.ckpt_manager,
         )
+        _n0 = len(model_state_dict)
+        model_state_dict = _drafter_only_state_dict(model_state_dict)   # skip frozen heavy.*
+        logger.info_rank0(f"HF export: {len(model_state_dict)} drafter tensors "
+                          f"(dropped {_n0 - len(model_state_dict)} frozen heavy.* from DMax source).")
         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
