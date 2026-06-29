@@ -269,6 +269,8 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
     if all_conf:
         scalar["auc"] = roc_auc(torch.cat(all_conf), torch.cat(all_accept))
         scalar["conf"] = conf_num / (conf_den or 1.0)
+    cw = float(getattr(args.train, "conf_loss_weight", 1.0))
+    scalar["loss"] = scalar["tok"] + (cw * scalar["conf"] if "conf" in scalar else 0.0)   # total, ~train loss
 
     acc_by_sigma, auc_by_sigma = [], []
     for s in sigmas:

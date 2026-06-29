@@ -66,26 +66,41 @@ def main():
     train, val = _load(args.metrics)
     print(f"loaded {len(train)} train + {len(val)} val records -> {out_dir}")
 
-    # ---- 1. loss + accuracy ----
-    fig, ax1 = plt.subplots(figsize=(7, 4.2))
-    ts, ls = _series(train, "loss")
-    if ts:
-        ax1.plot(ts, ls, color="tab:blue", alpha=0.25, lw=0.8)
-        ax1.plot(ts, _ema(ls, args.ema), color="tab:blue", lw=1.8, label="train loss (EMA)")
-    ax1.set_xlabel("step"); ax1.set_ylabel("loss", color="tab:blue")
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
-    ax2 = ax1.twinx()
-    ta, aa = _series(train, "acc")
-    if ta:
-        ax2.plot(ta, _ema(aa, args.ema), color="tab:green", lw=1.5, label="train acc (EMA)")
-    va, vaa = _series(val, "acc")
-    if va:
-        ax2.plot(va, vaa, "o-", color="tab:red", lw=1.5, ms=4, label="val acc")
-    ax2.set_ylabel("drafter accuracy (remaining)", color="tab:green")
-    ax2.tick_params(axis="y", labelcolor="tab:green"); ax2.set_ylim(0, 1)
-    lines = [l for l in ax1.get_lines() + ax2.get_lines() if not l.get_label().startswith("_")]
-    ax1.legend(lines, [l.get_label() for l in lines], loc="center right", fontsize=8)
-    ax1.set_title("DBet: loss & drafter accuracy")
+    # ---- 1. loss + accuracy, two panels: train (left) | val (right) ----
+    def _panel(ax, recs, smoothed, title):
+        """loss on the left y-axis; acc + acc6 (first-T) on the right y-axis."""
+        xs, ls = _series(recs, "loss")
+        style = dict(lw=1.8) if smoothed else dict(lw=1.5, marker="o", ms=4)
+        if xs:
+            if smoothed:
+                ax.plot(xs, ls, color="tab:blue", alpha=0.2, lw=0.8)
+                ls = _ema(ls, args.ema)
+            ax.plot(xs, ls, color="tab:blue", label="loss", **style)
+        ax.set_xlabel("step"); ax.set_ylabel("loss", color="tab:blue")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+        axr = ax.twinx()
+        for key, color, lab in [("acc", "tab:green", "acc (all remaining)"),
+                                ("acc6", "tab:orange", "acc@T (first-T)")]:
+            kx, ky = _series(recs, key)
+            if kx:
+                if smoothed:
+                    ky = _ema(ky, args.ema)
+                axr.plot(kx, ky, color=color, label=lab, **style)
+        axr.set_ylabel("accuracy", color="tab:green")
+        axr.tick_params(axis="y", labelcolor="tab:green"); axr.set_ylim(0, 1)
+        lines = [l for l in ax.get_lines() + axr.get_lines() if not l.get_label().startswith("_")]
+        ax.legend(lines, [l.get_label() for l in lines], loc="center right", fontsize=8)
+        ax.set_title(title)
+        return axr
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 4.6))
+    arL = _panel(axL, train, smoothed=True, title="Training")
+    arR = _panel(axR, val, smoothed=False, title="Validation")
+    # share the accuracy axis range across panels for easy comparison
+    hi = max([arL.get_ylim()[1], arR.get_ylim()[1], 1.0])
+    arL.set_ylim(0, hi); arR.set_ylim(0, hi)
+    fig.suptitle("DBet: loss & drafter accuracy", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     _save(fig, out_dir, "loss_accuracy")
 
     # ---- 2. confidence AUC over training ----

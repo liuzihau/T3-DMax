@@ -94,6 +94,22 @@ def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=Fa
     return out["logits"], out["conf"], remaining, clean_ids
 
 
+def first_t_position_acc(correct, remaining, block_size, tpf):
+    """Avg-OF-POSITION top-1 accuracy over the first `tpf` remaining positions per block (per-position rate then
+    mean over k<tpf) -- the heavy commits ~tpf tokens/forward, so this is the decision-relevant window.
+    correct, remaining: [B,L] bool. Returns a python float (nan if no data). Cheap: a `tpf`-iter loop of tensor ops."""
+    B, L = remaining.shape
+    nb = L // block_size
+    k = (torch.cumsum(remaining.view(B, nb, block_size).long(), dim=-1) - 1).clamp(min=0).view(B, L)
+    accs = []
+    for kk in range(tpf):
+        sel = remaining & (k == kk)
+        tot = sel.sum()
+        if int(tot) > 0:
+            accs.append((correct & sel).sum().float() / tot)
+    return float(torch.stack(accs).mean()) if accs else float("nan")
+
+
 def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, return_metrics=False):
     """DBet core step (requires the dual stream already in micro_batch: input_ids=[noisy|clean] [B,2L],
     attention_mask=[B,1,2L,2L] block-diffusion prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
@@ -111,14 +127,30 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
                          reduction="none").view_as(clean_ids)
     tok_loss = (ce * w).sum() / denom
     loss = tok_loss
-    metrics = {"tok": float(tok_loss.detach()), "n_remaining": int(remaining.sum())}
+    accept = None
     if conf is not None:
-        accept = (logits.argmax(-1) == clean_ids).float()             # label 1 iff drafter argmax == golden
+        accept = (logits.argmax(-1) == clean_ids)                     # label 1 iff drafter argmax == golden
+        accept_f = accept.float()
         c = conf.float().clamp(1e-5, 1 - 1e-5)                         # fp32 for a stable log
-        bce = -(accept * c.log() + (1 - accept) * (1 - c).log())
+        bce = -(accept_f * c.log() + (1 - accept_f) * (1 - c).log())
         conf_loss = (bce * w).sum() / denom
         loss = loss + args.train.conf_loss_weight * conf_loss
-        metrics["conf"] = float(conf_loss.detach())
-        metrics["acc"] = float((accept * w).sum() / denom)            # decayed drafter accuracy on remaining
     loss = loss / n_micro_batches
-    return (loss, metrics) if return_metrics else loss
+    if not return_metrics:
+        return loss                                                   # skip the metric .item() syncs (gated by caller)
+
+    # --- metrics (sync points; the caller only requests these every log_steps) ---
+    tpf = int(getattr(args.train, "eval_tpf", 6))
+    if accept is None:
+        accept = (logits.argmax(-1) == clean_ids)
+        accept_f = accept.float()
+    correct = accept & remaining.bool()
+    metrics = {
+        "tok": float(tok_loss.detach()),                              # token CE (the train loop logs total loss)
+        "acc": float((accept_f * w).sum() / denom),                   # decayed drafter accuracy on remaining
+        "acc6": first_t_position_acc(correct, remaining.bool(), bs, tpf),
+        "n_remaining": int(remaining.sum()),
+    }
+    if conf is not None:
+        metrics["conf"] = float(conf_loss.detach())
+    return loss, metrics                                              # loss already /n_micro_batches above

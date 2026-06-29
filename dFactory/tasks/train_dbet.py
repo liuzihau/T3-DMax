@@ -549,7 +549,10 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
-            step_m = {}                                     # accumulated DBet metrics (tok/conf/acc/n_remaining)
+            step_m = {}                                     # accumulated DBet metrics (tok/conf/acc/acc6)
+            # Only compute the extra train metrics (acc/acc6 + the .item() syncs) on steps we actually log --
+            # saves per-step host<->device syncs. The training loss itself is computed every step regardless.
+            want_metrics = (args.train.global_rank == 0 and global_step % max(1, args.train.log_steps) == 0)
             synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
@@ -584,14 +587,16 @@ def main():
                 # [prefix+clean ; noisy] -> decayed CE + confidence BCE on the remaining-masked. (Replaces
                 # DMax's OPUT backbone rollout; heavy is frozen, only the drafter trains.)
                 with model_fwd_context:
-                    loss, m = dbet_train_step(model, micro_batch, len(micro_batches), args, return_metrics=True)
+                    out = dbet_train_step(model, micro_batch, len(micro_batches), args, return_metrics=want_metrics)
+                loss = out[0] if want_metrics else out
 
                 with model_bwd_context:
                     loss.backward()
 
                 total_loss += loss.item()
-                for _k, _v in m.items():
-                    step_m[_k] = step_m.get(_k, 0.0) + float(_v)
+                if want_metrics:
+                    for _k, _v in out[1].items():
+                        step_m[_k] = step_m.get(_k, 0.0) + float(_v)
                 del micro_batch
 
             # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
