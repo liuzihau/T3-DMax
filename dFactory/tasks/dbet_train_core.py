@@ -54,11 +54,12 @@ def decay_weights(remaining_mask, block_size):
     return w.view(B, L)
 
 
-def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, return_metrics=False):
-    """DBet core step (requires the dual stream already in micro_batch: input_ids=[noisy|clean] [B,2L],
-    attention_mask=[B,1,2L,2L] block-diffusion prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
-    Returns loss/n_micro_batches (and a metrics dict if return_metrics)."""
-    core = model.module if hasattr(model, "module") else model         # unwrap FSDP1 if present
+def dbet_forward(core, micro_batch, args, mask_id=MASK_ID):
+    """Shared FROZEN-heavy -> commit -> drafter forward (no loss). Used by BOTH `dbet_train_step` (with grad on
+    the drafter) and the eval pass (wrapped in no_grad) so the two can never drift apart.
+    `core` is the UNWRAPPED model; micro_batch carries the dual stream (input_ids=[noisy|clean] [B,2L],
+    attention_mask=[B,1,2L,2L] block prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
+    Returns: logits [B,L,V], conf [B,L] (or None), remaining [B,L] bool, clean_ids [B,L] (golden)."""
     cfg = core.config
     bs, thr = args.train.block_size, args.train.heavy_commit_threshold
 
@@ -86,9 +87,19 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
         h_sel_denoise=noisy_h_sel, h_last_denoise=noisy_h_last, h_sel_prefix=clean_h_sel,
         attention_mask=derive_drafter_mask(attn, L), position_ids=pos, denoise_mask=None, tau=None,
     )
+    return out["logits"], out["conf"], remaining, clean_ids
 
-    # 4) decayed CE + confidence BCE on the remaining-masked positions vs golden
-    logits, conf = out["logits"], out["conf"]
+
+def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, return_metrics=False):
+    """DBet core step (requires the dual stream already in micro_batch: input_ids=[noisy|clean] [B,2L],
+    attention_mask=[B,1,2L,2L] block-diffusion prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
+    Returns loss/n_micro_batches (and a metrics dict if return_metrics)."""
+    core = model.module if hasattr(model, "module") else model         # unwrap FSDP1 if present
+    bs = args.train.block_size
+
+    logits, conf, remaining, clean_ids = dbet_forward(core, micro_batch, args, mask_id)
+
+    # decayed CE + confidence BCE on the remaining-masked positions vs golden
     w = decay_weights(remaining, bs)
     denom = w.sum().clamp_min(1.0)
     ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), clean_ids.reshape(-1),

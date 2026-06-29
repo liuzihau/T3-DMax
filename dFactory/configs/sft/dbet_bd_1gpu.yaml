@@ -77,5 +77,15 @@ train:
   heavy_commit_threshold: 0.9
   conf_loss_weight: 1.0
   same_token_labels: true
-  use_wandb: false
-  log_steps: 1
+  # --- metrics + held-out validation (figures via scripts/plot_dbet_metrics.py) ---
+  use_wandb: false                  # set true to also stream to Weights & Biases (wandb_project/wandb_name)
+  log_steps: 20                     # write a train-metrics JSONL record (loss/tok/conf/acc) every N steps
+  eval_steps: 200                   # held-out sigma-sweep eval every N steps (0 disables); ~1 min each at holdout 128
+  eval_holdout_size: 128            # tail examples of the train file held out for validation
+  eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
+  eval_at_start: true               # step-0 baseline (untrained drafter) point for the figures
+  # metrics_path: ""                # default -> <output_dir>/dbet_metrics.jsonl
+  #
+  # QUICK FIGURE RUN (see real learning in ~30-60 min instead of 60h): append CLI overrides, e.g.
+  #   --train.max_steps 3000 --train.lr_warmup_ratio 0.05 --train.lr 3.0e-4 --train.eval_steps 250
+  # then: python scripts/plot_dbet_metrics.py --metrics ./dbet_outputs/dbet_metrics.jsonl

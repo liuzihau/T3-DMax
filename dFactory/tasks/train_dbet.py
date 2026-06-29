@@ -54,6 +54,7 @@ AutoModelForCausalLM.register(DbetConfig, DbetForDraftDecoding)
 from dataset.data_transform_dbet import process_mdm_tokenized_example, process_mdm_sft_example
 from dataset import build_local_dataset
 from dbet_train_core import dbet_train_step
+from dbet_metrics import MetricsLogger, load_holdout_examples, evaluate_dbet
 import random
 
 
@@ -139,6 +140,30 @@ class LLaDA2TrainingArguments(TrainingArguments):
     conf_loss_weight: float = field(
         default=1.0,
         metadata={"help": "DBet: weight of the confidence-head BCE relative to the token CE."}
+    )
+    log_steps: int = field(
+        default=10,
+        metadata={"help": "DBet: write a train-metrics record (loss/tok/conf/acc/grad_norm/lr/tok_s) every N steps."}
+    )
+    eval_steps: int = field(
+        default=0,
+        metadata={"help": "DBet: run held-out validation (sigma sweep) every N steps. 0 disables eval."}
+    )
+    eval_holdout_size: int = field(
+        default=128,
+        metadata={"help": "DBet: number of tail examples of the train file held out for validation."}
+    )
+    eval_sigmas: str = field(
+        default="0.1,0.3,0.5,0.7,0.9",
+        metadata={"help": "DBet: comma-separated mask ratios swept during eval (acc/AUC-vs-mask-ratio)."}
+    )
+    eval_at_start: bool = field(
+        default=True,
+        metadata={"help": "DBet: also run one eval before training (step 0 baseline) for the figures."}
+    )
+    metrics_path: str = field(
+        default="",
+        metadata={"help": "DBet: JSONL metrics path. Empty -> <output_dir>/dbet_metrics.jsonl."}
     )
 
 
@@ -419,6 +444,36 @@ def main():
             dtype=torch.float32 if args.train.enable_mixed_precision else torch.bfloat16
         )
         block_diffusion_attn_mask_prototype.masked_fill_(block_diffusion_attn_mask_flag.logical_not(), float("-inf"))
+        eval_mask_proto = block_diffusion_attn_mask_prototype.to(get_device_type())   # device copy for held-out eval
+
+    # ---- DBet metrics + held-out validation ----
+    core_for_eval = model.module if hasattr(model, "module") else model
+    eval_sigmas = tuple(float(x) for x in args.train.eval_sigmas.split(",") if x.strip())
+    metrics_path = args.train.metrics_path or os.path.join(args.train.output_dir, "dbet_metrics.jsonl")
+    metrics_logger = MetricsLogger(
+        jsonl_path=metrics_path if args.train.global_rank == 0 else "",
+        use_wandb=args.train.use_wandb and args.train.global_rank == 0,
+        enabled=args.train.global_rank == 0,
+    )
+    holdout = None
+    if args.train.eval_steps and args.train.block_diffusion_mode and args.train.global_rank == 0:
+        logger.info_rank0(f"Building DBet held-out eval set ({args.train.eval_holdout_size} tail examples)...")
+        holdout = load_holdout_examples(
+            args.data.train_path, args.train.eval_holdout_size, tokenizer,
+            args.data.max_seq_len, args.data.text_keys)
+        logger.info_rank0(f"DBet held-out eval: {len(holdout)} examples, sigma sweep {eval_sigmas} "
+                          f"-> metrics at {metrics_path}")
+
+    def _run_eval(step):
+        if holdout is None:
+            return
+        scalar, detail = evaluate_dbet(core_for_eval, holdout, args, eval_mask_proto,
+                                       get_device_type(), sigmas=eval_sigmas)
+        metrics_logger.log(scalar, step=step, split="val", detail=detail)
+        msg = " ".join(f"{k}={v:.4f}" for k, v in scalar.items()
+                       if isinstance(v, float) and v == v and not k.startswith(("acc_sig", "auc_sig")))
+        logger.info_rank0(f"[DBet eval @ step {step}] {msg}")
+        helper.empty_cache()
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -428,6 +483,8 @@ def main():
     logger.info(
         f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
     )
+    if args.train.eval_steps and args.train.eval_at_start:
+        _run_eval(global_step)   # step-0 baseline (untrained drafter) for the figures
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -453,6 +510,7 @@ def main():
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
             total_loss = 0
+            step_m = {}                                     # accumulated DBet metrics (tok/conf/acc/n_remaining)
             synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
@@ -487,12 +545,14 @@ def main():
                 # [prefix+clean ; noisy] -> decayed CE + confidence BCE on the remaining-masked. (Replaces
                 # DMax's OPUT backbone rollout; heavy is frozen, only the drafter trains.)
                 with model_fwd_context:
-                    loss = dbet_train_step(model, micro_batch, len(micro_batches), args)
+                    loss, m = dbet_train_step(model, micro_batch, len(micro_batches), args, return_metrics=True)
 
                 with model_bwd_context:
                     loss.backward()
 
                 total_loss += loss.item()
+                for _k, _v in m.items():
+                    step_m[_k] = step_m.get(_k, 0.0) + float(_v)
                 del micro_batch
 
             # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
@@ -527,6 +587,17 @@ def main():
                         {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
                     )
                     wandb.log(train_metrics, step=global_step)
+
+                # DBet train-metrics record (JSONL + wandb via MetricsLogger), every log_steps
+                if global_step % max(1, args.train.log_steps) == 0:
+                    nmb = max(1, len(micro_batches))
+                    rec = {"loss": float(total_loss), "grad_norm": float(grad_norm), "lr": float(lr)}
+                    rec.update({k: v / nmb for k, v in step_m.items()})   # tok, conf, acc, n_remaining (mean/micro-batch)
+                    metrics_logger.log(rec, step=global_step, split="train")
+
+            # DBet held-out validation (sigma sweep) every eval_steps
+            if args.train.eval_steps and global_step % args.train.eval_steps == 0:
+                _run_eval(global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
                 profiler.step()
@@ -608,6 +679,9 @@ def main():
 
 
     synchronize()
+    if args.train.eval_steps:
+        _run_eval(global_step)          # final eval
+    metrics_logger.close()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
