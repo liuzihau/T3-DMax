@@ -102,14 +102,15 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
     # decayed CE + confidence BCE on the remaining-masked positions vs golden
     w = decay_weights(remaining, bs)
     denom = w.sum().clamp_min(1.0)
-    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), clean_ids.reshape(-1),
+    # CE in fp32: bf16 logsumexp can overflow for large drafter logits (NaN). logits.float() is the stable path.
+    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), clean_ids.reshape(-1),
                          reduction="none").view_as(clean_ids)
     tok_loss = (ce * w).sum() / denom
     loss = tok_loss
     metrics = {"tok": float(tok_loss.detach()), "n_remaining": int(remaining.sum())}
     if conf is not None:
         accept = (logits.argmax(-1) == clean_ids).float()             # label 1 iff drafter argmax == golden
-        c = conf.clamp(1e-5, 1 - 1e-5)
+        c = conf.float().clamp(1e-5, 1 - 1e-5)                         # fp32 for a stable log
         bce = -(accept * c.log() + (1 - accept) * (1 - c).log())
         conf_loss = (bce * w).sum() / denom
         loss = loss + args.train.conf_loss_weight * conf_loss

@@ -49,7 +49,8 @@ train:
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 1.0e-4
+  lr: 5.0e-5                         # bf16 (no fp32 master on 1 GPU) is divergence-prone: lr 1e-4 NaN'd ~87k steps.
+                                    #   5e-5 + skip_nonfinite_steps is stable here; fp32-master multi-GPU run can go higher.
   lr_warmup_ratio: 0.03
   lr_decay_style: cosine
   lr_decay_ratio: 1.0
@@ -86,6 +87,8 @@ train:
   eval_at_start: true               # step-0 baseline (untrained drafter) point for the figures
   # metrics_path: ""                # default -> <output_dir>/dbet_metrics.jsonl
   #
+  skip_nonfinite_steps: true        # bf16 stability guard: skip optimizer step on NaN/Inf grad (don't poison weights)
+  #
   # QUICK FIGURE RUN (see real learning in ~30-60 min instead of 60h): append CLI overrides, e.g.
-  #   --train.max_steps 3000 --train.lr_warmup_ratio 0.05 --train.lr 3.0e-4 --train.eval_steps 250
+  #   --train.max_steps 3000 --train.lr_warmup_ratio 0.05 --train.lr 1.0e-4 --train.eval_steps 250
   # then: python scripts/plot_dbet_metrics.py --metrics ./dbet_outputs/dbet_metrics.jsonl

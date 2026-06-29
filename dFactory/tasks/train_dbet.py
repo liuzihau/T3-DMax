@@ -165,6 +165,11 @@ class LLaDA2TrainingArguments(TrainingArguments):
         default="",
         metadata={"help": "DBet: JSONL metrics path. Empty -> <output_dir>/dbet_metrics.jsonl."}
     )
+    skip_nonfinite_steps: bool = field(
+        default=True,
+        metadata={"help": "DBet: skip the optimizer step when grad_norm is NaN/Inf (bf16 stability guard) so a "
+                          "single overflow can't permanently poison the weights."}
+    )
 
 
 @dataclass
@@ -398,6 +403,7 @@ def main():
         profiler.start()
 
     start_epoch, start_step, global_step = 0, 0, 0
+    nonfinite_skips = 0
     save_checkpoint_path = None
     environ_meter = helper.EnvironMeter(
         config=model_config,
@@ -565,9 +571,21 @@ def main():
                 )
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            # Skip non-finite steps: in bf16 (1-GPU, no fp32 master) a gradient spike can overflow; without this
+            # guard the next optimizer.step() writes NaN into the weights and training never recovers.
+            _gn_val = grad_norm.full_tensor().item() if hasattr(grad_norm, "full_tensor") else float(grad_norm)
+            _gn_finite = _gn_val == _gn_val and abs(_gn_val) != float("inf")
+            if args.train.skip_nonfinite_steps and not _gn_finite:
+                nonfinite_skips += 1
+                optimizer.zero_grad()
+                if nonfinite_skips <= 20 or nonfinite_skips % 100 == 0:
+                    logger.info_rank0(f"[DBet] skipped non-finite step (grad_norm={_gn_val}) at step "
+                                      f"{global_step}; total skips={nonfinite_skips}")
+                lr_scheduler.step()           # keep schedule aligned with global_step
+            else:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
             if hasattr(grad_norm, "full_tensor"):
                 grad_norm = grad_norm.full_tensor().item()
 
