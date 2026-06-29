@@ -6,6 +6,99 @@ model performs all iterative denoising steps inside the block.
 
 See [`T3_DMax_implementation_brief.md`](./T3_DMax_implementation_brief.md) for the design.
 
+---
+
+# DBet drafter — training, metrics & validation  (`DBet` branch)
+
+DBet ("Self-Conditioned Δh Drafter") is a lightweight draft model trained on top of a **frozen**
+DMax-Math-16B heavy: the heavy commits a confident left-to-right prefix in one pass, the drafter proposes
+the remaining masked tokens (predicting Δh decoded through the frozen LM head) plus a trained confidence head.
+Only the drafter trains. Code: `dFactory/models/dbet/`, `dFactory/tasks/{train_dbet,dbet_train_core,dbet_metrics}.py`.
+
+### 1. Build the init checkpoint (once)
+
+The trainer loads `config_path == model_path == ./dbet_init`. Assemble it from the frozen heavy:
+
+```bash
+cd dFactory
+PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
+  --heavy_path ../DMax-Math-16B-moe-merge --out_dir ./dbet_init \
+  --draft_num_layers 5 --sel_layers 1,10,19
+```
+
+### 2. Train (single H200) with metrics + held-out validation
+
+```bash
+cd dFactory
+# real run (lr 5e-5, bf16-stable; ~60h/epoch over the full set)
+PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh \
+  tasks/train_dbet.py configs/sft/dbet_bd_1gpu.yaml
+
+# QUICK FIGURE RUN (~30-60 min: short warmup, capped steps, frequent eval)
+PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh \
+  tasks/train_dbet.py configs/sft/dbet_bd_1gpu.yaml \
+  --train.max_steps 3000 --train.lr_warmup_ratio 0.05 --train.lr 1.0e-4 --train.eval_steps 250
+```
+
+`dbet_bd_1gpu.yaml` = 1-GPU (DDP, `init_device=cuda`, bf16, no FSDP). For ≥2 GPUs use `dbet_bd.yaml`
+(FSDP2 + meta + fp32-master/bf16-compute) which allows higher lr. Set `data.train_path` to your OPUT data.
+
+### 3. Metrics methods
+
+Everything is logged to **`<output_dir>/dbet_metrics.jsonl`** (one JSON record per line; `split` is `train`
+or `val`) and mirrored to **wandb** when `use_wandb: true`. The held-out eval re-uses the exact training
+forward (`dbet_forward`) under `no_grad`, so val numbers cannot drift from training.
+
+| metric | where | meaning |
+|---|---|---|
+| `loss`, `tok`, `conf` | train (every `log_steps`) | total / token-CE / confidence-BCE loss |
+| `acc` (train) | train | decayed drafter accuracy on remaining-masked positions |
+| `acc` (val) | val (every `eval_steps`) | **unweighted** fraction of remaining-masked where drafter argmax == golden |
+| `auc` | val | **confidence-head ROC-AUC** (predicting drafter-correctness) — the ship gate is >0.7 (prior probe ~0.57) |
+| `acc_sig{σ}`, `auc_sig{σ}` | val | accuracy / AUC at each swept mask ratio σ |
+| `acc_by_pos` | val (detail) | accuracy vs distance-into-block (how far ahead the drafter stays reliable) |
+| `acc_by_sigma`, `auc_by_sigma` | val (detail) | accuracy / AUC vs mask ratio |
+
+The held-out eval sweeps mask ratios (`eval_sigmas`) over the last `eval_holdout_size` examples of the train
+file, runs a step-0 baseline (`eval_at_start`), every `eval_steps`, and once at the end.
+
+**Eval / metrics knobs** (in the yaml or as `--train.<name>` CLI overrides):
+
+| knob | default | purpose |
+|---|---|---|
+| `log_steps` | 20 | write a train-metrics record every N steps |
+| `eval_steps` | 0 (off); 250 in 1gpu yaml | held-out sigma-sweep eval every N steps |
+| `eval_holdout_size` | 128 | tail examples held out for validation |
+| `eval_sigmas` | `0.1,0.3,0.5,0.7,0.9` | mask ratios swept |
+| `eval_at_start` | true | step-0 (untrained) baseline point |
+| `metrics_path` | "" → `<output_dir>/dbet_metrics.jsonl` | JSONL path |
+| `skip_nonfinite_steps` | true | skip optimizer step on NaN/Inf grad (bf16 stability guard) |
+
+### 4. Plot the figures
+
+```bash
+cd dFactory
+python scripts/plot_dbet_metrics.py --metrics ./dbet_outputs/dbet_metrics.jsonl
+#   --out <dir>   (default ./dbet_outputs/figures)   --ema 0.9  (train-curve smoothing)
+```
+
+Writes PNG + PDF to `./dbet_outputs/figures/`:
+
+| figure | shows |
+|---|---|
+| `loss_accuracy` | train loss (EMA) + train/val drafter accuracy over steps |
+| `confidence_auc` | held-out confidence-head AUC over training (0.70 gate + 0.57 prior-probe lines) |
+| `acc_by_position` | drafter accuracy vs distance-into-block (last eval) |
+| `acc_by_sigma` | accuracy & confidence-AUC vs mask ratio (last eval) |
+
+### Off-cluster smoke test
+
+```bash
+cd dFactory/tasks && python smoke_dbet.py     # tiny all-dense heavy on CPU; asserts frozen heavy + loss descends
+```
+
+---
+
 ## Layout
 
 ```
