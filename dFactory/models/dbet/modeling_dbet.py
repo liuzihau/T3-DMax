@@ -620,3 +620,10 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
             signals, attention_mask=attention_mask, position_ids=position_ids,
             denoise_mask=denoise_mask, tau=tau,
         )
+
+
+# VeOmni registry hook: `ModelRegistry.register_modeling_path("models.dbet")` walks SUBMODULES (pkgutil) and
+# registers each module's `ModelClass` -> the package __init__ is never visited, so the export must live HERE
+# (same convention as models/llada2_moe/modeling_llada2_moe.py). Without this, get_loader() falls back to the
+# Huggingface AutoModel path, which fails on DbetForDraftDecoding (arch name lacks "ForCausalLM").
+ModelClass = DbetForDraftDecoding
