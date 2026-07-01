@@ -52,9 +52,11 @@ class DbetConfig(LLaDA2MoeConfig):
         train_heavy: bool = False,             # heavy = DMax, ALWAYS frozen; flag exists only to round-trip
         warmstart_from_heavy_bottom: bool = True,  # init the L draft layers from the heavy's bottom L decoder layers
         heavy_path: str | None = None,         # checkpoint dir of the frozen heavy (DMax-Math-16B), for loading + warm-start
+        mask_token_id: int = 156895,           # LLaDA2/DMax [MASK] id; used at inference to split committed/canvas
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.mask_token_id = int(mask_token_id)
         self.draft_num_layers = int(draft_num_layers)
         self.draft_hidden_size = int(draft_hidden_size)
         self.draft_num_attention_heads = int(draft_num_attention_heads)
