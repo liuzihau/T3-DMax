@@ -23,9 +23,10 @@ import torch
 import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))                      # .../dInfer/python/dinfer/decoding
+_DINFER_PYTHON = os.path.abspath(os.path.join(_HERE, "..", ".."))       # .../dInfer/python (the `dinfer` package root)
 _T3DMAX_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))  # .../T3-DMax
 _DFACTORY = os.path.join(_T3DMAX_ROOT, "dFactory")
-for _p in (_DFACTORY, os.path.join(_DFACTORY, "VeOmni")):
+for _p in (_DINFER_PYTHON, _DFACTORY, os.path.join(_DFACTORY, "VeOmni")):  # dinfer pkg + models importable
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
