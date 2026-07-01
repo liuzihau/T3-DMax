@@ -154,11 +154,13 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1):
     """Decode one block in place with DMax soft-embedding re-feed. Committed positions are fed back to the heavy
-    as a SOFT embed (softmax(logits/tau) -> top-k weighted + residual mask, renormalized), tracked per
-    PROVENANCE: heavy-committed use (heavy_tau, heavy_top_k) [DMax default 1.0/1 = top-1], drafter-committed use
-    (draft_tau, draft_top_k). `x` holds the hard argmax ids (for the prefix/canvas split + final output);
-    `block_embeds` holds the soft feed. If use_draft: alternate heavy-commit / drafter-extend; else HEAVY-ONLY
-    baseline (pure DMax decode_uniform). bs/be = block start/end; attn = block-causal 4D mask over [0,be)."""
+    as a SOFT embed (softmax(logits/tau) -> top-k weighted + residual mask, renormalized). Provenance is
+    TRANSIENT: after every HEAVY pass, ALL committed decode positions are re-soft-embedded from the heavy's
+    fresh logits with (heavy_tau, heavy_top_k) [default 1.0/1 = DMax top-1] -- i.e. the heavy weakly VERIFIES /
+    re-encodes any prior drafter commits, so a position is 'drafter-committed' only in the window between a
+    draft pass and the NEXT heavy pass (there it uses (draft_tau, draft_top_k)). `x` holds the hard argmax ids
+    (prefix/canvas split + final output); `block_embeds` holds the soft feed. If use_draft: alternate
+    heavy-commit / drafter-extend; else HEAVY-ONLY (pure DMax decode_uniform). attn = block-causal over [0,be)."""
     device = x.device
     embed = model.draft.frozen_embed                                    # frozen heavy embedding
     active = (x[0:1, bs:be] == MASK_ID)                                 # original decode region
@@ -183,11 +185,17 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
         mask_idx = (x[0:1, bs:be] == MASK_ID)
         n_before = int(mask_idx.sum())
         x0, high_conf_idx, _, _ = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
-        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]               # block-local indices the heavy commits
+        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]               # block-local indices the heavy newly commits
         if hci.numel() > 0:
             x[0, bs + hci] = x0[0, hci]
-            block_embeds[0, hci] = _soft_embed(block_logits[0, hci], embed, MASK_ID, heavy_tau, heavy_top_k)
             stats.heavy_commits += int(hci.numel())
+        # WEAK VERIFY: re-soft-embed ALL committed decode positions from the heavy's fresh logits -> any prior
+        # drafter commits become heavy-committed (the heavy re-encoded them). Matches DMax refreshing committed
+        # positions every forward. (Prompt-tail positions are outside `active`, so they stay hard.)
+        committed = active[0] & (x[0, bs:be] != MASK_ID)
+        ci = committed.nonzero(as_tuple=True)[0]
+        if ci.numel() > 0:
+            block_embeds[0, ci] = _soft_embed(block_logits[0, ci], embed, MASK_ID, heavy_tau, heavy_top_k)
         if not bool((x[0:1, bs:be] == MASK_ID).any()):
             break
         if not use_draft:                                              # HEAVY-ONLY: loop (soft re-feed)
