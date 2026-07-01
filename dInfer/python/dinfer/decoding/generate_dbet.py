@@ -17,10 +17,19 @@
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+
+def _now(device):
+    """Wall clock with a CUDA sync so per-forward timing is accurate (the decode is sequential, so the sync
+    adds no real overhead -- each forward already waits on the previous)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))                      # .../dInfer/python/dinfer/decoding
 _DINFER_PYTHON = os.path.abspath(os.path.join(_HERE, "..", ".."))       # .../dInfer/python (the `dinfer` package root)
@@ -116,6 +125,9 @@ class DbetGenerateStats:
     draft_forwards: int = 0
     draft_commits: int = 0      # tokens committed by the drafter (the speculative wins)
     heavy_commits: int = 0      # tokens committed by the heavy
+    heavy_time: float = 0.0     # wall seconds in heavy forwards
+    draft_time: float = 0.0     # wall seconds in drafter forwards
+    wall_time: float = 0.0      # total decode wall seconds (this sequence)
 
 
 @torch.no_grad()
@@ -132,12 +144,14 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
     it = 0
     while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
         # ---- heavy forward + decode_uniform commit ----
+        _t = _now(x.device)
         if use_draft:
             signals = model.extract_heavy_signals(x[:, :be], attn)     # collects hidden for the drafter
             block_logits = signals["logits"][:, bs:be]                 # [1, blk, V]
         else:
             out = model.heavy_forward(input_ids=x[:, :be], attention_mask=attn, output_hidden_states=False)
             block_logits = out.logits[:, bs:be]                        # heavy-only: logits only, no hidden
+        stats.heavy_time += _now(x.device) - _t
         stats.heavy_forwards += 1
         mask_idx = (x[0:1, bs:be] == MASK_ID)
         x0, high_conf_idx, _, brk = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
@@ -161,7 +175,9 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             # relabel prefix/canvas from the UPDATED x (heavy hidden reused as prefix conditioning)
             signals["input_ids"] = x[:, :be]
             signals["prefix_idx"], signals["canvas_idx"] = model._split_prefix_denoise(x[:, :be])
+            _t = _now(x.device)
             d = model.draft_forward(signals, attention_mask=None, tau=tau)
+            stats.draft_time += _now(x.device) - _t
             stats.draft_forwards += 1
             dlogits, dconf = d["logits"], d["conf"]                     # [1,C,V], [1,C] (C = #masked in block)
             if dconf is None:                                          # no conf head -> can't gate; bail to heavy
@@ -226,6 +242,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
 
     stats = DbetGenerateStats()
     eos_cut = L
+    _t_wall = _now(device)
     for b in range(num_blocks):
         bs = first_block_start + b * block_length
         be = bs + block_length
@@ -242,6 +259,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                     x[0, be:] = PAD_ID
                 break
 
+    stats.wall_time = _now(device) - _t_wall
     return x[0, P:eos_cut].clone(), stats
 
 
@@ -280,8 +298,14 @@ def _smoke_test():
         max_draft_iters=args.max_draft_iters, use_draft=not args.heavy_only)
     text = tokenizer.decode(response_ids, skip_special_tokens=True)
     print(f"[dbet] mode={'HEAVY-ONLY' if args.heavy_only else 'DBet (heavy+draft)'}")
+    n_tok = int(response_ids.shape[0])
+    hpf = stats.heavy_time / max(stats.heavy_forwards, 1)
+    dpf = stats.draft_time / max(stats.draft_forwards, 1)
     print(f"[dbet] heavy_fwd={stats.heavy_forwards} draft_fwd={stats.draft_forwards} "
           f"heavy_commits={stats.heavy_commits} draft_commits={stats.draft_commits}")
+    print(f"[dbet] wall={stats.wall_time:.2f}s  heavy={stats.heavy_time:.2f}s ({hpf*1e3:.0f}ms/fwd)  "
+          f"draft={stats.draft_time:.2f}s ({dpf*1e3:.0f}ms/fwd)  "
+          f"tok={n_tok}  {n_tok / max(stats.wall_time, 1e-6):.1f} tok/s")
     print(f"[dbet] answer: {text!r}")
 
 

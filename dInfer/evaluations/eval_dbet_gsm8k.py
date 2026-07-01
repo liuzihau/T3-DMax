@@ -79,6 +79,7 @@ def main():
 
     t0 = time.time()
     tot_h, tot_d, tot_hc, tot_dc = 0, 0, 0, 0
+    tot_wall, tot_htime, tot_dtime, tot_tok = 0.0, 0.0, 0.0, 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
         for i, row in enumerate(rows):
             messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
@@ -93,11 +94,14 @@ def main():
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits
+            tot_wall += stats.wall_time; tot_htime += stats.heavy_time; tot_dtime += stats.draft_time
+            tot_tok += int(response_ids.shape[0])
             fh.write(json.dumps({
                 "answer": text, "question": row["question"],
                 "heavy_forwards": stats.heavy_forwards, "draft_forwards": stats.draft_forwards,
                 "heavy_commits": stats.heavy_commits, "draft_commits": stats.draft_commits,
-                "gen_tokens": int(response_ids.shape[0]),
+                "wall_time": round(stats.wall_time, 4), "heavy_time": round(stats.heavy_time, 4),
+                "draft_time": round(stats.draft_time, 4), "gen_tokens": int(response_ids.shape[0]),
             }, ensure_ascii=False) + "\n")
             fh.flush()
             if i < 3 or (i + 1) % 50 == 0:
@@ -107,8 +111,12 @@ def main():
     dt = time.time() - t0
     n = max(len(rows), 1)
     frac = tot_dc / max(tot_dc + tot_hc, 1)
-    print(f"[gsm8k-dbet] done in {dt:.1f}s. mean heavy/ex={tot_h/n:.1f} draft/ex={tot_d/n:.1f} "
+    mode = "HEAVY-ONLY" if args.heavy_only else "DBet"
+    print(f"[gsm8k-dbet] {mode} done in {dt:.1f}s. mean heavy/ex={tot_h/n:.1f} draft/ex={tot_d/n:.1f} "
           f"| tokens committed by drafter: {frac:.1%}")
+    print(f"[gsm8k-dbet] mean decode wall/ex={tot_wall/n:.2f}s (heavy {tot_htime/n:.2f}s + draft {tot_dtime/n:.2f}s) "
+          f"| throughput={tot_tok / max(tot_wall, 1e-6):.1f} tok/s "
+          f"| avg {1e3*tot_htime/max(tot_h,1):.0f}ms/heavy-fwd {1e3*tot_dtime/max(tot_d,1):.0f}ms/draft-fwd")
     grader = os.path.join(_HERE, "val_gsm8k.py")
     print(f"[gsm8k-dbet] grade: python {grader} --pred-path {args.out_path}"
           + (f" --limit {args.limit}" if args.limit else ""))
