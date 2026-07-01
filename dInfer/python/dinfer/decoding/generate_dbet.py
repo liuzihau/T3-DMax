@@ -120,18 +120,25 @@ class DbetGenerateStats:
 
 @torch.no_grad()
 def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
-                      max_iters, max_draft_iters, tau, stats):
-    """Decode one block in place via alternating heavy-commit / drafter-extend. Returns nothing (mutates x,
-    updates stats). bs/be = block start/end (grid-aligned); attn = block-causal 4D mask over [0,be)."""
+                      max_iters, max_draft_iters, tau, stats, use_draft=True):
+    """Decode one block in place. If use_draft: alternate heavy-commit / drafter-extend. If NOT use_draft:
+    HEAVY-ONLY baseline -- just heavy forward -> decode_uniform commit -> re-feed the committed tokens to the
+    heavy, no drafter and no hidden-state collection (uses heavy_forward with output_hidden_states=False, so it
+    bypasses the drafter-signal gathering). Shares the exact heavy commit rule so the two paths can't drift.
+    bs/be = block start/end (grid-aligned); attn = block-causal 4D mask over [0,be)."""
     active = (x[0:1, bs:be] == MASK_ID)                                 # original decode region
     block_logits = None
 
     it = 0
     while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
         # ---- heavy forward + decode_uniform commit ----
-        signals = model.extract_heavy_signals(x[:, :be], attn)
+        if use_draft:
+            signals = model.extract_heavy_signals(x[:, :be], attn)     # collects hidden for the drafter
+            block_logits = signals["logits"][:, bs:be]                 # [1, blk, V]
+        else:
+            out = model.heavy_forward(input_ids=x[:, :be], attention_mask=attn, output_hidden_states=False)
+            block_logits = out.logits[:, bs:be]                        # heavy-only: logits only, no hidden
         stats.heavy_forwards += 1
-        block_logits = signals["logits"][:, bs:be]                     # [1, blk, V]
         mask_idx = (x[0:1, bs:be] == MASK_ID)
         x0, high_conf_idx, _, brk = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
         n_before = int(mask_idx.sum())
@@ -142,6 +149,10 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             stats.heavy_commits += int(high_conf_idx.sum())
         if not bool((x[0:1, bs:be] == MASK_ID).any()):
             break
+
+        if not use_draft:                                              # HEAVY-ONLY: re-feed committed ids, loop
+            it += 1
+            continue
 
         # ---- drafter extend (1..max_draft_iters passes, confidence-gated commits) ----
         for _di in range(max_draft_iters):
@@ -184,13 +195,24 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
 
 
 @torch.no_grad()
+def generate_heavy(model, prompt_ids, gen_length, block_length,
+                   heavy_threshold=0.9, max_iter_per_block=32, early_stop=True):
+    """HEAVY-ONLY baseline (pure DMax block-diffusion decode through this model): no drafter, no hidden-state
+    collection. Same block loop + commit rule as generate_dbet, so `heavy_forwards` is directly comparable."""
+    return generate_dbet(model, prompt_ids, gen_length, block_length,
+                         heavy_threshold=heavy_threshold, max_iter_per_block=max_iter_per_block,
+                         early_stop=early_stop, use_draft=False)
+
+
+@torch.no_grad()
 def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_threshold=0.9, draft_threshold=0.7, max_iter_per_block=32,
-                  max_draft_iters=1, tau=None, early_stop=True):
+                  max_draft_iters=1, tau=None, early_stop=True, use_draft=True):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
-    draft_threshold: the trained confidence-head gate for committing DRAFTER tokens (higher = safer/slower)."""
+    draft_threshold: the trained confidence-head gate for committing DRAFTER tokens (higher = safer/slower).
+    use_draft=False -> pure heavy-only baseline (see generate_heavy)."""
     device = prompt_ids.device
     P = prompt_ids.shape[1]
 
@@ -209,7 +231,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
         be = bs + block_length
         attn = build_block_causal_mask(be, block_length, dtype=torch.bfloat16, device=device)
         decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
-                          max_iter_per_block, max_draft_iters, tau, stats)
+                          max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft)
         if early_stop:
             resp_lo = max(P, bs)
             seg = x[0, resp_lo:be]
@@ -241,6 +263,7 @@ def _smoke_test():
     p.add_argument("--heavy_threshold", type=float, default=0.9)
     p.add_argument("--draft_threshold", type=float, default=0.7)
     p.add_argument("--max_draft_iters", type=int, default=1)
+    p.add_argument("--heavy_only", action="store_true", help="pure-DMax baseline: no drafter.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -254,8 +277,9 @@ def _smoke_test():
     response_ids, stats = generate_dbet(
         model, prompt_ids, gen_length=args.gen_length, block_length=args.block_length,
         heavy_threshold=args.heavy_threshold, draft_threshold=args.draft_threshold,
-        max_draft_iters=args.max_draft_iters)
+        max_draft_iters=args.max_draft_iters, use_draft=not args.heavy_only)
     text = tokenizer.decode(response_ids, skip_special_tokens=True)
+    print(f"[dbet] mode={'HEAVY-ONLY' if args.heavy_only else 'DBet (heavy+draft)'}")
     print(f"[dbet] heavy_fwd={stats.heavy_forwards} draft_fwd={stats.draft_forwards} "
           f"heavy_commits={stats.heavy_commits} draft_commits={stats.draft_commits}")
     print(f"[dbet] answer: {text!r}")
