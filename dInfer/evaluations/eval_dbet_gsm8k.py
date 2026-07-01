@@ -61,6 +61,10 @@ def main():
     p.add_argument("--max_iters_per_block", type=int, default=32)
     p.add_argument("--max_draft_iters", type=int, default=1, help="drafter passes per heavy forward.")
     p.add_argument("--heavy_only", action="store_true", help="pure-DMax baseline (no drafter) via the same harness.")
+    p.add_argument("--heavy_tau", type=float, default=1.0, help="soft-embed temperature for heavy commits.")
+    p.add_argument("--heavy_top_k", type=int, default=1, help="soft-embed top-k for heavy commits.")
+    p.add_argument("--draft_tau", type=float, default=1.0, help="soft-embed temperature for drafter commits.")
+    p.add_argument("--draft_top_k", type=int, default=1, help="soft-embed top-k for drafter commits.")
     p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--gt_jsonl_path", default=None)
@@ -90,7 +94,9 @@ def main():
                 gen_length=args.gen_length, block_length=args.block_length,
                 heavy_threshold=args.heavy_threshold, draft_threshold=args.draft_threshold,
                 max_iter_per_block=args.max_iters_per_block, max_draft_iters=args.max_draft_iters,
-                early_stop=not args.no_early_stop, use_draft=not args.heavy_only)
+                early_stop=not args.no_early_stop, use_draft=not args.heavy_only,
+                heavy_tau=args.heavy_tau, heavy_top_k=args.heavy_top_k,
+                draft_tau=args.draft_tau, draft_top_k=args.draft_top_k)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits

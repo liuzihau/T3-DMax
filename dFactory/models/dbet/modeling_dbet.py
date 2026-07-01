@@ -550,12 +550,16 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         return ~canvas, canvas
 
     @torch.no_grad()
-    def extract_heavy_signals(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> dict:
+    def extract_heavy_signals(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
+                              inputs_embeds: Optional[torch.Tensor] = None) -> dict:
         """Run the FROZEN heavy once; capture hidden at config.sel_layers_list (concat -> m*D), the last-layer
         hidden, and the logits; split prefix/canvas. Returns the dict consumed by `draft_forward`. The heavy
-        is bidirectional within a block, so a single pass over [prefix ; canvas] gives all signals."""
+        is bidirectional within a block, so a single pass over [prefix ; canvas] gives all signals.
+        If `inputs_embeds` is given (DMax soft-embedding decode), the heavy forwards on it while the prefix/canvas
+        split still uses the HARD `input_ids` (mask_token_id marks the canvas)."""
         out = self.heavy(
-            input_ids=input_ids, attention_mask=attention_mask,
+            input_ids=None if inputs_embeds is not None else input_ids,
+            inputs_embeds=inputs_embeds, attention_mask=attention_mask,
             output_hidden_states=True, use_cache=False, return_dict=True,
         )
         hs = out.hidden_states                                  # tuple of [B,N,D], len = num_layers+1
