@@ -476,7 +476,7 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
     runs one draft forward; `forward` chains them for training/eval. All masks come from the caller."""
 
     config_class = DbetConfig
-    _no_split_modules = ["DbetDecoderLayer"]
+    _no_split_modules = ["DbetDecoderLayer", "LLaDA2MoeDecoderLayer"]   # shard BOTH draft + heavy layers per-layer (FSDP)
 
     def __init__(self, config: DbetConfig, _heavy: Optional[nn.Module] = None):
         super().__init__(config)
