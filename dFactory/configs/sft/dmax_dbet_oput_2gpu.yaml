@@ -68,7 +68,12 @@ train:
   # --- required infra flags ---
   block_diffusion_mode: true         # REQUIRED: dual-stream [noisy|clean] + block mask (mask path unchanged)
   block_size: 32
-  eval_steps: 0                      # no drafter held-out eval here (heavy-only GSM8K evaluated offline via dInfer)
-  eval_at_start: false
+  # --- held-out val (last-N train tail; base-skill guard + draft-correct vs matched-budget pure-heavy) ---
+  eval_steps: 500                    # run val every 500 steps (0 disables). Metrics -> dmax_ft_metrics.jsonl
+  eval_at_start: true                # step-0 baseline (untrained heavy) for the curves
+  eval_holdout_size: 128             # last-N train examples (minor leakage; fine for a regression curve)
+  eval_heavy_thr: 0.8                # FIXED val threshold (corr2 commit + acc_heavy3 decode)
+  eval_draft_k: 2                    # FIXED val draft top-k
+  eval_n_heavy_passes: 3             # acc_heavy3 = 3 heavy passes (matches acc_corr2's 2 heavy + 1 draft)
   use_wandb: false
   log_steps: 10

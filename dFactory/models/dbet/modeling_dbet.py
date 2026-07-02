@@ -614,6 +614,7 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
         dmax_ft_kwargs: Optional[dict] = None,
+        dmax_ft_eval_kwargs: Optional[dict] = None,
     ) -> dict:
         """extract_heavy_signals -> draft_forward; returns the raw drafter outputs only. The model does NOT
         compute loss — the training script owns that (it has the labels, the loss/accept masks and the loss
@@ -623,6 +624,8 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         the sharded embed/lm_head; direct submodule calls fail under FSDP2)."""
         if dmax_ft_kwargs is not None:
             return self.dmax_ft_forward(**dmax_ft_kwargs)
+        if dmax_ft_eval_kwargs is not None:
+            return self.dmax_ft_eval_forward(**dmax_ft_eval_kwargs)
         signals = self.extract_heavy_signals(input_ids, attention_mask)
         return self.draft_forward(
             signals, attention_mask=attention_mask, position_ids=position_ids,
@@ -690,6 +693,47 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
             "acc_corr2": float(((hout2.logits[:, :L].argmax(-1) == clean_ids) & masked).float().sum() / denom),
         }
         return loss_B, loss_A, metrics
+
+    @torch.no_grad()
+    def _heavy_multipass_acc(self, full, attention_mask, position_ids, noisy_len, mask_id,
+                             heavy_thr, block_size, heavy_top_k, heavy_tau, n_passes):
+        """Matched-budget PURE-HEAVY baseline: run the heavy `n_passes` times, decode_uniform-committing at
+        `heavy_thr` (soft-embed re-feed) each pass; return accuracy on the originally-masked positions vs gold.
+        n_passes=3 aligns with acc_corr2's 2-heavy+1-draft (3 model forwards). All no_grad."""
+        from dbet_train_core import heavy_commit as _heavy_commit
+        from dmax_dbet_train_core import soft_embed as _soft_embed
+        L = noisy_len
+        noisy_ids, clean_ids = full[:, :L], full[:, L:]
+        active = (noisy_ids == mask_id)
+        denom = active.float().sum().clamp_min(1.0)
+        embed = self.draft.frozen_embed
+        cur = noisy_ids.clone()                                  # committed tokens accumulate here (mask = uncommitted)
+        noisy_embeds = embed(noisy_ids).clone()
+        clean_embeds = embed(clean_ids)
+        logits = None
+        for p in range(n_passes):
+            full_embeds = torch.cat([noisy_embeds, clean_embeds], dim=1)
+            logits = self.heavy(inputs_embeds=full_embeds, attention_mask=attention_mask, position_ids=position_ids,
+                                use_cache=False, output_router_logits=False, return_dict=True).logits[:, :L]
+            if p < n_passes - 1:                                 # commit + soft-embed on all but the last pass
+                post, _ = _heavy_commit(logits, cur, mask_id, block_size, heavy_thr)
+                newly = (cur == mask_id) & (post != mask_id)
+                cur = post
+                if bool(newly.any()):
+                    noisy_embeds[newly] = _soft_embed(logits[newly], embed, mask_id, heavy_tau, heavy_top_k)
+        final = torch.where(cur == mask_id, logits.argmax(-1), cur)   # committed token, else last-pass argmax
+        return float(((final == clean_ids) & active).float().sum() / denom)
+
+    @torch.no_grad()
+    def dmax_ft_eval_forward(self, full, attention_mask, position_ids, noisy_len, mask_id,
+                             heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size, n_heavy_passes):
+        """Held-out val (run through forward for FSDP). Reuses dmax_ft_forward for loss_B/loss_A/acc_heavy1/
+        acc_corr2 (2 heavy + draft), then adds acc_heavy3 (matched-budget pure-heavy). Returns the metrics dict."""
+        _, _, m = self.dmax_ft_forward(full, attention_mask, position_ids, noisy_len, mask_id,
+                                       heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size)
+        m["acc_heavy3"] = self._heavy_multipass_acc(full, attention_mask, position_ids, noisy_len, mask_id,
+                                                    heavy_thr, block_size, heavy_top_k, heavy_tau, n_heavy_passes)
+        return m
 
 
 # VeOmni registry hook: `ModelRegistry.register_modeling_path("models.dbet")` walks SUBMODULES (pkgutil) and

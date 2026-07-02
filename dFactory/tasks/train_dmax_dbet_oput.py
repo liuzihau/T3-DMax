@@ -159,6 +159,11 @@ class LLaDA2TrainingArguments(TrainingArguments):
     draft_soft_tau: float = field(default=1.0, metadata={"help": "draft-committed soft-embed temperature."})
     loss_b_weight: float = field(default=1.0, metadata={"help": "weight of the mask-denoise loss (Route B)."})
     loss_a_weight: float = field(default=1.0, metadata={"help": "weight of the draft-correct loss (Route A)."})
+    eval_heavy_thr: float = field(default=0.8, metadata={"help": "held-out val: FIXED heavy commit threshold "
+                                                                 "(both the corr2 commit and the acc_heavy3 decode)."})
+    eval_draft_k: int = field(default=2, metadata={"help": "held-out val: FIXED draft soft-embed top-k."})
+    eval_n_heavy_passes: int = field(default=3, metadata={"help": "held-out val: heavy passes for acc_heavy3 "
+                                                                  "(matched to acc_corr2's 2 heavy + 1 draft)."})
     loss_decay_mode: str = field(
         default="dbet",
         metadata={"help": "DBet loss-weight schedule over remaining positions: 'dbet' (max(base^k,floor); "
@@ -534,8 +539,48 @@ def main():
         enabled=args.train.global_rank == 0,
     )
 
-    def _run_eval(step):     # no-op here; heavy-only GSM8K is evaluated offline via the dInfer harness
-        return
+    # ---- held-out val: base-skill guard (acc_heavy1), draft-correct (acc_corr2, 2 heavy+draft), matched-budget
+    #      pure-heavy (acc_heavy3, 3 heavy @eval_heavy_thr), + loss_B/loss_A. Same step through model(...) under
+    #      no_grad on the last-N train examples, FIXED reveal/th/draft_k (stable curve). COLLECTIVE: every rank
+    #      runs model(...) in sync (FSDP all-gather); only rank0 logs. Deterministic -> ranks agree.
+    from dbet_metrics import load_holdout_examples as _load_holdout, _build_dual_stream as _dual
+    from dataset.data_transform_dbet import block_left_to_right_reveal as _reveal
+    from dbet_train_core import MASK_ID as _MASK_ID
+    _ft_holdout = None
+    if args.train.eval_steps:
+        _ft_holdout = _load_holdout(args.data.train_path, args.train.eval_holdout_size, tokenizer,
+                                    args.data.max_seq_len, args.data.text_keys)
+        logger.info_rank0(f"[dmax-ft eval] {len(_ft_holdout)} held-out examples, th={args.train.eval_heavy_thr} "
+                          f"draft_k={args.train.eval_draft_k} n_heavy={args.train.eval_n_heavy_passes} -> {metrics_path}")
+
+    def _run_eval(step):
+        if not _ft_holdout:
+            return
+        was_training = model.training
+        model.eval()
+        L, bs, dev = args.data.max_seq_len, args.train.block_size, get_device_type()
+        agg, keys = {}, ("loss_B", "loss_A", "acc_heavy1", "acc_corr2", "acc_heavy3")
+        for clean_ids, prompt_len in _ft_holdout:
+            clean_ids = clean_ids[:L]
+            maskable = torch.arange(L) >= prompt_len
+            noisy = _reveal(clean_ids.clone(), (args.data.noise_range_low, args.data.noise_range_high),
+                            maskable, _MASK_ID, bs)
+            mb = _dual(noisy.unsqueeze(0), clean_ids.unsqueeze(0), block_diffusion_attn_mask_prototype, dev)
+            m = model(dmax_ft_eval_kwargs=dict(
+                full=mb["input_ids"], attention_mask=mb["attention_mask"], position_ids=mb["position_ids"],
+                noisy_len=L, mask_id=_MASK_ID, heavy_thr=args.train.eval_heavy_thr, draft_k=args.train.eval_draft_k,
+                heavy_top_k=int(args.train.heavy_soft_top_k), heavy_tau=float(args.train.heavy_soft_tau),
+                draft_tau=float(args.train.draft_soft_tau), block_size=bs, n_heavy_passes=args.train.eval_n_heavy_passes))
+            for k in keys:
+                agg[k] = agg.get(k, 0.0) + float(m[k])
+        n = max(1, len(_ft_holdout))
+        scalar = {k: agg[k] / n for k in keys}
+        metrics_logger.log(scalar, step=step, split="val")
+        logger.info_rank0(f"[dmax-ft eval @ {step}] " + " ".join(f"{k}={v:.4f}" for k, v in scalar.items())
+                          + "   (want acc_corr2 >= acc_heavy3, acc_heavy1 steady)")
+        if was_training:
+            model.train()
+        helper.empty_cache()
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
