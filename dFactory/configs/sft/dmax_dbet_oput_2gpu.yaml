@@ -19,7 +19,7 @@ data:
   max_seq_len: 2048
   text_keys: messages
   noise_range_low: 0.75              # fixed 25% reveal (sigma 0.75), left-to-right per block
-  noise_range_high: 0.75
+  noise_range_high: 1
   num_workers: 16
 
 train:
@@ -53,7 +53,7 @@ train:
   empty_cache_steps: 200
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_steps: 1000                   # checkpoint every 1000 steps (0 = only at epoch end). hf_ckpt = FULL model
+  save_steps: 20000                  # checkpoint every 1000 steps (0 = only at epoch end). hf_ckpt = FULL model
                                      # (fine-tuned heavy ~16B + draft) ~33GB each + a DCP for resume -> PRUNE old
                                      # ones / raise this if disk is tight. Fine-tune converges fast; pick the ckpt
                                      # where val acc_corr2 peaks with acc_heavy1 still steady.
