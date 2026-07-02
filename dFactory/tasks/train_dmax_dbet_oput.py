@@ -763,10 +763,11 @@ def main():
                             output_dir=args.train.output_dir,
                             ckpt_manager=args.train.ckpt_manager,
                         )
-                        _n0 = len(model_state_dict)
-                        model_state_dict = _drafter_only_state_dict(model_state_dict)   # skip frozen heavy.*
-                        logger.info_rank0(f"HF export: {len(model_state_dict)} drafter tensors "
-                                          f"(dropped {_n0 - len(model_state_dict)} frozen heavy.* from DMax source).")
+                        # HEAVY fine-tune: KEEP the full model (fine-tuned heavy.* + frozen draft.*) so hf_ckpt is
+                        # a self-contained, directly-loadable DBet model. (train_dbet dropped heavy.* because the
+                        # heavy was frozen there; here the heavy IS what we trained -- dropping it loses the run.)
+                        logger.info_rank0(f"HF export: {len(model_state_dict)} tensors (full model: fine-tuned "
+                                          f"heavy.* + frozen draft.*).")
                         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
 
                         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
@@ -820,10 +821,8 @@ def main():
             output_dir=args.train.output_dir,
             ckpt_manager=args.train.ckpt_manager,
         )
-        _n0 = len(model_state_dict)
-        model_state_dict = _drafter_only_state_dict(model_state_dict)   # skip frozen heavy.*
-        logger.info_rank0(f"HF export: {len(model_state_dict)} drafter tensors "
-                          f"(dropped {_n0 - len(model_state_dict)} frozen heavy.* from DMax source).")
+        # HEAVY fine-tune: KEEP the full model (fine-tuned heavy.* + frozen draft.*) -- self-contained DBet ckpt.
+        logger.info_rank0(f"HF export: {len(model_state_dict)} tensors (full model: fine-tuned heavy.* + draft.*).")
         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 

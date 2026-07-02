@@ -53,6 +53,10 @@ train:
   empty_cache_steps: 200
   ckpt_manager: dcp
   load_checkpoint_path: ""
+  save_steps: 1000                   # checkpoint every 1000 steps (0 = only at epoch end). hf_ckpt = FULL model
+                                     # (fine-tuned heavy ~16B + draft) ~33GB each + a DCP for resume -> PRUNE old
+                                     # ones / raise this if disk is tight. Fine-tune converges fast; pick the ckpt
+                                     # where val acc_corr2 peaks with acc_heavy1 still steady.
   save_epochs: 1
   save_hf_weights: true
   # --- heavy fine-tune knobs ---
