@@ -1,0 +1,74 @@
+# DMax HEAVY fine-tune (OPUT with draft-contaminated rollout) -- 2x H200, FSDP2.
+# Trains only heavy.model.layers[trainable_from_layer:] (top 12 of 20); freezes the rest + embed/lm_head + the
+# whole drafter. Merged 2-route step: mask-denoise (loss_B) + draft-correct (loss_A). Mask path unchanged.
+# Reuses ./dbet_init (heavy.* + trained draft.*). Set data.train_path to the OPUT math data.
+# Launch (2 GPUs):
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dmax_dbet_oput.py configs/sft/dmax_dbet_oput_2gpu.yaml
+model:
+  config_path: ./dbet_init
+  model_path: ./dbet_init            # heavy.* (DMax) + draft.* (trained drafter) -- rebuild dbet_init from a trained drafter
+  tokenizer_path: ../DMax-Math-16B-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75              # fixed 25% reveal (sigma 0.75), left-to-right per block
+  noise_range_high: 0.75
+  num_workers: 16
+
+train:
+  output_dir: ./dmax_ft_outputs
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 2               # 2 GPUs, mbs 1 -> grad-accum 1 (offload OFF); raise gbs for accumulation
+  micro_batch_size: 1                # step assumes B=1 (drafter gather); keep micro_batch_size 1
+  num_train_epochs: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 5.0e-6                         # FINE-TUNE a well-trained 16B -> small lr (5e-6 .. 1e-5)
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  enable_mixed_precision: true       # fp32 master + fp32 Adam + bf16 compute (STABLE; needed for the heavy update)
+  enable_gradient_checkpointing: true
+  enable_full_shard: true            # shard across the 2 GPUs
+  enable_fsdp_offload: false         # top-12 states fit on 2 H200 -> no offload (fast). Turn on only if OOM.
+  enable_activation_offload: false
+  init_device: meta
+  broadcast_model_weights_from_rank0: true
+  empty_cache_steps: 200
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 1
+  save_hf_weights: true
+  # --- heavy fine-tune knobs ---
+  trainable_from_layer: 8            # train heavy layers [8:20] = top 12 (10 safe, 14 tight on 2 H200)
+  heavy_commit_threshold_low: 0.75   # heavy commit threshold sampled in [lo,hi] per example
+  heavy_commit_threshold_high: 0.9
+  draft_top_k_choices: "1,2,3"       # draft soft-embed top-k sampled per example
+  heavy_soft_top_k: 1                # heavy-committed soft-embed top-k (DMax default 1)
+  heavy_soft_tau: 1.0
+  draft_soft_tau: 1.0
+  loss_b_weight: 1.0                 # mask-denoise route
+  loss_a_weight: 1.0                 # draft-correct route
+  # --- required infra flags ---
+  block_diffusion_mode: true         # REQUIRED: dual-stream [noisy|clean] + block mask (mask path unchanged)
+  block_size: 32
+  eval_steps: 0                      # no drafter held-out eval here (heavy-only GSM8K evaluated offline via dInfer)
+  eval_at_start: false
+  use_wandb: false
+  log_steps: 10
