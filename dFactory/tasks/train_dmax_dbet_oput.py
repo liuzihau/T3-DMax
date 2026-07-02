@@ -374,6 +374,8 @@ def main():
         raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
 
     logger.info_rank0("Prepare model")
+    import logging as _logging   # silence VeOmni's per-key weight-load/broadcast INFO spam (fills the screen)
+    _logging.getLogger("veomni.models.module_utils").setLevel(_logging.WARNING)
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,

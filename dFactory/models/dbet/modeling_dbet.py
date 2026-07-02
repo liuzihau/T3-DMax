@@ -608,22 +608,88 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
     # ---- end-to-end (training / eval) ----
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
+        dmax_ft_kwargs: Optional[dict] = None,
     ) -> dict:
         """extract_heavy_signals -> draft_forward; returns the raw drafter outputs only. The model does NOT
         compute loss — the training script owns that (it has the labels, the loss/accept masks and the loss
         weighting). `attention_mask` (#1[+#2]) and `denoise_mask` (#4) are passed through.
-        Returns dict: logits [B,C,V], conf [B,C] (or None), h_draft [B,C,D], delta [B,C,D]. Everything a
-        training script needs to compute token CE + the asymmetric confidence loss itself."""
+        Returns dict: logits [B,C,V], conf [B,C] (or None), h_draft [B,C,D], delta [B,C,D].
+        `dmax_ft_kwargs`: route to the HEAVY-fine-tune step (must go through forward so the FSDP root hook gathers
+        the sharded embed/lm_head; direct submodule calls fail under FSDP2)."""
+        if dmax_ft_kwargs is not None:
+            return self.dmax_ft_forward(**dmax_ft_kwargs)
         signals = self.extract_heavy_signals(input_ids, attention_mask)
         return self.draft_forward(
             signals, attention_mask=attention_mask, position_ids=position_ids,
             denoise_mask=denoise_mask, tau=tau,
         )
+
+    def dmax_ft_forward(self, full, attention_mask, position_ids, noisy_len, mask_id,
+                        heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size):
+        """HEAVY fine-tune merged step, run INSIDE forward so FSDP gathers the root params. Returns
+        (loss_B, loss_A, metrics). See dmax_dbet_train_core for the design. B=1 assumed."""
+        import torch.nn.functional as _F
+        from dbet_train_core import heavy_commit as _heavy_commit, derive_drafter_mask as _derive_mask
+        from dmax_dbet_train_core import soft_embed as _soft_embed
+
+        cfg = self.config
+        bs = block_size
+        L = noisy_len
+        noisy_ids, clean_ids = full[:, :L], full[:, L:]
+        masked = (noisy_ids == mask_id)
+        w = masked.float()
+        denom = w.sum().clamp_min(1.0)
+        embed = self.draft.frozen_embed
+
+        def _ce(noisy_logits):
+            ce = _F.cross_entropy(noisy_logits.reshape(-1, noisy_logits.shape[-1]).float(),
+                                  clean_ids.reshape(-1), reduction="none").view_as(clean_ids)
+            return (ce * w).sum() / denom
+
+        # heavy fwd #1 (grad): mask-denoise loss + draft ingredients
+        hout1 = self.heavy(input_ids=full, attention_mask=attention_mask, position_ids=position_ids,
+                           use_cache=False, output_hidden_states=True, output_router_logits=False, return_dict=True)
+        noisy_logits1 = hout1.logits[:, :L]
+        loss_B = _ce(noisy_logits1)
+        sel = torch.cat([hout1.hidden_states[i] for i in cfg.sel_layers_list], dim=-1)
+        noisy_h_sel, clean_h_sel = sel[:, :L].detach(), sel[:, L:].detach()
+        noisy_h_last = hout1.hidden_states[-1][:, :L].detach()
+        noisy_logits1_d = noisy_logits1.detach()
+
+        post_commit, remaining = _heavy_commit(noisy_logits1_d, noisy_ids, mask_id, bs, heavy_thr)
+        heavy_committed = masked & (~remaining)
+
+        with torch.no_grad():
+            dout = self.draft(input_ids=post_commit, heavy_logits=noisy_logits1_d,
+                              h_sel_denoise=noisy_h_sel, h_last_denoise=noisy_h_last, h_sel_prefix=clean_h_sel,
+                              attention_mask=_derive_mask(attention_mask, L), position_ids=position_ids,
+                              denoise_mask=None, tau=None)
+        draft_logits = dout["logits"]
+
+        noisy_embeds = embed(noisy_ids).detach().clone()
+        if bool(heavy_committed.any()):
+            noisy_embeds[heavy_committed] = _soft_embed(noisy_logits1_d[heavy_committed], embed, mask_id, heavy_tau, heavy_top_k)
+        if bool(remaining.any()):
+            noisy_embeds[remaining] = _soft_embed(draft_logits[remaining], embed, mask_id, draft_tau, draft_k)
+        full_embeds = torch.cat([noisy_embeds, embed(clean_ids).detach()], dim=1)
+
+        hout2 = self.heavy(inputs_embeds=full_embeds, attention_mask=attention_mask, position_ids=position_ids,
+                           use_cache=False, output_router_logits=False, return_dict=True)
+        loss_A = _ce(hout2.logits[:, :L])
+
+        metrics = {
+            "loss_B": float(loss_B.detach()), "loss_A": float(loss_A.detach()),
+            "heavy_thr": heavy_thr, "draft_k": draft_k,
+            "n_masked": int(masked.sum()), "n_heavy_commit": int(heavy_committed.sum()), "n_draft": int(remaining.sum()),
+            "acc_heavy1": float(((noisy_logits1_d.argmax(-1) == clean_ids) & masked).float().sum() / denom),
+            "acc_corr2": float(((hout2.logits[:, :L].argmax(-1) == clean_ids) & masked).float().sum() / denom),
+        }
+        return loss_B, loss_A, metrics
 
 
 # VeOmni registry hook: `ModelRegistry.register_modeling_path("models.dbet")` walks SUBMODULES (pkgutil) and
