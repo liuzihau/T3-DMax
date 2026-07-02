@@ -50,6 +50,9 @@ def main():
     p.add_argument("--draft_num_layers", type=int, default=5)
     p.add_argument("--sel_layers", default="1,10,19")
     p.add_argument("--per_layer_prefix_fuse", action="store_true", default=True)
+    p.add_argument("--draft_ckpt", default=None,
+                   help="dir with a TRAINED drafter (drafter-only hf_ckpt safetensors). If given, load draft.* "
+                        "from it instead of warm-starting (use this to assemble the init for the heavy fine-tune).")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
 
@@ -81,8 +84,26 @@ def main():
         args.heavy_path, config=heavy_cfg, dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation="sdpa")
     model = DbetForDraftDecoding(cfg, _heavy=heavy).to(device=args.device, dtype=torch.bfloat16)
 
-    # 3) warm-start drafter from the (real) heavy bottom + zero Δh; freeze the heavy/reused pieces
-    model.init_draft_layers_warmstart()
+    # 3) drafter init: load a TRAINED drafter (for the heavy fine-tune) or warm-start from the heavy bottom.
+    if args.draft_ckpt:
+        import glob
+        from safetensors.torch import load_file
+        files = sorted(glob.glob(os.path.join(os.path.abspath(args.draft_ckpt), "*.safetensors")))
+        if not files:
+            raise FileNotFoundError(f"no .safetensors in --draft_ckpt {args.draft_ckpt}")
+        sd = {}
+        for f in files:
+            sd.update(load_file(f))
+        draft_sd = {k: v for k, v in sd.items() if k.startswith("draft.")}
+        missing, unexpected = model.load_state_dict(draft_sd, strict=False)
+        loaded = [k for k in draft_sd if not any(k in u for u in unexpected)]
+        still_missing = [k for k in missing if k.startswith("draft.") and "frozen_" not in k]
+        print(f"[build_dbet_init] loaded {len(draft_sd)} trained draft.* tensors from {args.draft_ckpt}; "
+              f"draft params still missing (untrained): {len(still_missing)}")
+        if still_missing:
+            print(f"[build_dbet_init]   WARNING first missing: {still_missing[:4]}")
+    else:
+        model.init_draft_layers_warmstart()   # warm-start from the heavy bottom + zero Delta-h
     model._apply_freeze_flags()
 
     # 5) save self-contained checkpoint (config.json + weights). config_path == model_path == out_dir
