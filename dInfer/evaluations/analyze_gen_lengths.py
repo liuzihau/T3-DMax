@@ -34,7 +34,7 @@ def degenerate_tail(text, tail_len=80):
 
 def summarize(path, near_cap):
     rows = [json.loads(l) for l in open(path) if l.strip()]
-    if not rows:
+    if not rows or "gen_tokens" not in rows[0]:      # skip non-pred jsonl (e.g. val_gsm8k *_eval_details files)
         return None
     toks = [int(r.get("gen_tokens", 0)) for r in rows]
     capped = sum(1 for t in toks if t >= near_cap)
@@ -58,7 +58,8 @@ def main():
     ap.add_argument("--near_cap", type=int, default=1000, help="gen_tokens >= this = likely truncated / no-EOS")
     args = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(args.dir, args.glob)))
+    files = [f for f in sorted(glob.glob(os.path.join(args.dir, args.glob)))
+             if "_eval_details" not in os.path.basename(f)]   # drop val_gsm8k grading-detail files
     if not files:
         print(f"no files match {os.path.join(args.dir, args.glob)}")
         return
