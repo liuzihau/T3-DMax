@@ -37,10 +37,13 @@ train:
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 5.0e-6                         # FINE-TUNE a well-trained 16B -> small lr (5e-6 .. 1e-5)
-  lr_warmup_ratio: 0.03
+  max_steps: 40000                   # caps train_steps (via the arg property) -> drives BOTH the loop AND the
+                                     # cosine total. Matches the previous run's 40k ckpt for comparison.
+  lr: 2.0e-6                         # DMax paper's fine-tune lr (ceiling). Last run's 5e-6 sat at peak w/ no
+                                     # decay and degraded the heavy; 2e-6 + a real 40k cosine is the fix.
+  lr_warmup_ratio: 0.01             # 0.01 * 40k = 400 warmup steps (was 0.03*699k = 21k -> never really decayed)
   lr_decay_style: cosine
-  lr_decay_ratio: 1.0
+  lr_decay_ratio: 1.0                # cosine 2e-6 -> lr_min over the full 40k
   weight_decay: 0.0
   max_grad_norm: 1.0
   enable_mixed_precision: true       # fp32 master + fp32 Adam + bf16 compute (STABLE; needed for the heavy update)
