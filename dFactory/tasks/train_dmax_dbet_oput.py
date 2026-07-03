@@ -159,6 +159,8 @@ class LLaDA2TrainingArguments(TrainingArguments):
     draft_soft_tau: float = field(default=1.0, metadata={"help": "draft-committed soft-embed temperature."})
     loss_b_weight: float = field(default=1.0, metadata={"help": "weight of the mask-denoise loss (Route B)."})
     loss_a_weight: float = field(default=1.0, metadata={"help": "weight of the draft-correct loss (Route A)."})
+    loss_c_weight: float = field(default=1.0, metadata={"help": "weight of the pure-heavy self-refine loss "
+                                                                "(Route C: all-heavy-commit 2nd pass; anti-degradation)."})
     eval_heavy_thr: float = field(default=0.8, metadata={"help": "held-out val: FIXED heavy commit threshold "
                                                                  "(both the corr2 commit and the acc_heavy3 decode)."})
     eval_draft_k: int = field(default=2, metadata={"help": "held-out val: FIXED draft soft-embed top-k."})
@@ -559,7 +561,7 @@ def main():
         was_training = model.training
         model.eval()
         L, bs, dev = args.data.max_seq_len, args.train.block_size, get_device_type()
-        agg, keys = {}, ("loss_B", "loss_A", "acc_heavy1", "acc_corr2", "acc_heavy3")
+        agg, keys = {}, ("loss_B", "loss_A", "loss_C", "acc_heavy1", "acc_corr2", "acc_corrC", "acc_heavy3")
         for clean_ids, prompt_len in _ft_holdout:
             clean_ids = clean_ids[:L]
             maskable = torch.arange(L) >= prompt_len

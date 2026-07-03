@@ -634,8 +634,10 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
 
     def dmax_ft_forward(self, full, attention_mask, position_ids, noisy_len, mask_id,
                         heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size):
-        """HEAVY fine-tune merged step, run INSIDE forward so FSDP gathers the root params. Returns
-        (loss_B, loss_A, metrics). See dmax_dbet_train_core for the design. B=1 assumed."""
+        """HEAVY fine-tune merged 3-route step, run INSIDE forward so FSDP gathers the root params. Shares heavy
+        fwd#1 (loss_B mask-denoise + commit + draft signals), then ONE batched B=2 second heavy forward:
+        row0 = Route A (correct the draft rollout -> loss_A), row1 = Route C (all-heavy-commit self-refine ->
+        loss_C, anti-degradation). Returns (loss_B, loss_A, loss_C, metrics). B(data)=1 assumed."""
         import torch.nn.functional as _F
         from dbet_train_core import heavy_commit as _heavy_commit, derive_drafter_mask as _derive_mask
         from dmax_dbet_train_core import soft_embed as _soft_embed
@@ -674,25 +676,43 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
                               denoise_mask=None, tau=None)
         draft_logits = dout["logits"]
 
-        noisy_embeds = embed(noisy_ids).detach().clone()
-        if bool(heavy_committed.any()):
-            noisy_embeds[heavy_committed] = _soft_embed(noisy_logits1_d[heavy_committed], embed, mask_id, heavy_tau, heavy_top_k)
+        # ---- build BOTH 2nd-pass noisy embeds (share revealed golden + heavy-committed soft-embed) ----
+        base = embed(noisy_ids).detach()                        # golden@revealed, embed(MASK)@masked
+        heavy_soft_committed = (_soft_embed(noisy_logits1_d[heavy_committed], embed, mask_id, heavy_tau, heavy_top_k)
+                                if bool(heavy_committed.any()) else None)
+        # Route A: golden ; heavy-soft(committed) ; DRAFT-soft(remaining)   (correct the draft rollout)
+        embeds_A = base.clone()
+        if heavy_soft_committed is not None:
+            embeds_A[heavy_committed] = heavy_soft_committed
         if bool(remaining.any()):
-            noisy_embeds[remaining] = _soft_embed(draft_logits[remaining], embed, mask_id, draft_tau, draft_k)
-        full_embeds = torch.cat([noisy_embeds, embed(clean_ids).detach()], dim=1)
+            embeds_A[remaining] = _soft_embed(draft_logits[remaining], embed, mask_id, draft_tau, draft_k)
+        # Route C: golden ; heavy-soft(ALL masked)  ("all commit" -> keep the heavy's own self-refine; anti-degrade)
+        embeds_C = base.clone()
+        if bool(masked.any()):
+            embeds_C[masked] = _soft_embed(noisy_logits1_d[masked], embed, mask_id, heavy_tau, heavy_top_k)
+        clean_embeds = embed(clean_ids).detach()
 
-        hout2 = self.heavy(inputs_embeds=full_embeds, attention_mask=attention_mask, position_ids=position_ids,
+        # ---- ONE batched 2nd heavy forward (B=2): row0 = Route A, row1 = Route C (shares fwd#1; +1 fwd call) ----
+        full_2 = torch.cat([torch.cat([embeds_A, clean_embeds], dim=1),
+                            torch.cat([embeds_C, clean_embeds], dim=1)], dim=0)      # [2,2L,D]
+        attn_2 = attention_mask.expand(2, *attention_mask.shape[1:]) if attention_mask is not None else None
+        pos_2 = position_ids.expand(2, -1).contiguous() if position_ids is not None else None
+        hout2 = self.heavy(inputs_embeds=full_2, attention_mask=attn_2, position_ids=pos_2,
                            use_cache=False, output_router_logits=False, return_dict=True)
-        loss_A = _ce(hout2.logits[:, :L])
+        logits_A = hout2.logits[0:1, :L]                        # keep the [1,L,V] batch dim for _ce (vs clean_ids [1,L])
+        logits_C = hout2.logits[1:2, :L]
+        loss_A = _ce(logits_A)                                  # correct-draft route
+        loss_C = _ce(logits_C)                                  # pure-heavy self-refine route
 
         metrics = {
-            "loss_B": float(loss_B.detach()), "loss_A": float(loss_A.detach()),
+            "loss_B": float(loss_B.detach()), "loss_A": float(loss_A.detach()), "loss_C": float(loss_C.detach()),
             "heavy_thr": heavy_thr, "draft_k": draft_k,
             "n_masked": int(masked.sum()), "n_heavy_commit": int(heavy_committed.sum()), "n_draft": int(remaining.sum()),
             "acc_heavy1": float(((noisy_logits1_d.argmax(-1) == clean_ids) & masked).float().sum() / denom),
-            "acc_corr2": float(((hout2.logits[:, :L].argmax(-1) == clean_ids) & masked).float().sum() / denom),
+            "acc_corr2": float(((logits_A.argmax(-1) == clean_ids) & masked).float().sum() / denom),
+            "acc_corrC": float(((logits_C.argmax(-1) == clean_ids) & masked).float().sum() / denom),
         }
-        return loss_B, loss_A, metrics
+        return loss_B, loss_A, loss_C, metrics
 
     @torch.no_grad()
     def _heavy_multipass_acc(self, full, attention_mask, position_ids, noisy_len, mask_id,
@@ -729,8 +749,8 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
                              heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size, n_heavy_passes):
         """Held-out val (run through forward for FSDP). Reuses dmax_ft_forward for loss_B/loss_A/acc_heavy1/
         acc_corr2 (2 heavy + draft), then adds acc_heavy3 (matched-budget pure-heavy). Returns the metrics dict."""
-        _, _, m = self.dmax_ft_forward(full, attention_mask, position_ids, noisy_len, mask_id,
-                                       heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size)
+        _, _, _, m = self.dmax_ft_forward(full, attention_mask, position_ids, noisy_len, mask_id,
+                                          heavy_thr, draft_k, heavy_top_k, heavy_tau, draft_tau, block_size)
         m["acc_heavy3"] = self._heavy_multipass_acc(full, attention_mask, position_ids, noisy_len, mask_id,
                                                     heavy_thr, block_size, heavy_top_k, heavy_tau, n_heavy_passes)
         return m

@@ -67,8 +67,10 @@ train:
   heavy_soft_top_k: 1                # heavy-committed soft-embed top-k (DMax default 1)
   heavy_soft_tau: 1.0
   draft_soft_tau: 1.0
-  loss_b_weight: 1.0                 # mask-denoise route
-  loss_a_weight: 1.0                 # draft-correct route
+  loss_b_weight: 1.0                 # Route B: mask-denoise (1-pass base skill)
+  loss_a_weight: 1.0                 # Route A: draft-correct (2nd pass sees draft soft-embeds)
+  loss_c_weight: 1.0                 # Route C: pure-heavy self-refine (all-heavy-commit 2nd pass; anti-degrade
+                                     #          acc_heavy3). Batched with Route A in one B=2 2nd forward.
   # --- required infra flags ---
   block_diffusion_mode: true         # REQUIRED: dual-stream [noisy|clean] + block mask (mask path unchanged)
   block_size: 32
