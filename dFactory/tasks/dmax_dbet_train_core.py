@@ -28,22 +28,7 @@ import random
 import torch
 import torch.nn.functional as F
 
-from dbet_train_core import MASK_ID, derive_drafter_mask, heavy_commit
-
-
-def soft_embed(logits_sel, embed_layer, mask_id, tau, top_k):
-    """DMax soft-embed for committed positions: softmax(logits/tau) -> top-k weighted token embeds +
-    residual*embed(MASK), renormalized. logits_sel [n,V] -> [n,D]. (Matches generate_dbet._soft_embed.)"""
-    device = logits_sel.device
-    probs = torch.softmax(logits_sel.float() / max(float(tau), 1e-6), dim=-1)
-    topk_probs, topk_idx = torch.topk(probs, top_k, dim=-1)
-    residual = (1.0 - topk_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
-    topk_emb = embed_layer(topk_idx).float()
-    mask_emb = embed_layer(torch.tensor([mask_id], device=device)).float()
-    s = (topk_emb * topk_probs.unsqueeze(-1)).sum(dim=1) + mask_emb * residual
-    tgt = (topk_emb.norm(dim=-1) * topk_probs).sum(dim=-1, keepdim=True) + mask_emb.norm() * residual
-    s = s * (tgt / (s.norm(dim=-1, keepdim=True) + 1e-6))
-    return s.to(embed_layer.weight.dtype)
+from dbet_train_core import MASK_ID, derive_drafter_mask, heavy_commit, soft_embed  # soft_embed defined in dbet_train_core
 
 
 def _cfg(args, name, default):

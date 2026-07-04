@@ -58,12 +58,18 @@ train:
   # --- DBet block-diffusion + drafter knobs ---
   block_diffusion_mode: true       # REQUIRED: builds the dual-stream [noisy|clean] + block mask
   block_size: 32
-  heavy_commit_threshold: 0.9      # frozen heavy one-pass decode_uniform commit (high -> drafter does more)
-  conf_loss_weight: 1.0            # confidence-head BCE weight (now regresses accept rate = 1 - 0.5*L1(draft,heavy))
+  heavy_commit_threshold: 0.5      # LOW commit -> heavy commits more (some wrong) -> the draft learns to catch/fix them
+  conf_loss_weight: 1.0            # confidence-head BCE weight (regresses accept rate = 1 - 0.5*L1(draft, heavy target))
   # --- DSpark-style alignment: drafter matches the HEAVY (CE to heavy-argmax + L1/TV) + small golden nudge ---
   align_ce_weight: 0.1
   align_l1_weight: 1.0
   golden_ce_weight: 0.1           # small golden portion (set 0 for pure heavy-matching / no divergence)
+  # --- 2nd-pass verification mode: draft REPLACES the heavy's 2nd pass; full-region loss; committed = peak weight ---
+  align_to_2nd_pass: true         # +1 frozen heavy (verifier) forward/step; drafts fixes to wrong 1st-pass commits
+  heavy_soft_tau: 1.0             # soft-embed temperature for re-feeding committed positions to the 2nd pass
+  heavy_soft_top_k: 1
+  loss_decay_mode: dflash         # DFlash decay exp(-k/gamma) on the remaining region (committed uses peak weight)
+  loss_decay_gamma: 16.0          # ~block_size/2
   same_token_labels: true          # (unused by DBet loss; kept for arg compatibility)
   use_wandb: false
   log_steps: 1

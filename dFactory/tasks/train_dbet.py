@@ -152,6 +152,10 @@ class LLaDA2TrainingArguments(TrainingArguments):
     align_l1_weight: float = field(default=1.0, metadata={"help": "weight of L1/TV(draft, heavy) -- soft align (=1-accept)."})
     golden_ce_weight: float = field(default=0.1, metadata={"help": "small CE(draft, golden) nudge; 0 = pure DSpark "
                                                                   "(match heavy only). Higher re-buys divergence risk."})
+    align_to_2nd_pass: bool = field(default=False, metadata={"help": "if True: drafter REPLACES the heavy's 2nd "
+        "(verification) pass -- target = 2nd-pass logits over the FULL region (committed re-predicted + remaining), "
+        "so it drafts fixes to wrong 1st-pass commits; committed = peak weight. +1 frozen heavy forward/step. "
+        "Pair with a low heavy_commit_threshold (e.g. 0.5). False = match the 1st pass on remaining only."})
     loss_decay_mode: str = field(
         default="dbet",
         metadata={"help": "DBet loss-weight schedule over remaining positions: 'dbet' (max(base^k,floor); "

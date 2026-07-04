@@ -141,43 +141,95 @@ def first_t_position_acc(correct, remaining, block_size, tpf):
     return float(torch.stack(accs).mean()) if accs else float("nan")
 
 
+def soft_embed(logits_sel, embed_layer, mask_id, tau, top_k):
+    """DMax soft-embed: softmax(logits/tau) -> top-k weighted token embeds + residual*embed(MASK), renormalized.
+    logits_sel [n,V] -> [n,D]. (Matches generate_dbet._soft_embed / the decode re-feed.)"""
+    device = logits_sel.device
+    probs = torch.softmax(logits_sel.float() / max(float(tau), 1e-6), dim=-1)
+    topk_probs, topk_idx = torch.topk(probs, top_k, dim=-1)
+    residual = (1.0 - topk_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)
+    topk_emb = embed_layer(topk_idx).float()
+    mask_emb = embed_layer(torch.tensor([mask_id], device=device)).float()
+    s = (topk_emb * topk_probs.unsqueeze(-1)).sum(dim=1) + mask_emb * residual
+    tgt = (topk_emb.norm(dim=-1) * topk_probs).sum(dim=-1, keepdim=True) + mask_emb.norm() * residual
+    s = s * (tgt / (s.norm(dim=-1, keepdim=True) + 1e-6))
+    return s.to(embed_layer.weight.dtype)
+
+
+def _heavy_verify_pass(core, micro_batch, heavy_logits1, committed, mask_id, tau, top_k):
+    """2nd heavy pass = the VERIFIER. Re-feed the 1st-pass committed positions as SOFT-embeds (the blur lets the
+    heavy RECONSIDER a low-confidence commit -- a hard-token re-feed near-copies and finds nothing); remaining
+    stay MASK. Forward the frozen heavy; return its logits over the L noisy positions = the settled/verifier
+    distribution across the FULL answer region (committed re-predicted + remaining). +1 frozen heavy forward."""
+    L = micro_batch["noisy_input_ids"].shape[1]
+    full = micro_batch["input_ids"]
+    noisy_ids, clean_ids = full[:, :L], full[:, L:]
+    embed = core.draft.frozen_embed
+    noisy_emb = embed(noisy_ids).clone()                              # golden@revealed, embed(MASK)@masked
+    if bool(committed.any()):
+        noisy_emb[committed] = soft_embed(heavy_logits1[committed], embed, mask_id, tau, top_k)
+    full_emb = torch.cat([noisy_emb, embed(clean_ids)], dim=1)
+    with torch.no_grad():
+        out2 = core.heavy(inputs_embeds=full_emb, attention_mask=micro_batch["attention_mask"],
+                          position_ids=micro_batch["position_ids"], use_cache=False,
+                          output_router_logits=False, return_dict=True)
+    return out2.logits[:, :L]
+
+
 def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, return_metrics=False):
     """DBet core step (requires the dual stream already in micro_batch: input_ids=[noisy|clean] [B,2L],
     attention_mask=[B,1,2L,2L] block-diffusion prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
-    Returns loss/n_micro_batches (and a metrics dict if return_metrics)."""
+    Returns loss/n_micro_batches (and a metrics dict if return_metrics).
+    `align_to_2nd_pass` (config): if True, the drafter learns to REPLACE the heavy's 2nd (verification) pass --
+    target = 2nd-pass logits over the FULL answer region (committed re-predicted + remaining), so it can draft
+    fixes to wrong 1st-pass commits; committed positions get the peak (first-masked-index) weight, no decay.
+    If False (default), the drafter matches the heavy's 1st pass on the remaining region only."""
     core = model.module if hasattr(model, "module") else model         # unwrap FSDP1 if present
     bs = args.train.block_size
+    two_pass = bool(getattr(args.train, "align_to_2nd_pass", False))
 
-    logits, conf, remaining, clean_ids, heavy_logits = dbet_forward(
-        core, micro_batch, args, mask_id, return_heavy_logits=True)
+    logits, conf, remaining, clean_ids, heavy_logits, post_commit = dbet_forward(
+        core, micro_batch, args, mask_id, return_heavy_logits=True, return_post_commit=True)
     rem = remaining.bool()
+    w = decay_weights(remaining, bs, **decay_kwargs(args))              # decayed weights over the remaining region
 
-    # per-position decay weights, gathered to the remaining (drafter-predicted) positions
-    w = decay_weights(remaining, bs, **decay_kwargs(args))
-    wl = w[rem]                                                        # [n]
+    committed = None
+    if two_pass:
+        # FULL region = committed | remaining; target = 2nd heavy (verifier) pass; committed = peak weight, no decay.
+        masked = (micro_batch["noisy_input_ids"] == mask_id)
+        committed = masked & (~rem)                                    # 1st-pass committed positions
+        tau = float(getattr(args.train, "heavy_soft_tau", 1.0))
+        topk = int(getattr(args.train, "heavy_soft_top_k", 1))
+        target_logits = _heavy_verify_pass(core, micro_batch, heavy_logits, committed, mask_id, tau, topk)
+        region = masked
+        w = w.clone()
+        w[committed] = 1.0                                             # committed -> first-masked-index weight (no decay)
+    else:
+        target_logits = heavy_logits                                  # match the heavy 1st pass, remaining only
+        region = rem
+
+    wl = w[region]                                                    # [n]
     denom = wl.sum().clamp_min(1.0)
 
-    # --- Prong 1: alignment target = match the HEAVY. DSpark: acceptance depends on distribution OVERLAP
-    #     (1 - 0.5*L1(draft,heavy)), so L1/TV is the direct objective; CE-to-heavy-argmax stabilizes; a small
-    #     golden CE keeps a nudge toward truth. All in fp32 (bf16 logsumexp can NaN). heavy_logits is detached.
+    # --- Alignment: match the (frozen, detached) heavy target. DSpark: acceptance depends on distribution OVERLAP
+    #     (1 - 0.5*L1), so L1/TV is the direct objective; CE-to-target-argmax stabilizes; small golden nudge.
     ce_a  = float(getattr(args.train, "align_ce_weight", 0.1))
     l1_a  = float(getattr(args.train, "align_l1_weight", 1.0))
     gld_a = float(getattr(args.train, "golden_ce_weight", 0.1))
-    dlog = logits[rem].float()                                        # [n,V] draft logits on remaining
-    hlog = heavy_logits[rem].float()                                  # [n,V] frozen-heavy logits on remaining
-    harg = hlog.argmax(-1)                                            # [n]
-    ce_heavy  = F.cross_entropy(dlog, harg,           reduction="none")   # [n] match heavy top token
-    ce_golden = F.cross_entropy(dlog, clean_ids[rem], reduction="none")  # [n] small nudge to golden
-    l1 = (torch.softmax(dlog, -1) - torch.softmax(hlog, -1)).abs().sum(-1)   # [n] L1; TV = 0.5*L1
+    dlog = logits[region].float()                                     # [n,V] draft logits on the region
+    tlog = target_logits[region].float()                             # [n,V] heavy target logits (1st or 2nd pass)
+    targ = tlog.argmax(-1)                                            # [n]
+    ce_heavy  = F.cross_entropy(dlog, targ,              reduction="none")   # [n] match heavy top token
+    ce_golden = F.cross_entropy(dlog, clean_ids[region], reduction="none")  # [n] small nudge to golden
+    l1 = (torch.softmax(dlog, -1) - torch.softmax(tlog, -1)).abs().sum(-1)   # [n] L1; TV = 0.5*L1
     tok_loss = ((ce_a * ce_heavy + l1_a * l1 + gld_a * ce_golden) * wl).sum() / denom
     loss = tok_loss
 
-    # --- Prong 2: confidence head regresses the per-position ACCEPTANCE RATE a = 1 - 0.5*L1(draft,heavy) (DSpark),
-    #     a calibrated P(accept) -- replaces the old binary (argmax==golden) label. Target detached.
+    # --- Confidence head regresses the per-position ACCEPTANCE RATE a = 1 - 0.5*L1(draft, heavy target) (DSpark).
     accept_rate = (1.0 - 0.5 * l1).clamp(0.0, 1.0).detach()          # [n]
     conf_loss = None
     if conf is not None:
-        c = conf[rem].float().clamp(1e-5, 1 - 1e-5)                  # [n] drafter conf is a probability
+        c = conf[region].float().clamp(1e-5, 1 - 1e-5)              # [n] drafter conf is a probability
         bce = -(accept_rate * c.log() + (1 - accept_rate) * (1 - c).log())
         conf_loss = (bce * wl).sum() / denom
         loss = loss + args.train.conf_loss_weight * conf_loss
@@ -187,17 +239,26 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
 
     # --- metrics (sync points; the caller only requests these every log_steps) ---
     tpf = int(getattr(args.train, "eval_tpf", 6))
-    acc_gold = (logits.argmax(-1) == clean_ids) & rem                 # drafter vs GOLDEN [B,L]
+    acc_gold = (logits.argmax(-1) == clean_ids) & region              # drafter vs GOLDEN over the region
     metrics = {
         "tok": float(tok_loss.detach()),
         "ce_heavy": float((ce_heavy * wl).sum() / denom),
         "l1": float((l1 * wl).sum() / denom),
-        "acc": float((acc_gold.float() * w).sum() / denom),           # drafter vs golden (decayed)
-        "acc_heavy": float(((dlog.argmax(-1) == harg).float() * wl).sum() / denom),   # drafter vs HEAVY (align target)
-        "accept_rate": float((accept_rate * wl).sum() / denom),       # mean predicted acceptance on remaining
+        "acc": float((acc_gold.float() * w).sum() / denom),           # drafter vs golden
+        "acc_heavy": float(((dlog.argmax(-1) == targ).float() * wl).sum() / denom),   # drafter vs heavy target
+        "accept_rate": float((accept_rate * wl).sum() / denom),       # mean predicted acceptance
         "acc6": first_t_position_acc(acc_gold, rem, bs, tpf),
         "n_remaining": int(rem.sum()),
     }
+    if two_pass and committed is not None and bool(committed.any()):
+        h2c = target_logits[committed].argmax(-1)                     # 2nd-pass call on committed positions
+        commit_tok = post_commit[committed]                          # what the 1st pass committed
+        draftc = logits[committed].argmax(-1)
+        disagree = (h2c != commit_tok)                               # 2nd pass "finds a 1st-pass mistake"
+        nd = int(disagree.sum())
+        metrics["n_committed"] = int(committed.sum())
+        metrics["commit_wrong_rate"] = float(disagree.float().mean())            # frac of commits the verifier changes
+        metrics["fix_acc"] = float((draftc[disagree] == h2c[disagree]).float().mean()) if nd > 0 else float("nan")
     if conf_loss is not None:
         metrics["conf"] = float(conf_loss.detach())
     return loss, metrics                                              # loss already /n_micro_batches above
