@@ -82,14 +82,14 @@ def decay_kwargs(args):
     )
 
 
-def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=False):
+def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=False, return_heavy_logits=False):
     """Shared FROZEN-heavy -> commit -> drafter forward (no loss). Used by BOTH `dbet_train_step` (with grad on
     the drafter) and the eval pass (wrapped in no_grad) so the two can never drift apart.
     `core` is the UNWRAPPED model; micro_batch carries the dual stream (input_ids=[noisy|clean] [B,2L],
     attention_mask=[B,1,2L,2L] block prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
     Returns: logits [B,L,V], conf [B,L] (or None), remaining [B,L] bool, clean_ids [B,L] (golden).
-    If return_post_commit: also returns post_commit [B,L] (heavy pass-1 committed ids) as a 5th element
-    (the eval uses it to run a heavy SECOND pass)."""
+    Optional trailing elements (fixed order): heavy_logits [B,L,V] (frozen heavy's noisy dist, for the
+    DSpark-style align/accept targets) if return_heavy_logits; then post_commit [B,L] if return_post_commit."""
     cfg = core.config
     bs, thr = args.train.block_size, args.train.heavy_commit_threshold
 
@@ -117,9 +117,12 @@ def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=Fa
         h_sel_denoise=noisy_h_sel, h_last_denoise=noisy_h_last, h_sel_prefix=clean_h_sel,
         attention_mask=derive_drafter_mask(attn, L), position_ids=pos, denoise_mask=None, tau=None,
     )
+    ret = [out["logits"], out["conf"], remaining, clean_ids]
+    if return_heavy_logits:
+        ret.append(noisy_logits)                                       # frozen heavy dist (detached; no_grad above)
     if return_post_commit:
-        return out["logits"], out["conf"], remaining, clean_ids, post_commit
-    return out["logits"], out["conf"], remaining, clean_ids
+        ret.append(post_commit)
+    return tuple(ret)
 
 
 def first_t_position_acc(correct, remaining, block_size, tpf):
@@ -145,23 +148,38 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
     core = model.module if hasattr(model, "module") else model         # unwrap FSDP1 if present
     bs = args.train.block_size
 
-    logits, conf, remaining, clean_ids = dbet_forward(core, micro_batch, args, mask_id)
+    logits, conf, remaining, clean_ids, heavy_logits = dbet_forward(
+        core, micro_batch, args, mask_id, return_heavy_logits=True)
+    rem = remaining.bool()
 
-    # decayed CE + confidence BCE on the remaining-masked positions vs golden
+    # per-position decay weights, gathered to the remaining (drafter-predicted) positions
     w = decay_weights(remaining, bs, **decay_kwargs(args))
-    denom = w.sum().clamp_min(1.0)
-    # CE in fp32: bf16 logsumexp can overflow for large drafter logits (NaN). logits.float() is the stable path.
-    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), clean_ids.reshape(-1),
-                         reduction="none").view_as(clean_ids)
-    tok_loss = (ce * w).sum() / denom
+    wl = w[rem]                                                        # [n]
+    denom = wl.sum().clamp_min(1.0)
+
+    # --- Prong 1: alignment target = match the HEAVY. DSpark: acceptance depends on distribution OVERLAP
+    #     (1 - 0.5*L1(draft,heavy)), so L1/TV is the direct objective; CE-to-heavy-argmax stabilizes; a small
+    #     golden CE keeps a nudge toward truth. All in fp32 (bf16 logsumexp can NaN). heavy_logits is detached.
+    ce_a  = float(getattr(args.train, "align_ce_weight", 0.1))
+    l1_a  = float(getattr(args.train, "align_l1_weight", 1.0))
+    gld_a = float(getattr(args.train, "golden_ce_weight", 0.1))
+    dlog = logits[rem].float()                                        # [n,V] draft logits on remaining
+    hlog = heavy_logits[rem].float()                                  # [n,V] frozen-heavy logits on remaining
+    harg = hlog.argmax(-1)                                            # [n]
+    ce_heavy  = F.cross_entropy(dlog, harg,           reduction="none")   # [n] match heavy top token
+    ce_golden = F.cross_entropy(dlog, clean_ids[rem], reduction="none")  # [n] small nudge to golden
+    l1 = (torch.softmax(dlog, -1) - torch.softmax(hlog, -1)).abs().sum(-1)   # [n] L1; TV = 0.5*L1
+    tok_loss = ((ce_a * ce_heavy + l1_a * l1 + gld_a * ce_golden) * wl).sum() / denom
     loss = tok_loss
-    accept = None
+
+    # --- Prong 2: confidence head regresses the per-position ACCEPTANCE RATE a = 1 - 0.5*L1(draft,heavy) (DSpark),
+    #     a calibrated P(accept) -- replaces the old binary (argmax==golden) label. Target detached.
+    accept_rate = (1.0 - 0.5 * l1).clamp(0.0, 1.0).detach()          # [n]
+    conf_loss = None
     if conf is not None:
-        accept = (logits.argmax(-1) == clean_ids)                     # label 1 iff drafter argmax == golden
-        accept_f = accept.float()
-        c = conf.float().clamp(1e-5, 1 - 1e-5)                         # fp32 for a stable log
-        bce = -(accept_f * c.log() + (1 - accept_f) * (1 - c).log())
-        conf_loss = (bce * w).sum() / denom
+        c = conf[rem].float().clamp(1e-5, 1 - 1e-5)                  # [n] drafter conf is a probability
+        bce = -(accept_rate * c.log() + (1 - accept_rate) * (1 - c).log())
+        conf_loss = (bce * wl).sum() / denom
         loss = loss + args.train.conf_loss_weight * conf_loss
     loss = loss / n_micro_batches
     if not return_metrics:
@@ -169,16 +187,17 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
 
     # --- metrics (sync points; the caller only requests these every log_steps) ---
     tpf = int(getattr(args.train, "eval_tpf", 6))
-    if accept is None:
-        accept = (logits.argmax(-1) == clean_ids)
-        accept_f = accept.float()
-    correct = accept & remaining.bool()
+    acc_gold = (logits.argmax(-1) == clean_ids) & rem                 # drafter vs GOLDEN [B,L]
     metrics = {
-        "tok": float(tok_loss.detach()),                              # token CE (the train loop logs total loss)
-        "acc": float((accept_f * w).sum() / denom),                   # decayed drafter accuracy on remaining
-        "acc6": first_t_position_acc(correct, remaining.bool(), bs, tpf),
-        "n_remaining": int(remaining.sum()),
+        "tok": float(tok_loss.detach()),
+        "ce_heavy": float((ce_heavy * wl).sum() / denom),
+        "l1": float((l1 * wl).sum() / denom),
+        "acc": float((acc_gold.float() * w).sum() / denom),           # drafter vs golden (decayed)
+        "acc_heavy": float(((dlog.argmax(-1) == harg).float() * wl).sum() / denom),   # drafter vs HEAVY (align target)
+        "accept_rate": float((accept_rate * wl).sum() / denom),       # mean predicted acceptance on remaining
+        "acc6": first_t_position_acc(acc_gold, rem, bs, tpf),
+        "n_remaining": int(rem.sum()),
     }
-    if conf is not None:
+    if conf_loss is not None:
         metrics["conf"] = float(conf_loss.detach())
     return loss, metrics                                              # loss already /n_micro_batches above

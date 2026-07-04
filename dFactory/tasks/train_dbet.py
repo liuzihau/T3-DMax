@@ -145,8 +145,13 @@ class LLaDA2TrainingArguments(TrainingArguments):
     )
     conf_loss_weight: float = field(
         default=1.0,
-        metadata={"help": "DBet: weight of the confidence-head BCE relative to the token CE."}
+        metadata={"help": "DBet: weight of the confidence-head BCE (now regresses the accept rate 1-0.5*L1)."}
     )
+    # --- DSpark-style alignment target (drafter matches the HEAVY, not golden) ---
+    align_ce_weight: float = field(default=0.1, metadata={"help": "weight of CE(draft, heavy-argmax) -- hard align."})
+    align_l1_weight: float = field(default=1.0, metadata={"help": "weight of L1/TV(draft, heavy) -- soft align (=1-accept)."})
+    golden_ce_weight: float = field(default=0.1, metadata={"help": "small CE(draft, golden) nudge; 0 = pure DSpark "
+                                                                  "(match heavy only). Higher re-buys divergence risk."})
     loss_decay_mode: str = field(
         default="dbet",
         metadata={"help": "DBet loss-weight schedule over remaining positions: 'dbet' (max(base^k,floor); "

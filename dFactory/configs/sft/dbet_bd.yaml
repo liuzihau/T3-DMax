@@ -59,7 +59,11 @@ train:
   block_diffusion_mode: true       # REQUIRED: builds the dual-stream [noisy|clean] + block mask
   block_size: 32
   heavy_commit_threshold: 0.9      # frozen heavy one-pass decode_uniform commit (high -> drafter does more)
-  conf_loss_weight: 1.0            # confidence-head BCE weight vs token CE
+  conf_loss_weight: 1.0            # confidence-head BCE weight (now regresses accept rate = 1 - 0.5*L1(draft,heavy))
+  # --- DSpark-style alignment: drafter matches the HEAVY (CE to heavy-argmax + L1/TV) + small golden nudge ---
+  align_ce_weight: 0.1
+  align_l1_weight: 1.0
+  golden_ce_weight: 0.1           # small golden portion (set 0 for pure heavy-matching / no divergence)
   same_token_labels: true          # (unused by DBet loss; kept for arg compatibility)
   use_wandb: false
   log_steps: 1
