@@ -44,14 +44,17 @@ train:
   expert_parallel_size: 1
   global_batch_size: 1
   micro_batch_size: 1
-  num_train_epochs: 2
+  num_train_epochs: 1               # MUST be 1 with max_steps (scheduler total = train_steps * epochs; loop = epochs
+                                    #   * train_steps). 1 epoch -> cosine + loop both run over exactly max_steps.
+  max_steps: 40000                  # cap train_steps (arg property) -> drives loop AND cosine total (set 20000 for a
+                                    #   shorter run). Without this, warmup spreads over the 1.4M-step epoch -> lr ~0.
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
   optimizer: adamw
   beta1: 0.9
   beta2: 0.999
-  lr: 1.0e-4                         # fp32 training is stable at higher lr (bf16 NaN'd at 1e-4 ~87k steps; fp32 won't).
+  lr: 1.0e-4                         # SAME as the previous drafter runs. fp32 stable at higher lr (bf16 NaN'd at 1e-4);
                                     #   DFlash trains its draft model at 6e-4 (cosine, warmup 0.04) -- can push toward
                                     #   that in fp32. If running bf16 (enable_mixed_precision:false) drop to ~5e-5.
   lr_warmup_ratio: 0.03
@@ -73,6 +76,7 @@ train:
   empty_cache_steps: 500
   ckpt_manager: dcp
   load_checkpoint_path: ""
+  save_steps: 10000                 # drafter hf_ckpt is small -> cheap; gives 10k/20k/30k/40k to test generation
   save_epochs: 1
   save_hf_weights: true
   # --- DBet block-diffusion + drafter knobs ---
@@ -100,7 +104,7 @@ train:
   # --- metrics + held-out validation (figures via scripts/plot_dbet_metrics.py) ---
   use_wandb: false                  # set true to also stream to Weights & Biases (wandb_project/wandb_name)
   log_steps: 20                     # write a train-metrics JSONL record (loss/tok/conf/acc) every N steps
-  eval_steps: 200                   # held-out sigma-sweep eval every N steps (0 disables); ~1 min each at holdout 128
+  eval_steps: 500                   # held-out sigma-sweep eval every N steps (0 disables); ~1 min each at holdout 128
   eval_holdout_size: 128            # tail examples of the train file held out for validation
   eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
   eval_at_start: true               # step-0 baseline (untrained drafter) point for the figures
