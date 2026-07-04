@@ -1,0 +1,79 @@
+# ABLATION 2 (B ONLY -- pure mask-denoise, no rollout at all) -- isolate whether ANY heavy fine-tune breaks it.
+# Identical to dmax_dbet_oput_2gpu.yaml EXCEPT loss_a_weight=0, loss_c_weight=0, and a distinct output_dir. This
+# trains ONLY the LLaDA masked-token objective on the top-12 layers (the safest possible heavy FT). If generation
+# SURVIVES -> the rollout routes (A/C) are the issue. If it STILL breaks -> the cause is the top-12 partial FT /
+# left-to-right reveal / lr itself (i.e., even DMax's mask route destabilizes a top-12 fine-tune).
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dmax_dbet_oput.py configs/sft/dmax_dbet_oput_ablB.yaml
+model:
+  config_path: ./dbet_init
+  model_path: ./dbet_init
+  tokenizer_path: ../DMax-Math-16B-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.75
+  noise_range_high: 1
+  num_workers: 16
+
+train:
+  output_dir: ./dmax_ft_b             # <-- distinct dir (ablation 2: B only)
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 2
+  micro_batch_size: 1
+  num_train_epochs: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  max_steps: 40000
+  lr: 2.0e-6
+  lr_warmup_ratio: 0.01
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  broadcast_model_weights_from_rank0: true
+  empty_cache_steps: 200
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_steps: 20000
+  save_epochs: 1
+  save_hf_weights: true
+  trainable_from_layer: 8
+  heavy_commit_threshold_low: 0.75
+  heavy_commit_threshold_high: 0.9
+  draft_top_k_choices: "1,2,3"
+  heavy_soft_top_k: 1
+  heavy_soft_tau: 1.0
+  draft_soft_tau: 1.0
+  loss_b_weight: 1.0                  # Route B ON
+  loss_a_weight: 0.0                  # Route A OFF
+  loss_c_weight: 0.0                  # Route C OFF  <-- B-only ablation
+  block_diffusion_mode: true
+  block_size: 32
+  eval_steps: 500
+  eval_at_start: true
+  eval_holdout_size: 128
+  eval_heavy_thr: 0.8
+  eval_draft_k: 2
+  eval_n_heavy_passes: 3
+  use_wandb: false
+  log_steps: 10
