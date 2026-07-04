@@ -78,16 +78,24 @@ train:
   # --- DBet block-diffusion + drafter knobs ---
   block_diffusion_mode: true
   block_size: 32
-  heavy_commit_threshold: 0.9
-  conf_loss_weight: 1.0
-  # --- loss-weight schedule over remaining positions (pick one via loss_decay_mode) ---
-  loss_decay_mode: dbet            # 'dbet' (max(base^k,floor)) | 'dbet_twophase' | 'dflash' (exp(-k/gamma))
+  heavy_commit_threshold: 0.5      # LOW commit -> more (some wrong) commits for the draft to catch/fix
+  conf_loss_weight: 1.0            # conf-head BCE (regresses accept rate = 1 - 0.5*L1(draft, heavy target))
+  # --- DSpark-style alignment: drafter matches the HEAVY (CE to heavy-argmax + L1/TV) + small golden nudge ---
+  align_ce_weight: 0.1
+  align_l1_weight: 1.0
+  golden_ce_weight: 0.1
+  # --- 2nd-pass verification mode: draft REPLACES the heavy's 2nd pass; full-region loss; committed = peak weight ---
+  align_to_2nd_pass: true         # +1 frozen heavy (verifier) forward/step; drafts fixes to wrong 1st-pass commits
+  heavy_soft_tau: 1.0             # soft-embed temperature for re-feeding committed positions to the 2nd pass
+  heavy_soft_top_k: 1
+  # --- loss-weight schedule over the REMAINING region (committed uses the peak/first-index weight, no decay) ---
+  loss_decay_mode: dflash          # 'dbet' (max(base^k,floor)) | 'dbet_twophase' | 'dflash' (exp(-k/gamma))
   loss_decay_base: 0.9             # 'dbet'
   loss_decay_floor: 0.1            #   (set 0.025 for the twophase method)
   loss_decay_head: 0.95            # 'dbet_twophase' gentle decay for first `window` tokens
   loss_decay_tail: 0.8             # 'dbet_twophase' steep decay after `window`
   loss_decay_window: 6             # 'dbet_twophase' first-T boundary
-  loss_decay_gamma: 14.0           # 'dflash' exp(-k/gamma); ~block_size/2 (paper 7@bs16)
+  loss_decay_gamma: 16.0           # 'dflash' exp(-k/gamma); ~block_size/2 (bs 32 -> 16)
   same_token_labels: true
   # --- metrics + held-out validation (figures via scripts/plot_dbet_metrics.py) ---
   use_wandb: false                  # set true to also stream to Weights & Biases (wandb_project/wandb_name)

@@ -156,6 +156,9 @@ class LLaDA2TrainingArguments(TrainingArguments):
         "(verification) pass -- target = 2nd-pass logits over the FULL region (committed re-predicted + remaining), "
         "so it drafts fixes to wrong 1st-pass commits; committed = peak weight. +1 frozen heavy forward/step. "
         "Pair with a low heavy_commit_threshold (e.g. 0.5). False = match the 1st pass on remaining only."})
+    heavy_soft_tau: float = field(default=1.0, metadata={"help": "soft-embed temperature for re-feeding committed "
+                                                                 "positions to the 2nd (verifier) pass."})
+    heavy_soft_top_k: int = field(default=1, metadata={"help": "soft-embed top-k for the 2nd-pass committed re-feed."})
     loss_decay_mode: str = field(
         default="dbet",
         metadata={"help": "DBet loss-weight schedule over remaining positions: 'dbet' (max(base^k,floor); "
