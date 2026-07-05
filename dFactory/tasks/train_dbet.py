@@ -617,7 +617,9 @@ def main():
                     for k, v in micro_batch.items()
                 }
 
-                micro_batch.pop("labels", None)   # DBet uses the clean stream as golden (not the labels tensor)
+                # KEEP labels: golden target still = the clean stream, but labels carry the pad-tail truncation
+                # (answer + ~32 trailing EOS; rest = -100) which dbet_train_step uses to gate the loss/metrics so
+                # they aren't dominated by the ~1000 trivial trailing-pad positions.
 
                 # ===== DBet core training step =====
                 # FROZEN heavy dual-stream forward -> decode_uniform commit -> drafter forward over

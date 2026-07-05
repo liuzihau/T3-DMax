@@ -190,20 +190,27 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
 
     logits, conf, remaining, clean_ids, heavy_logits, post_commit = dbet_forward(
         core, micro_batch, args, mask_id, return_heavy_logits=True, return_post_commit=True)
-    rem = remaining.bool()
-    w = decay_weights(remaining, bs, **decay_kwargs(args))              # decayed weights over the remaining region
+    rem_orig = remaining.bool()
+    masked_full = (micro_batch["noisy_input_ids"] == mask_id)
+    committed_ctx = masked_full & (~rem_orig)                          # ALL heavy commits (context for the verify pass)
+    # --- pad-tail gate: supervise only the answer + ~32 trailing EOS (the data's `labels` truncation), else the
+    #     loss/acc drown in the ~1000 trivial trailing-pad positions (EOS == pad here). sup subset of masked;
+    #     falls back to all-masked if labels absent.
+    labels = micro_batch.get("labels")
+    sup = (labels != -100) if labels is not None else masked_full
+    rem = rem_orig & sup
+    w = decay_weights(remaining, bs, **decay_kwargs(args)) * sup.float()   # decay (block-position correct), zeroed off-sup
 
     committed = None
     if two_pass:
-        # FULL region = committed | remaining; target = 2nd heavy (verifier) pass; committed = peak weight, no decay.
-        masked = (micro_batch["noisy_input_ids"] == mask_id)
-        committed = masked & (~rem)                                    # 1st-pass committed positions
+        # FULL supervised region = committed | remaining; target = 2nd heavy (verifier) pass; committed = peak weight.
         tau = float(getattr(args.train, "heavy_soft_tau", 1.0))
         topk = int(getattr(args.train, "heavy_soft_top_k", 1))
-        target_logits = _heavy_verify_pass(core, micro_batch, heavy_logits, committed, mask_id, tau, topk)
-        region = masked
+        target_logits = _heavy_verify_pass(core, micro_batch, heavy_logits, committed_ctx, mask_id, tau, topk)
+        committed = committed_ctx & sup                               # supervised commits (for loss + fix metrics)
+        region = sup                                                  # supervised masked region (= committed | rem)
         w = w.clone()
-        w[committed] = 1.0                                             # committed -> first-masked-index weight (no decay)
+        w[committed] = 1.0                                            # committed -> first-masked-index weight (no decay)
     else:
         target_logits = heavy_logits                                  # match the heavy 1st pass, remaining only
         region = rem
@@ -239,7 +246,10 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
 
     # --- metrics (sync points; the caller only requests these every log_steps) ---
     tpf = int(getattr(args.train, "eval_tpf", 6))
-    acc_gold = (logits.argmax(-1) == clean_ids) & region              # drafter vs GOLDEN over the region
+    darg = logits.argmax(-1)
+    acc_gold = (darg == clean_ids) & region                           # drafter vs GOLDEN over the (supervised) region
+    pad_id = int(getattr(core.config, "pad_token_id", 156892))         # EOS == pad here
+    eos_m = (clean_ids == pad_id) & region                            # the KEPT trailing-EOS positions (termination)
     metrics = {
         "tok": float(tok_loss.detach()),
         "ce_heavy": float((ce_heavy * wl).sum() / denom),
@@ -248,6 +258,7 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
         "acc_heavy": float(((dlog.argmax(-1) == targ).float() * wl).sum() / denom),   # drafter vs heavy target
         "accept_rate": float((accept_rate * wl).sum() / denom),       # mean predicted acceptance
         "acc6": first_t_position_acc(acc_gold, rem, bs, tpf),
+        "eos_acc": float(((darg == clean_ids) & eos_m).float().sum() / eos_m.float().sum().clamp_min(1)),  # termination
         "n_remaining": int(rem.sum()),
     }
     if two_pass and committed is not None and bool(committed.any()):

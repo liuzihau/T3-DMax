@@ -183,9 +183,17 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
 
     was_training = core.training
     core.eval()
+    pad_id = int(getattr(core.config, "pad_token_id", 156892))         # EOS == pad; used for the pad-tail gate
+    eos_num = eos_den = 0.0
     for clean_ids, prompt_len in holdout:
         clean_ids = clean_ids[:L]
         maskable = torch.arange(L) >= prompt_len
+        # pad-tail cutoff (mirror data_transform_dbet): supervise the answer + ~32 trailing EOS only, drop the far
+        # trailing pad run (else tok/acc are dominated by trivial pad copy).
+        _np = (clean_ids != pad_id)
+        _rs = (int(torch.nonzero(_np, as_tuple=False)[-1]) + 1) if bool(_np.any()) else 0
+        _cut = max(_rs + 32, int(prompt_len))
+        sup_pos = (torch.arange(L) < _cut).to(device)                  # [L] positions before the cutoff
         for sigma in sigmas:
             noisy = block_left_to_right_reveal(clean_ids.clone(), (sigma, sigma), maskable, mask_id, bs)
             mb = _build_dual_stream(noisy.unsqueeze(0), clean_ids.unsqueeze(0), mask_proto, device)
@@ -194,7 +202,7 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
                 logits, conf, remaining, golden, post_commit = out
             else:
                 logits, conf, remaining, golden = out
-            rem = remaining[0]
+            rem = remaining[0] & sup_pos                               # pad-tail gate: drop the far trailing pad
             if int(rem.sum()) == 0:
                 continue
             g = golden[0]
@@ -212,9 +220,11 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
                                 position_ids=mb2["position_ids"], use_cache=False, return_dict=True)
                 h2_correct = (h2.logits[0, :L].argmax(-1) == g) & rem
 
-            # decayed CE + BCE (train-equivalent aggregate, for the loss curve)
-            w = decay_weights(remaining, bs, **decay_kwargs(args))[0]
+            # decayed CE + BCE (train-equivalent aggregate, for the loss curve). Gate w by the pad-tail cutoff too.
+            w = decay_weights(remaining, bs, **decay_kwargs(args))[0] * sup_pos.float()
             denom = float(w.sum().clamp_min(1.0))
+            _eos = (g == pad_id) & rem                                 # kept trailing-EOS positions (termination)
+            eos_num += float((in1 & _eos).sum()); eos_den += float(_eos.sum())
             ce = F.cross_entropy(logits[0], g, reduction="none")
             tok_num += float((ce * w).sum()); tok_den += denom
 
@@ -261,6 +271,7 @@ def evaluate_dbet(core, holdout, args, mask_proto, device, mask_id: int = MASK_I
         "acc6": _avg_pos(pos_top1),                  # first-tpf window, avg across positions
         "top2_6": _avg_pos(pos_top2), "top3_6": _avg_pos(pos_top3),
         "tok": tok_num / (tok_den or 1.0),
+        "eos_acc": eos_num / (eos_den or 1.0),       # drafter top-1 on the kept trailing-EOS (termination)
         "n": int(pool["n"]),
     }
     if heavy_second:
