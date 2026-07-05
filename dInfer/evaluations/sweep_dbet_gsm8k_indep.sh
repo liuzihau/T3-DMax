@@ -75,10 +75,13 @@ run_cfg () {                                     # $1=mode $2=heavy_thr $3=draft
   drow=$(grep "$tag" "$alog" | tail -1)
   degen=$(echo "$drow" | grep -oE "[0-9]+%" | sed -n '2p')       # 2nd % = degen% (1st = cap%)
   mean=$(echo "$drow"  | awk '{print $3}')
-  heavy=$(grep -oE "mean heavy/ex=[0-9.]+" "$glog" | tail -1 | grep -oE "[0-9.]+")
-  draft=$(grep -oE "draft/ex=[0-9.]+"     "$glog" | tail -1 | grep -oE "[0-9.]+")
-  wall=$(grep -oE "wall/ex=[0-9.]+s"      "$glog" | tail -1 | grep -oE "[0-9.]+")
-  tps=$(grep -oE "throughput=[0-9.]+ tok/s" "$glog" | tail -1 | grep -oE "[0-9.]+")
+  # throughput/forwards straight from the PREDS jsonl (robust even when generation was skipped on resume)
+  read heavy draft wall tps <<< "$(python3 -c "
+import json
+rows=[json.loads(l) for l in open('$preds')]
+n=max(len(rows),1); tt=sum(r.get('wall_time',0.0) for r in rows) or 1e-9
+print(f\"{sum(r.get('heavy_forwards',0) for r in rows)/n:.1f} {sum(r.get('draft_forwards',0) for r in rows)/n:.1f} {tt/n:.2f} {sum(r.get('gen_tokens',0) for r in rows)/tt:.1f}\")
+" 2>/dev/null)"
   echo ">>> [RESULT] $tag  acc=${acc:-NA}  degen=${degen:-NA}  |  heavy/ex=${heavy:-NA} draft/ex=${draft:-NA}  wall/ex=${wall:-NA}s  tok/s=${tps:-NA}"
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
     "$tag" "${acc:-NA}" "${degen:-NA}" "${mean:-NA}" "${heavy:-NA}" "${draft:-NA}" "${wall:-NA}" "${tps:-NA}" >> "$SUMMARY"
