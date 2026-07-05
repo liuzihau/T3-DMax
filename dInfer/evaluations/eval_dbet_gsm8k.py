@@ -65,6 +65,9 @@ def main():
     p.add_argument("--heavy_top_k", type=int, default=1, help="soft-embed top-k for heavy commits.")
     p.add_argument("--draft_tau", type=float, default=1.0, help="soft-embed temperature for drafter commits.")
     p.add_argument("--draft_top_k", type=int, default=1, help="soft-embed top-k for drafter commits.")
+    p.add_argument("--draft_committed_soft", action="store_true",
+                   help="show heavy-committed slots to the draft as MASK+soft-embed (re-predictable) not hard tokens.")
+    p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
     p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--gt_jsonl_path", default=None)
@@ -96,7 +99,8 @@ def main():
                 max_iter_per_block=args.max_iters_per_block, max_draft_iters=args.max_draft_iters,
                 early_stop=not args.no_early_stop, use_draft=not args.heavy_only,
                 heavy_tau=args.heavy_tau, heavy_top_k=args.heavy_top_k,
-                draft_tau=args.draft_tau, draft_top_k=args.draft_top_k)
+                draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
+                draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits
@@ -106,6 +110,7 @@ def main():
                 "answer": text, "question": row["question"],
                 "heavy_forwards": stats.heavy_forwards, "draft_forwards": stats.draft_forwards,
                 "heavy_commits": stats.heavy_commits, "draft_commits": stats.draft_commits,
+                "draft_fixes": stats.draft_fixes,
                 "wall_time": round(stats.wall_time, 4), "heavy_time": round(stats.heavy_time, 4),
                 "draft_time": round(stats.draft_time, 4), "gen_tokens": int(response_ids.shape[0]),
             }, ensure_ascii=False) + "\n")

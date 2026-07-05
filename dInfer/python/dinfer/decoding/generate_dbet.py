@@ -143,6 +143,7 @@ class DbetGenerateStats:
     heavy_forwards: int = 0
     draft_forwards: int = 0
     draft_commits: int = 0      # tokens committed by the drafter (the speculative wins)
+    draft_fixes: int = 0        # committed tokens the drafter OVERRODE (2nd-pass fix)
     heavy_commits: int = 0      # tokens committed by the heavy
     heavy_time: float = 0.0     # wall seconds in heavy forwards
     draft_time: float = 0.0     # wall seconds in drafter forwards
@@ -152,85 +153,99 @@ class DbetGenerateStats:
 @torch.no_grad()
 def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
-                      heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1):
-    """Decode one block in place with DMax soft-embedding re-feed. Committed positions are fed back to the heavy
-    as a SOFT embed (softmax(logits/tau) -> top-k weighted + residual mask, renormalized). Provenance is
-    TRANSIENT: after every HEAVY pass, ALL committed decode positions are re-soft-embedded from the heavy's
-    fresh logits with (heavy_tau, heavy_top_k) [default 1.0/1 = DMax top-1] -- i.e. the heavy weakly VERIFIES /
-    re-encodes any prior drafter commits, so a position is 'drafter-committed' only in the window between a
-    draft pass and the NEXT heavy pass (there it uses (draft_tau, draft_top_k)). `x` holds the hard argmax ids
-    (prefix/canvas split + final output); `block_embeds` holds the soft feed. If use_draft: alternate
-    heavy-commit / drafter-extend; else HEAVY-ONLY (pure DMax decode_uniform). attn = block-causal over [0,be)."""
+                      heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
+                      draft_committed_soft=False, draft_fix=True):
+    """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
+    soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
+    The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
+    forward proposes over the WHOLE current block and (a) EXTENDS (commits confident still-masked slots) and
+    (b) FIXES (overrides a committed slot only if its conf-head >= draft_threshold AND it disagrees).
+    Block-based split (matches the heavy's block structure): the draft's PREFIX = earlier blocks [0,bs), its
+    CANVAS = the whole current block [bs,be) (committed re-predictable + masked). Committed slots are shown to
+    the draft as HARD tokens (default; consistent with training) or SOFT `MASK + heavy-soft-embed`
+    (`draft_committed_soft`). `use_draft=False` -> byte-for-byte DMax. attn = block-causal over [0,be)."""
     device = x.device
-    embed = model.draft.frozen_embed                                    # frozen heavy embedding
-    active = (x[0:1, bs:be] == MASK_ID)                                 # original decode region
-    prefix_embeds = embed(x[:, :bs])                                    # [1, bs, D] prompt + earlier blocks (hard)
-    block_embeds = embed(x[:, bs:be]).clone()                          # [1, blk, D] (mask positions -> embed(MASK))
+    embed = model.draft.frozen_embed
+    active = (x[0:1, bs:be] == MASK_ID)                                # original decode region (all-mask at block start)
+    prefix_embeds = embed(x[:, :bs])                                   # [1, bs, D] prompt + earlier blocks
+    block_embeds = embed(x[:, bs:be]).clone()                         # [1, blk, D] (mask -> embed(MASK))
     block_logits = None
+    # block-based prefix/canvas split for the draft: prefix=[0,bs), canvas=[bs,be) (contiguous -> gather valid)
+    prefix_idx = torch.zeros(1, be, dtype=torch.bool, device=device); prefix_idx[0, :bs] = True
+    canvas_idx = torch.zeros(1, be, dtype=torch.bool, device=device); canvas_idx[0, bs:be] = True
 
     it = 0
     while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
-        inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)  # [1, be, D] soft feed
-        # ---- heavy forward (on soft embeds) + decode_uniform commit ----
+        inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)   # [1, be, D] soft feed
+        # ================= HEAVY forward + DMax decode_uniform commit (unchanged from DMax) =================
         _t = _now(device)
         if use_draft:
             signals = model.extract_heavy_signals(x[:, :be], attention_mask=attn, inputs_embeds=inputs_embeds)
-            block_logits = signals["logits"][:, bs:be]                 # [1, blk, V]
+            block_logits = signals["logits"][:, bs:be]                # [1, blk, V]
         else:
             out = model.heavy_forward(inputs_embeds=inputs_embeds, attention_mask=attn, output_hidden_states=False)
-            block_logits = out.logits[:, bs:be]                        # heavy-only: logits only, no hidden
+            block_logits = out.logits[:, bs:be]
         stats.heavy_time += _now(device) - _t
         stats.heavy_forwards += 1
 
         mask_idx = (x[0:1, bs:be] == MASK_ID)
-        n_before = int(mask_idx.sum())
-        x0, high_conf_idx, _, _ = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
-        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]               # block-local indices the heavy newly commits
+        x0, high_conf_idx, _, breakflag = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
+        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]
         if hci.numel() > 0:
             x[0, bs + hci] = x0[0, hci]
             stats.heavy_commits += int(hci.numel())
-        # WEAK VERIFY: re-soft-embed ALL committed decode positions from the heavy's fresh logits -> any prior
-        # drafter commits become heavy-committed (the heavy re-encoded them). Matches DMax refreshing committed
-        # positions every forward. (Prompt-tail positions are outside `active`, so they stay hard.)
+        # re-soft-embed ALL committed from the heavy's fresh logits (heavy re-verifies / re-encodes)
         committed = active[0] & (x[0, bs:be] != MASK_ID)
         ci = committed.nonzero(as_tuple=True)[0]
         if ci.numel() > 0:
             block_embeds[0, ci] = _soft_embed(block_logits[0, ci], embed, MASK_ID, heavy_tau, heavy_top_k)
-        if not bool((x[0:1, bs:be] == MASK_ID).any()):
+
+        # ---- DMax EXIT rule (heavy is the arbiter): breakflag OR no mask left -> block DONE, no draft this step ----
+        if bool(breakflag) or not bool((x[0:1, bs:be] == MASK_ID).any()):
             break
-        if not use_draft:                                              # HEAVY-ONLY: loop (soft re-feed)
+        if not use_draft:                                             # HEAVY-ONLY = pure DMax
             it += 1
             continue
 
-        # ---- drafter extend (confidence-gated); drafter-committed positions get their OWN soft embed ----
-        for _di in range(max_draft_iters):
-            if not bool((x[0:1, bs:be] == MASK_ID).any()):
-                break
-            signals["input_ids"] = x[:, :be]
-            signals["prefix_idx"], signals["canvas_idx"] = model._split_prefix_denoise(x[:, :be])
-            _t = _now(device)
-            d = model.draft_forward(signals, attention_mask=None, tau=tau)
-            stats.draft_time += _now(device) - _t
-            stats.draft_forwards += 1
-            dlogits, dconf = d["logits"], d["conf"]                     # [1,C,V], [1,C] over canvas
-            if dconf is None:                                          # no conf head -> can't gate; back to heavy
-                break
-            tokens, commit = draft_commit_confident(dlogits, dconf, draft_threshold)
-            canvas_local = (x[0, bs:be] == MASK_ID).nonzero(as_tuple=True)[0]   # block-local masked indices (asc)
-            sel = canvas_local[commit]                                 # block-local positions to commit
-            if sel.numel() == 0:
-                break
-            x[0, bs + sel] = tokens[commit]
-            block_embeds[0, sel] = _soft_embed(dlogits[0][commit], embed, MASK_ID, draft_tau, draft_top_k)
-            stats.draft_commits += int(sel.numel())
+        # ================= DRAFT forward (helper, between heavy passes) =================
+        block_x = x[0, bs:be]                                         # state entering the draft step
+        mask_pos = (block_x == MASK_ID)                              # still-masked slots (EXTEND targets)
+        committed_before = active[0] & (~mask_pos)                   # committed slots (FIX candidates)
+        draft_ids = x[:, :be].clone()
+        if draft_committed_soft and bool(committed_before.any()):    # show committed as MASK -> E(MASK) (+ heavy soft-embed)
+            _cb = torch.zeros(be, dtype=torch.bool, device=device); _cb[bs:be] = committed_before
+            draft_ids[0, _cb] = MASK_ID                              # single advanced-index assign (in-place, safe)
+        signals["input_ids"] = draft_ids
+        signals["prefix_idx"], signals["canvas_idx"] = prefix_idx, canvas_idx
+        _t = _now(device)
+        d = model.draft_forward(signals, attention_mask=None, tau=tau)
+        stats.draft_time += _now(device) - _t
+        stats.draft_forwards += 1
+        dlogits, dconf = d["logits"], d["conf"]                       # [1, blk, V], [1, blk] over the WHOLE block
+        if dconf is None:                                            # no conf head -> can't gate; back to heavy
+            it += 1
+            continue
+        darg = dlogits[0].argmax(-1)                                 # [blk]
+        dc = dconf[0]                                                # [blk]
 
-        n_after = int((x[0:1, bs:be] == MASK_ID).sum())
-        if n_after == n_before:                                        # neither progressed -> force one token
-            mp = (x[0, bs:be] == MASK_ID).nonzero(as_tuple=True)[0]
-            if mp.numel() > 0:
-                p = int(mp[0])
-                x[0, bs + p] = int(block_logits[0, p].argmax())
-                block_embeds[0, p] = _soft_embed(block_logits[0, p:p + 1], embed, MASK_ID, heavy_tau, heavy_top_k)[0]
+        # ---- EXTEND: left-to-right prefix commit of masked slots while conf >= draft_threshold (always >=1 for progress)
+        mloc = mask_pos.nonzero(as_tuple=True)[0]                    # block-local masked indices (ascending)
+        if mloc.numel() > 0:
+            ok = dc[mloc] >= draft_threshold
+            keep = ~(torch.cumsum((~ok).long(), 0) > 0)             # prefix up to first below-threshold
+            keep[0] = True
+            sel = mloc[keep]
+            x[0, bs + sel] = darg[sel]
+            block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
+            stats.draft_commits += int(sel.numel())
+        # ---- FIX: override a committed slot only if conf-head >= draft_threshold AND the draft disagrees ----
+        if draft_fix and bool(committed_before.any()):
+            fix = committed_before & (dc >= draft_threshold) & (darg != block_x)
+            floc = fix.nonzero(as_tuple=True)[0]
+            if floc.numel() > 0:
+                x[0, bs + floc] = darg[floc]
+                block_embeds[0, floc] = _soft_embed(dlogits[0][floc], embed, MASK_ID, draft_tau, draft_top_k)
+                stats.draft_fixes += int(floc.numel())
         it += 1
 
     # safety: never leave a [MASK] in the output
@@ -256,7 +271,8 @@ def generate_heavy(model, prompt_ids, gen_length, block_length,
 def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_threshold=0.9, draft_threshold=0.7, max_iter_per_block=32,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
-                  heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1):
+                  heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
+                  draft_committed_soft=False, draft_fix=True):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -283,7 +299,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
         decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                           max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft,
                           heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
-                          draft_tau=draft_tau, draft_top_k=draft_top_k)
+                          draft_tau=draft_tau, draft_top_k=draft_top_k,
+                          draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
         if early_stop:
             resp_lo = max(P, bs)
             seg = x[0, resp_lo:be]
