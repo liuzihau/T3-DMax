@@ -8,9 +8,13 @@
 #   bash evaluations/sweep_dbet_gsm8k_indep.sh
 # Full GSM8K by default (LIMIT="" = all 1319). Override via env, e.g.:
 #   LIMIT=200 DRAFTER=/abs/hf_ckpt HEAVY=/abs/DMax OUT=./report_out bash evaluations/sweep_dbet_gsm8k_indep.sh
+# USE_CACHE=1 -> DBet configs use the incremental cross-block prefix-KV cache (--use_cache), tagged "_cache"
+#   so cache and no-cache preds coexist; heavy baselines are cache-agnostic (shared). Run the cache A/B
+#   (cache_ab_gsm8k.sh) FIRST and confirm iso-accuracy before launching a full USE_CACHE=1 sweep.
 
 set -u
 cd "$(dirname "$0")/.."                          # -> dInfer/
+USE_CACHE="${USE_CACHE:-0}"
 
 DRAFTER="${DRAFTER:-../dFactory/dbet_outputs/checkpoints/global_step_20000/hf_ckpt/}"
 HEAVY="${HEAVY:-../DMax-Math-16B-moe-merge}"
@@ -24,35 +28,44 @@ printf "config\taccuracy\tdegen%%\tmean_tok\theavy/ex\tdraft/ex\twall/ex\ttok/s\
 
 LIM_FLAG=""; [ -n "$LIMIT" ] && LIM_FLAG="--limit $LIMIT"
 echo "[sweep] drafter=$DRAFTER  heavy=$HEAVY"
-echo "[sweep] gen=$GEN limit=${LIMIT:-ALL} block=$BLOCK  -> $OUT"
+echo "[sweep] gen=$GEN limit=${LIMIT:-ALL} block=$BLOCK use_cache=$USE_CACHE  -> $OUT"
 
 # mode heavy_thr draft_thr draft_top_k extra_flags   (extra_flags may be empty)
 CONFIGS=(
   # ---------- h0.9 group ----------
   "dbet  0.9 0.9 2"
   "heavy 0.9 0   1"
-  "dbet  0.9 0.8 2"
-  "dbet  0.9 0.9 2 --no_draft_fix"
-  "dbet  0.9 0.9 1"
-  "dbet  0.9 0.8 1"
+  "dbet  0.9 0.9 3"
+  "dbet  0.9 0.8 3"
+  # "dbet  0.9 0.8 2"
+  # "dbet  0.9 0.9 2 --no_draft_fix"
+  # "dbet  0.9 0.9 1"
+  # "dbet  0.9 0.8 1"
   # ---------- h0.7 group ----------
   "dbet  0.7 0.9 2"
   "heavy 0.7 0   1"
-  "dbet  0.7 0.8 2"
-  "dbet  0.7 0.9 2 --no_draft_fix"
+  "dbet  0.7 0.9 3"
+  "dbet  0.7 0.8 3"
+  # "dbet  0.7 0.8 2"
+  # "dbet  0.7 0.9 2 --no_draft_fix"
   # ---------- h0.5 group ----------
   "dbet  0.5 0.9 2"
   "heavy 0.5 0   1"
-  "dbet  0.5 0.8 2"
-  "dbet  0.5 0.9 2 --no_draft_fix"
+  "dbet  0.5 0.9 3"
+  "dbet  0.5 0.8 3"
+  # "dbet  0.5 0.8 2"
+  # "dbet  0.5 0.9 2 --no_draft_fix"
 )
 
 run_cfg () {                                     # $1=mode $2=heavy_thr $3=draft_thr $4=draft_top_k $5..=extra
   local mode="$1" hthr="$2" dthr="$3" dk="$4"; shift 4; local extra="$*"
-  local flag="" tag suffix=""
+  local flag="" tag suffix="" csuffix=""
   [[ "$extra" == *--no_draft_fix* ]] && suffix="_nofix"
-  if [ "$mode" = heavy ]; then flag="--heavy_only"; tag="heavy_h${hthr}"
-  else tag="dbet_h${hthr}_d${dthr}_k${dk}${suffix}"; fi
+  if [ "$mode" = heavy ]; then flag="--heavy_only"; tag="heavy_h${hthr}"      # cache is DBet-only -> heavy shared
+  else
+    [ "$USE_CACHE" = 1 ] && { extra="$extra --use_cache"; csuffix="_cache"; }  # incremental prefix-KV cache
+    tag="dbet_h${hthr}_d${dthr}_k${dk}${suffix}${csuffix}"
+  fi
   local preds="$OUT/preds_${tag}.jsonl" glog="$OUT/gen_${tag}.log" vlog="$OUT/grade_${tag}.log" alog="$OUT/degen_${tag}.log"
   echo; echo "==================== $tag ===================="
 
