@@ -123,11 +123,39 @@ def main():
     rep("block logits", logits_c, logits_f)
     rep("block h_sel", hblk_c, hblk_f)
     rep("prefix h_sel", prefix_hsel, hpre_f)
-    print("\nDECISION (run with --exact_moe --math_attn, both non-assoc sources removed):")
-    print("  * block logits max|Δ| == 0  => the FORWARD/cache is CORRECT; a 0/10 decode is chaotic threshold")
-    print("    sensitivity (judge the cache by GSM8K accuracy, NOT token-identity), not a logic bug.")
-    print("  * block logits max|Δ| > 0   => a real forward-level cache bug. Localize: if 'prefix h_sel' Δ>0 the")
-    print("    cached PREFIX is wrong (crop/rope/mask); if only 'block' Δ>0 the PARTIAL-block forward is wrong.")
+
+    # ---- PER-LAYER localization: which layer's block hidden first diverges (full vs partial) ----
+    # hidden_states[i] = input to layer i (hs[0] = embeddings); compare the block slice at every layer.
+    heavy = model.heavy
+    with attn_ctx():
+        out_f = heavy(inputs_embeds=embed(x[:, :be]), attention_mask=m_full,
+                      output_hidden_states=True, use_cache=False, return_dict=True)
+        cache2 = _new_dynamic_cache()
+        if args.cache_build == "crop":
+            heavy(inputs_embeds=embed(x[:, :be]), attention_mask=m_full, past_key_values=cache2,
+                  use_cache=True, return_dict=True)
+            _crop_cache(cache2, bs)
+        else:
+            m_pre = build_block_causal_mask(bs, block, dtype=DT, device=args.device)
+            heavy(inputs_embeds=embed(x[:, :bs]), attention_mask=m_pre, past_key_values=cache2,
+                  use_cache=True, return_dict=True)
+        out_p = heavy(inputs_embeds=embed(x[:, bs:be]), attention_mask=m_blk, past_key_values=cache2,
+                      use_cache=True, output_hidden_states=True, return_dict=True)
+    hs_f, hs_p = out_f.hidden_states, out_p.hidden_states
+    print(f"\nper-layer block hidden Δ (full[:,{bs}:{be}] vs partial), {len(hs_f)} states (0=embeds):")
+    first = None
+    for i, (a, b) in enumerate(zip(hs_f, hs_p)):
+        d = (a[:, bs:be].float() - b.float()).abs()
+        mx = d.max().item()
+        flag = ""
+        if first is None and mx > 1e-3:
+            first = i; flag = "  <== FIRST DIVERGENCE"
+        if i < 3 or flag or i == len(hs_f) - 1:
+            print(f"  hs[{i:2d}] max|Δ|={mx:.6f}{flag}")
+    print(f"\n=> first diverging state = {first} "
+          f"({'embeds (input differs!)' if first == 0 else f'output of layer {first-1}' if first else 'none (identical)'})")
+    print("DECISION: block max|Δ|==0 => forward correct (0/10 decode = chaotic threshold sensitivity, judge by")
+    print("  accuracy). max|Δ|>0 => real bug; the first diverging layer + (prefix vs block) Δ above localize it.")
 
 
 if __name__ == "__main__":
