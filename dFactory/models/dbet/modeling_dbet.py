@@ -69,6 +69,27 @@ def _apply_rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, un
     return torch.cat([x_embed, x_pass], dim=-1)
 
 
+def _cache_seq_len(cache) -> int:
+    """Seq-dim length of a (possibly empty) Cache, robust across transformers versions."""
+    try:
+        return int(cache.get_seq_length())
+    except Exception:
+        return 0
+
+
+def _cache_layer_kv(cache, layer_idx):
+    """Read (keys, values) for one layer of a DynamicCache, robust to the transformers API change that
+    replaced the `key_cache`/`value_cache` lists with a `layers` list of DynamicLayer(.keys/.values)."""
+    if hasattr(cache, "key_cache"):                              # transformers < ~4.54
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+    layer = cache.layers[layer_idx]                              # transformers >= ~4.54
+    k = getattr(layer, "keys", None)
+    v = getattr(layer, "values", None)
+    if k is None:                                               # very defensive: alternate attr names
+        k, v = getattr(layer, "key_cache", None), getattr(layer, "value_cache", None)
+    return k, v
+
+
 # NOTE: the DMax-native heavy decode (decode_uniform: grid-aligned blocks, left-to-right threshold commit,
 # soft-embedding reveal) is DEFERRED to the inference stage. To match DMax/LLaDA-2.0's framework it will live
 # in a separate inference wrapper (a `DbetDiffusionLLM`, mirroring dInfer's DiffusionLLM classes), NOT in the
@@ -305,8 +326,8 @@ class DbetAttention(nn.Module):
             k_pre = _apply_rope_single(k_pre, cos[:, :p], sin[:, :p])     # prefix keeps its own positions
             if past_key_values is not None:
                 k_pre, v_pre = past_key_values.update(k_pre, v_pre, self.layer_idx)
-        elif past_key_values is not None and len(past_key_values.key_cache) > self.layer_idx:
-            k_pre, v_pre = past_key_values.key_cache[self.layer_idx], past_key_values.value_cache[self.layer_idx]
+        elif past_key_values is not None and _cache_seq_len(past_key_values) > 0:
+            k_pre, v_pre = _cache_layer_kv(past_key_values, self.layer_idx)
         else:
             k_pre = v_pre = None
 
@@ -457,8 +478,8 @@ class DbetDraftStack(nn.Module):
         # committed-context length P (for positions): from the prefix feature, else the cache, else 0.
         if h_sel_prefix is not None:
             p = h_sel_prefix.shape[1]
-        elif past_key_values is not None and len(past_key_values.key_cache) > 0:
-            p = past_key_values.key_cache[0].shape[2]
+        elif past_key_values is not None and _cache_seq_len(past_key_values) > 0:
+            p = _cache_seq_len(past_key_values)
         else:
             p = 0
 
