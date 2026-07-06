@@ -378,11 +378,18 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_cache, prefix_hsel, heavy_t
         x[0, bs + sp] = block_logits[0, sp].argmax(dim=-1)
         block_embeds[0, sp] = _soft_embed(block_logits[0, sp], embed, MASK_ID, heavy_tau, heavy_top_k)
 
-    # ---- FINALIZATION: forward the block's FINAL soft-embeds, KEEP its KV -> becomes prefix for the next block ----
+    # ---- FINALIZATION: represent the completed block the way the no-cache path represents a PREFIX block ----
+    # decode_block_dbet feeds earlier/committed blocks as HARD token embeds (`prefix_embeds = embed(x[:, :bs])`),
+    # NOT soft-embeds. So the cached prefix KV / h_sel must be built from embed(x[bs:be]) (hard), else every later
+    # block attends a slightly-off prefix and diverges. KEEP this block's KV (append -> next block's prefix).
+    if heavy_cache is not None and heavy_cache.get_seq_length() > bs:
+        _crop_cache(heavy_cache, bs)
     _t = _now(device)
-    sig = _heavy_block(keep=True)                                      # heavy_cache now [0,be) (block KV kept)
+    sig = model.extract_heavy_signals(x[:, bs:be], attention_mask=full_attend, inputs_embeds=embed(x[:, bs:be]),
+                                      past_key_values=heavy_cache, use_cache=True)
+    heavy_cache = sig["past_key_values"]                              # now [0,be) (block KV kept)
     stats.heavy_time += _now(device) - _t; stats.heavy_forwards += 1
-    block_hsel = sig["h_sel"]                                          # [1, blk, mD] final-state prefix hidden
+    block_hsel = sig["h_sel"]                                          # [1, blk, mD] hard-embed prefix hidden
     prefix_hsel = block_hsel if prefix_hsel is None else torch.cat([prefix_hsel, block_hsel], dim=1)
     return heavy_cache, prefix_hsel
 
