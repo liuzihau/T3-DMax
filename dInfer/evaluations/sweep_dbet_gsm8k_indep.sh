@@ -103,6 +103,6 @@ print(f\"{sum(r.get('heavy_forwards',0) for r in rows)/n:.1f} {sum(r.get('draft_
 for cfg in "${CONFIGS[@]}"; do run_cfg $cfg; done
 
 echo; echo "======================= SWEEP SUMMARY ======================="
-column -t -s $'\t' "$SUMMARY"
+awk -F'\t' '{ printf "%-28s %-10s %-7s %-9s %-9s %-9s %-9s %-8s\n", $1,$2,$3,$4,$5,$6,$7,$8 }' "$SUMMARY"  # column(1) not on box
 echo "============================================================="
 echo "[sweep] table: $SUMMARY   logs: $OUT/{gen,grade,degen}_*.log   preds: $OUT/preds_*.jsonl"

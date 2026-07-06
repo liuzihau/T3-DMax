@@ -50,6 +50,7 @@ run cache   "--use_cache"
 echo; echo "======================= CACHE A/B (h$HTHR d$DTHR k$DK, n=$LIMIT) ======================="
 { printf "config\taccuracy\theavy/ex\tdraft/ex\twall/ex\ttok/s\n"
   report nocache "$OUT/preds_nocache.jsonl"
-  report cache   "$OUT/preds_cache.jsonl"; } | column -t -s $'\t'
+  report cache   "$OUT/preds_cache.jsonl"; } \
+  | awk -F'\t' '{ printf "%-10s %-11s %-10s %-10s %-10s %-8s\n", $1,$2,$3,$4,$5,$6 }'   # column(1) not on box
 echo "======================================================================================"
 echo "[ab] iso accuracy + lower cache wall/ex (mean) = win. logs/preds in $OUT/"
