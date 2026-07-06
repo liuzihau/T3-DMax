@@ -34,7 +34,8 @@ print(f\"{sum(r.get('heavy_forwards',0) for r in rows)/n:.1f} {sum(r.get('draft_
 }
 
 run () {                                           # $1=tag $2=extra_flag
-  local tag="$1" extra="$2" preds="$OUT/preds_${tag}.jsonl"
+  local tag="$1" extra="$2"
+  local preds="$OUT/preds_${tag}.jsonl"
   echo; echo "==================== $tag ===================="
   if [ -s "$preds" ]; then echo "[ab] $preds exists -> skip"; else
     python evaluations/eval_dbet_gsm8k.py --drafter_path "$DRAFTER" --heavy_path "$HEAVY" \
