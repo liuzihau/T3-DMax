@@ -13,7 +13,8 @@ import sys
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "python")))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "python")))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..")))
 from dinfer.decoding.generate_dbet import generate_dbet, load_dbet_model          # noqa: E402
 from eval_dbet_gsm8k import load_gsm8k_test                                        # noqa: E402
 from transformers import AutoTokenizer                                            # noqa: E402

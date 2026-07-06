@@ -16,7 +16,8 @@ import types
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "python")))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "python")))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..")))
 from dinfer.decoding.generate_dbet import (build_block_causal_mask, load_dbet_model,     # noqa: E402
                                            _new_dynamic_cache, _crop_cache, MASK_ID)
 from eval_dbet_gsm8k import load_gsm8k_test                                              # noqa: E402
