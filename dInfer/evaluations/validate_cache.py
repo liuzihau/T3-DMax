@@ -37,11 +37,18 @@ def main():
     p.add_argument("--exact_moe", action="store_true",
                    help="force the non-fused (row-independent, length-invariant) MoE path -> isolates the cache "
                         "LOGIC from the batch-dependent veomni fused kernel. Expect 10/10 if the cache is correct.")
+    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
+                   help="cast the model; fp32 kills bf16 non-associativity (tokens should match).")
+    p.add_argument("--math_attn", action="store_true",
+                   help="force SDPA MATH backend (full score matrix, no flash tiling) -> attention becomes "
+                        "shape-independent. With --exact_moe this removes BOTH non-associativity sources -> "
+                        "expect 10/10 BIT-IDENTICAL even in bf16 (the definitive cache-correctness proof).")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     model = load_dbet_model(args.drafter_path, args.heavy_path, args.device)
+    model.to(getattr(torch, args.dtype))
     if args.exact_moe:
         import types
 
@@ -72,13 +79,21 @@ def main():
         print(f"[exact_moe] patched {n} fused-experts modules to the row-independent exact path (length-invariant)")
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
 
+    import contextlib
+    if args.math_attn:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        attn_ctx = lambda: sdpa_kernel(SDPBackend.MATH)
+    else:
+        attn_ctx = contextlib.nullcontext
+
     def gen(prompt_ids, use_cache):
-        r, s = generate_dbet(
-            model, prompt_ids, gen_length=args.gen_length, block_length=args.block_length,
-            heavy_threshold=args.heavy_threshold, draft_threshold=args.draft_threshold,
-            heavy_top_k=args.heavy_top_k, draft_top_k=args.draft_top_k,
-            draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
-            use_cache=use_cache)
+        with attn_ctx():
+            r, s = generate_dbet(
+                model, prompt_ids, gen_length=args.gen_length, block_length=args.block_length,
+                heavy_threshold=args.heavy_threshold, draft_threshold=args.draft_threshold,
+                heavy_top_k=args.heavy_top_k, draft_top_k=args.draft_top_k,
+                draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
+                use_cache=use_cache)
         return r, s
 
     n_ok = 0
