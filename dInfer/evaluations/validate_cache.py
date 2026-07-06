@@ -34,11 +34,20 @@ def main():
     p.add_argument("--draft_committed_soft", action="store_true")
     p.add_argument("--no_draft_fix", action="store_true")
     p.add_argument("--gt_jsonl_path", default=None)
+    p.add_argument("--exact_moe", action="store_true",
+                   help="force the non-fused (row-independent, length-invariant) MoE path -> isolates the cache "
+                        "LOGIC from the batch-dependent veomni fused kernel. Expect 10/10 if the cache is correct.")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     model = load_dbet_model(args.drafter_path, args.heavy_path, args.device)
+    if args.exact_moe:
+        n = 0
+        for mod in model.modules():
+            if hasattr(mod, "_fuse_moe_forward") and hasattr(mod, "_forward"):
+                mod.forward = mod._forward.__get__(mod, type(mod)); n += 1
+        print(f"[exact_moe] forced {n} MoE blocks onto the non-fused exact path (length-invariant)")
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
 
     def gen(prompt_ids, use_cache):
