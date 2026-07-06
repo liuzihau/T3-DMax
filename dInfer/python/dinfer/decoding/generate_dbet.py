@@ -255,17 +255,37 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
         x[0, bs + sp] = block_logits[0, sp].argmax(dim=-1)
 
 
+def _new_dynamic_cache():
+    """DynamicCache, with a compat shim: the heavy's forward calls `get_usable_length` (removed in newer
+    transformers); for an unbounded DynamicCache that equals `get_seq_length`, so alias it if missing."""
+    from transformers import DynamicCache
+    if not hasattr(DynamicCache, "get_usable_length"):
+        DynamicCache.get_usable_length = lambda self, new_seq_length=0, layer_idx=0: self.get_seq_length(layer_idx)
+    return DynamicCache()
+
+
+def _crop_cache(cache, length):
+    """Truncate a DynamicCache to `length` tokens (drop the in-progress block KV). Uses `.crop` if present,
+    else truncates key/value tensors directly (version-robust)."""
+    if hasattr(cache, "crop"):
+        cache.crop(length); return
+    for i in range(len(cache.key_cache)):
+        cache.key_cache[i] = cache.key_cache[i][..., :length, :].contiguous()
+        cache.value_cache[i] = cache.value_cache[i][..., :length, :].contiguous()
+    if hasattr(cache, "_seen_tokens"):
+        cache._seen_tokens = length
+
+
 @torch.no_grad()
 def _build_prefix_cache(model, x, upto, block_length, heavy_tau, heavy_top_k):
     """Build the initial prefix cache over the settled HARD region [0, upto) (prompt-prefix). Returns
     (DynamicCache with KV for [0,upto), prefix h_sel [1,upto,mD]). Block-causal mask over [0,upto)."""
-    from transformers import DynamicCache
     device = x.device
     if upto <= 0:
-        return DynamicCache(), None
+        return _new_dynamic_cache(), None
     embed = model.draft.frozen_embed
     attn = build_block_causal_mask(upto, block_length, dtype=torch.bfloat16, device=device)
-    cache = DynamicCache()
+    cache = _new_dynamic_cache()
     sig = model.extract_heavy_signals(x[:, :upto], attention_mask=attn, inputs_embeds=embed(x[:, :upto]),
                                       past_key_values=cache, use_cache=True)
     return sig["past_key_values"], sig["h_sel"]                          # cache=[0,upto), prefix h_sel [1,upto,mD]
@@ -292,12 +312,12 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_cache, prefix_hsel, heavy_t
     def _heavy_block(keep):                                             # partial forward of the block with the cache
         nonlocal heavy_cache
         if heavy_cache is not None and heavy_cache.get_seq_length() > bs:
-            heavy_cache.crop(bs)                                        # ensure cache is exactly [0,bs) pre-forward
+            _crop_cache(heavy_cache, bs)                               # ensure cache is exactly [0,bs) pre-forward
         sig = model.extract_heavy_signals(x[:, bs:be], attention_mask=full_attend, inputs_embeds=block_embeds,
                                           past_key_values=heavy_cache, use_cache=True)
         heavy_cache = sig["past_key_values"]                           # now [0,be)
         if not keep:
-            heavy_cache.crop(bs)                                       # discard the in-progress block KV -> [0,bs)
+            _crop_cache(heavy_cache, bs)                               # discard the in-progress block KV -> [0,bs)
         return sig
 
     it = 0
