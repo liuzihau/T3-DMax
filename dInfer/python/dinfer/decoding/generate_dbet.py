@@ -284,7 +284,7 @@ def _build_prefix_cache(model, x, upto, block_length, heavy_tau, heavy_top_k):
     if upto <= 0:
         return _new_dynamic_cache(), None
     embed = model.draft.frozen_embed
-    attn = build_block_causal_mask(upto, block_length, dtype=torch.bfloat16, device=device)
+    attn = build_block_causal_mask(upto, block_length, dtype=model.draft.frozen_embed.weight.dtype, device=device)
     cache = _new_dynamic_cache()
     sig = model.extract_heavy_signals(x[:, :upto], attention_mask=attn, inputs_embeds=embed(x[:, :upto]),
                                       past_key_values=cache, use_cache=True)
@@ -306,7 +306,7 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_cache, prefix_hsel, heavy_t
     active = (x[0:1, bs:be] == MASK_ID)                                  # decode region (excludes prompt tail)
     blk = be - bs
     block_embeds = embed(x[:, bs:be]).clone()                           # [1, blk, D]
-    full_attend = torch.zeros(1, 1, blk, be, dtype=torch.bfloat16, device=device)   # block attends all [0,be)
+    full_attend = torch.zeros(1, 1, blk, be, dtype=model.draft.frozen_embed.weight.dtype, device=device)  # block attends all [0,be)
     block_logits = None
 
     def _heavy_block(keep):                                             # partial forward of the block with the cache
@@ -446,7 +446,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                 draft_tau=draft_tau, draft_top_k=draft_top_k,
                 draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
         else:
-            attn = build_block_causal_mask(be, block_length, dtype=torch.bfloat16, device=device)
+            attn = build_block_causal_mask(be, block_length, dtype=model.draft.frozen_embed.weight.dtype, device=device)
             decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                               max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft,
                               heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
