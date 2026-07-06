@@ -402,12 +402,13 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_threshold=0.9, draft_threshold=0.7, max_iter_per_block=32,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                  draft_committed_soft=False, draft_fix=True, use_cache=False):
+                  draft_committed_soft=False, draft_fix=True, use_cache=False, progress_desc=None):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
     draft_threshold: the trained confidence-head gate for committing DRAFTER tokens (higher = safer/slower).
-    use_draft=False -> pure heavy-only baseline (see generate_heavy)."""
+    use_draft=False -> pure heavy-only baseline (see generate_heavy).
+    progress_desc: if given (a label), show a per-block tqdm bar (useful for the very slow --exact_moe proof)."""
     device = prompt_ids.device
     P = prompt_ids.shape[1]
 
@@ -427,7 +428,11 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
     draft_cache = _new_dynamic_cache() if cached else None
     settled = 0                                                        # length of prefix currently in the caches
     _t_wall = _now(device)
-    for b in range(num_blocks):
+    block_iter = range(num_blocks)
+    if progress_desc is not None:
+        from tqdm import tqdm
+        block_iter = tqdm(block_iter, desc=progress_desc, total=num_blocks, unit="blk", leave=False)
+    for b in block_iter:
         bs = first_block_start + b * block_length
         be = bs + block_length
         if cached:

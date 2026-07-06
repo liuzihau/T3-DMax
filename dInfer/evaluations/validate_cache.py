@@ -86,14 +86,14 @@ def main():
     else:
         attn_ctx = contextlib.nullcontext
 
-    def gen(prompt_ids, use_cache):
+    def gen(prompt_ids, use_cache, desc):
         with attn_ctx():
             r, s = generate_dbet(
                 model, prompt_ids, gen_length=args.gen_length, block_length=args.block_length,
                 heavy_threshold=args.heavy_threshold, draft_threshold=args.draft_threshold,
                 heavy_top_k=args.heavy_top_k, draft_top_k=args.draft_top_k,
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
-                use_cache=use_cache)
+                use_cache=use_cache, progress_desc=desc)
         return r, s
 
     n_ok = 0
@@ -101,8 +101,8 @@ def main():
         msgs = [{"role": "user", "content": row["question"]}]
         pid = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
                                       return_tensors="pt").to(args.device)
-        r0, s0 = gen(pid, use_cache=False)
-        r1, s1 = gen(pid, use_cache=True)
+        r0, s0 = gen(pid, use_cache=False, desc=f"ex{i+1}/{len(rows)} no-cache")
+        r1, s1 = gen(pid, use_cache=True, desc=f"ex{i+1}/{len(rows)} cache")
         same = (r0.shape == r1.shape) and bool(torch.equal(r0, r1))
         if same:
             n_ok += 1
