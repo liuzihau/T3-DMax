@@ -59,6 +59,9 @@ def main():
     p.add_argument("--math_attn", action="store_true",
                    help="force SDPA MATH backend (no flash tiling). With --exact_moe removes BOTH non-assoc "
                         "sources -> a correct cache must be BIT-IDENTICAL at the forward level (max|Δ|=0).")
+    p.add_argument("--prove_shape", type=int, default=0,
+                   help="N>0: cache-FREE control -- forward the block at total length be vs be+N*block (identical "
+                        "attention) to show the block output is shape-dependent in bf16 (~0 in fp32).")
     p.add_argument("--cache_build", default="crop", choices=["crop", "separate"],
                    help="how to build the prefix cache: 'crop' = full [0,be) forward then crop to bs (EXACTLY what "
                         "the decode does); 'separate' = a standalone [0,bs) forward (the old diag path).")
@@ -154,8 +157,29 @@ def main():
             print(f"  hs[{i:2d}] max|Δ|={mx:.6f}{flag}")
     print(f"\n=> first diverging state = {first} "
           f"({'embeds (input differs!)' if first == 0 else f'output of layer {first-1}' if first else 'none (identical)'})")
-    print("DECISION: block max|Δ|==0 => forward correct (0/10 decode = chaotic threshold sensitivity, judge by")
-    print("  accuracy). max|Δ|>0 => real bug; the first diverging layer + (prefix vs block) Δ above localize it.")
+
+    # ---- SHAPE-ONLY control (ZERO caching): is the block's OWN forward shape-dependent in bf16? ----
+    # Forward the SAME block [bs,be) with the SAME attention pattern but a DIFFERENT total length: append
+    # `--prove_shape` extra all-mask blocks at [be, be+pad). Block-causal EXCLUDES them from the block's
+    # attention, so the block's inputs + attended keys are IDENTICAL -- only the matmul M-dimension changes
+    # (be -> be+pad). Any block-logits Δ here is PURE bf16 matmul shape-rounding with NO cache in play, i.e.
+    # exactly what makes the cached (M=blk) partial forward differ from the no-cache (M=be) full forward.
+    if args.prove_shape > 0:
+        pad = args.prove_shape * block
+        xL = torch.full((1, be + pad), MASK_ID, dtype=torch.long, device=args.device); xL[:, :P] = pid
+        mL = build_block_causal_mask(be + pad, block, dtype=DT, device=args.device)
+        with attn_ctx():
+            s_short = model.extract_heavy_signals(x[:, :be], attention_mask=m_full, inputs_embeds=embed(x[:, :be]))
+            s_long = model.extract_heavy_signals(xL, attention_mask=mL, inputs_embeds=embed(xL))
+        print(f"\nSHAPE-ONLY control (NO cache): block[{bs}:{be}] forwarded at total length {be} vs {be+pad}, "
+              f"identical attention:")
+        rep("block logits", s_long["logits"][:, bs:be], s_short["logits"][:, bs:be])
+        print("  ^ nonzero in bf16 with ZERO caching => the model's block output is shape-dependent (cuBLAS tiling);")
+        print("    fp32 collapses it to ~1e-5. Same mechanism as cache (M=blk) vs no-cache (M=be), and as AR M=1 vs M=N.")
+
+    print("\nDECISION: block max|Δ|==0 => forward correct (0/10 bf16 decode = chaotic threshold sensitivity on top")
+    print("  of shape-dependent bf16 rounding; judge the cache by GSM8K ACCURACY, not token-identity). fp32 decode")
+    print("  10/10 (prove_cache proof 2) already confirms the cache LOGIC is correct.")
 
 
 if __name__ == "__main__":
