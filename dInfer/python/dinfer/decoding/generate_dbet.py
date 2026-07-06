@@ -256,6 +256,118 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
 
 
 @torch.no_grad()
+def _build_prefix_cache(model, x, upto, block_length, heavy_tau, heavy_top_k):
+    """Build the initial prefix cache over the settled HARD region [0, upto) (prompt-prefix). Returns
+    (DynamicCache with KV for [0,upto), prefix h_sel [1,upto,mD]). Block-causal mask over [0,upto)."""
+    from transformers import DynamicCache
+    device = x.device
+    if upto <= 0:
+        return DynamicCache(), None
+    embed = model.draft.frozen_embed
+    attn = build_block_causal_mask(upto, block_length, dtype=torch.bfloat16, device=device)
+    cache = DynamicCache()
+    sig = model.extract_heavy_signals(x[:, :upto], attention_mask=attn, inputs_embeds=embed(x[:, :upto]),
+                                      past_key_values=cache, use_cache=True)
+    return sig["past_key_values"], sig["h_sel"]                          # cache=[0,upto), prefix h_sel [1,upto,mD]
+
+
+@torch.no_grad()
+def decode_block_dbet_cached(model, x, bs, be, heavy_cache, prefix_hsel, heavy_threshold, draft_threshold,
+                             max_iters, tau, stats, heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
+                             draft_committed_soft=False, draft_fix=True):
+    """Prefix-KV-cached twin of decode_block_dbet (must give byte-identical output). `heavy_cache` holds KV for
+    the settled prefix [0,bs); `prefix_hsel` [1,bs,mD] is the heavy sel-hidden there (for the draft PrefixFuse).
+    Each iteration forwards ONLY the block [bs,be) with the cached prefix (all-attend 4D mask, since the last
+    block attends everything), then CROPs the block KV back off. On completion, one FINALIZATION forward on the
+    block's FINAL soft-embeds keeps the block KV (append to prefix) + extends prefix_hsel. Returns the extended
+    (heavy_cache=[0,be), prefix_hsel=[1,be,mD])."""
+    device = x.device
+    embed = model.draft.frozen_embed
+    active = (x[0:1, bs:be] == MASK_ID)                                  # decode region (excludes prompt tail)
+    blk = be - bs
+    block_embeds = embed(x[:, bs:be]).clone()                           # [1, blk, D]
+    full_attend = torch.zeros(1, 1, blk, be, dtype=torch.bfloat16, device=device)   # block attends all [0,be)
+    block_logits = None
+
+    def _heavy_block(keep):                                             # partial forward of the block with the cache
+        nonlocal heavy_cache
+        if heavy_cache is not None and heavy_cache.get_seq_length() > bs:
+            heavy_cache.crop(bs)                                        # ensure cache is exactly [0,bs) pre-forward
+        sig = model.extract_heavy_signals(x[:, bs:be], attention_mask=full_attend, inputs_embeds=block_embeds,
+                                          past_key_values=heavy_cache, use_cache=True)
+        heavy_cache = sig["past_key_values"]                           # now [0,be)
+        if not keep:
+            heavy_cache.crop(bs)                                       # discard the in-progress block KV -> [0,bs)
+        return sig
+
+    it = 0
+    while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
+        _t = _now(device)
+        sig = _heavy_block(keep=False)
+        block_logits = sig["logits"]                                   # [1, blk, V]
+        stats.heavy_time += _now(device) - _t; stats.heavy_forwards += 1
+
+        mask_idx = (x[0:1, bs:be] == MASK_ID)
+        x0, high_conf_idx, _, breakflag = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
+        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]
+        if hci.numel() > 0:
+            x[0, bs + hci] = x0[0, hci]; stats.heavy_commits += int(hci.numel())
+        committed = active[0] & (x[0, bs:be] != MASK_ID)
+        ci = committed.nonzero(as_tuple=True)[0]
+        if ci.numel() > 0:
+            block_embeds[0, ci] = _soft_embed(block_logits[0, ci], embed, MASK_ID, heavy_tau, heavy_top_k)
+        if bool(breakflag) or not bool((x[0:1, bs:be] == MASK_ID).any()):
+            break
+
+        # ---- draft: direct call with the block canvas + cached prefix h_sel (PrefixFuse recomputed; Phase 2 caches it)
+        block_x = x[0, bs:be]; mask_pos = (block_x == MASK_ID)
+        committed_before = active[0] & (~mask_pos)
+        draft_ids = x[:, bs:be].clone()
+        if draft_committed_soft and bool(committed_before.any()):
+            draft_ids[0][committed_before] = MASK_ID
+        _t = _now(device)
+        d = model.draft(input_ids=draft_ids, heavy_logits=sig["logits"], h_sel_denoise=sig["h_sel"],
+                        h_last_denoise=sig["h_last"], h_sel_prefix=prefix_hsel,
+                        attention_mask=None, position_ids=None, denoise_mask=None, tau=tau)
+        stats.draft_time += _now(device) - _t; stats.draft_forwards += 1
+        dlogits, dconf = d["logits"], d["conf"]
+        if dconf is None:
+            it += 1; continue
+        darg = dlogits[0].argmax(-1); dc = dconf[0]
+        mloc = mask_pos.nonzero(as_tuple=True)[0]
+        if mloc.numel() > 0:
+            ok = dc[mloc] >= draft_threshold
+            keep = ~(torch.cumsum((~ok).long(), 0) > 0); keep[0] = True
+            sel = mloc[keep]
+            x[0, bs + sel] = darg[sel]
+            block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
+            stats.draft_commits += int(sel.numel())
+        if draft_fix and bool(committed_before.any()):
+            fix = committed_before & (dc >= draft_threshold) & (darg != block_x)
+            floc = fix.nonzero(as_tuple=True)[0]
+            if floc.numel() > 0:
+                x[0, bs + floc] = darg[floc]
+                block_embeds[0, floc] = _soft_embed(dlogits[0][floc], embed, MASK_ID, draft_tau, draft_top_k)
+                stats.draft_fixes += int(floc.numel())
+        it += 1
+
+    # safety: fill any remaining mask + soft-embed it, so the finalization forward sees the FINAL block state
+    still = (x[0:1, bs:be] == MASK_ID)
+    if still.any() and block_logits is not None:
+        sp = still[0].nonzero(as_tuple=True)[0]
+        x[0, bs + sp] = block_logits[0, sp].argmax(dim=-1)
+        block_embeds[0, sp] = _soft_embed(block_logits[0, sp], embed, MASK_ID, heavy_tau, heavy_top_k)
+
+    # ---- FINALIZATION: forward the block's FINAL soft-embeds, KEEP its KV -> becomes prefix for the next block ----
+    _t = _now(device)
+    sig = _heavy_block(keep=True)                                      # heavy_cache now [0,be) (block KV kept)
+    stats.heavy_time += _now(device) - _t; stats.heavy_forwards += 1
+    block_hsel = sig["h_sel"]                                          # [1, blk, mD] final-state prefix hidden
+    prefix_hsel = block_hsel if prefix_hsel is None else torch.cat([prefix_hsel, block_hsel], dim=1)
+    return heavy_cache, prefix_hsel
+
+
+@torch.no_grad()
 def generate_heavy(model, prompt_ids, gen_length, block_length,
                    heavy_threshold=0.9, max_iter_per_block=32, early_stop=True,
                    heavy_tau=1.0, heavy_top_k=1):
@@ -272,7 +384,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_threshold=0.9, draft_threshold=0.7, max_iter_per_block=32,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                  draft_committed_soft=False, draft_fix=True):
+                  draft_committed_soft=False, draft_fix=True, use_cache=False):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -291,16 +403,28 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
 
     stats = DbetGenerateStats()
     eos_cut = L
+    cached = use_cache and use_draft                                   # prefix-KV cache path (DBet only)
+    heavy_cache = prefix_hsel = None
+    if cached:
+        heavy_cache, prefix_hsel = _build_prefix_cache(model, x, first_block_start, block_length,
+                                                       heavy_tau, heavy_top_k)
     _t_wall = _now(device)
     for b in range(num_blocks):
         bs = first_block_start + b * block_length
         be = bs + block_length
-        attn = build_block_causal_mask(be, block_length, dtype=torch.bfloat16, device=device)
-        decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
-                          max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft,
-                          heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
-                          draft_tau=draft_tau, draft_top_k=draft_top_k,
-                          draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+        if cached:
+            heavy_cache, prefix_hsel = decode_block_dbet_cached(
+                model, x, bs, be, heavy_cache, prefix_hsel, heavy_threshold, draft_threshold,
+                max_iter_per_block, tau, stats, heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
+                draft_tau=draft_tau, draft_top_k=draft_top_k,
+                draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+        else:
+            attn = build_block_causal_mask(be, block_length, dtype=torch.bfloat16, device=device)
+            decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
+                              max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft,
+                              heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
+                              draft_tau=draft_tau, draft_top_k=draft_top_k,
+                              draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
         if early_stop:
             resp_lo = max(P, bs)
             seg = x[0, resp_lo:be]

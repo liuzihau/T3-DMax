@@ -68,6 +68,8 @@ def main():
     p.add_argument("--draft_committed_soft", action="store_true",
                    help="show heavy-committed slots to the draft as MASK+soft-embed (re-predictable) not hard tokens.")
     p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
+    p.add_argument("--use_cache", action="store_true",
+                   help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
     p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--gt_jsonl_path", default=None)
@@ -100,7 +102,8 @@ def main():
                 early_stop=not args.no_early_stop, use_draft=not args.heavy_only,
                 heavy_tau=args.heavy_tau, heavy_top_k=args.heavy_top_k,
                 draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
-                draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix)
+                draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
+                use_cache=args.use_cache)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits

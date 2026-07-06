@@ -551,16 +551,23 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
 
     @torch.no_grad()
     def extract_heavy_signals(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
-                              inputs_embeds: Optional[torch.Tensor] = None) -> dict:
+                              inputs_embeds: Optional[torch.Tensor] = None,
+                              past_key_values=None, use_cache: bool = False) -> dict:
         """Run the FROZEN heavy once; capture hidden at config.sel_layers_list (concat -> m*D), the last-layer
         hidden, and the logits; split prefix/canvas. Returns the dict consumed by `draft_forward`. The heavy
         is bidirectional within a block, so a single pass over [prefix ; canvas] gives all signals.
         If `inputs_embeds` is given (DMax soft-embedding decode), the heavy forwards on it while the prefix/canvas
-        split still uses the HARD `input_ids` (mask_token_id marks the canvas)."""
+        split still uses the HARD `input_ids` (mask_token_id marks the canvas).
+        PREFIX-KV CACHE (decode only): pass `past_key_values` (a DynamicCache holding the settled prefix [0,bs))
+        + `use_cache=True` and feed ONLY the current block as `inputs_embeds` [1,blk,D] with an all-attend 4D
+        `attention_mask` [1,1,blk,be]; the heavy computes just the block (position_ids default to arange(bs,be)
+        from the cache length) and APPENDS its KV to the returned cache — the caller crops back to bs each iter,
+        or keeps it on block completion. Then `logits/h_sel/h_last` are [1,blk,*] (block only)."""
         out = self.heavy(
             input_ids=None if inputs_embeds is not None else input_ids,
             inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-            output_hidden_states=True, use_cache=False, return_dict=True,
+            past_key_values=past_key_values, use_cache=use_cache,
+            output_hidden_states=True, return_dict=True,
         )
         hs = out.hidden_states                                  # tuple of [B,N,D], len = num_layers+1
         sel = torch.cat([hs[i] for i in self.config.sel_layers_list], dim=-1)  # [B,N,m*D]
@@ -570,6 +577,7 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         return {
             "input_ids": input_ids, "logits": logits, "h_sel": sel, "h_last": h_last,
             "prefix_idx": prefix_idx, "canvas_idx": canvas_idx,
+            "past_key_values": out.past_key_values if use_cache else None,
         }
 
     # ---- one draft forward ----
