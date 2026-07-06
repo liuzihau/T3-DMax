@@ -43,11 +43,33 @@ def main():
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     model = load_dbet_model(args.drafter_path, args.heavy_path, args.device)
     if args.exact_moe:
+        import types
+
+        def _exact_experts(self, hidden_states, expert_idx=None, routing_weights=None, selected_experts=None):
+            # row-independent (length-invariant) replacement for the fused kernel: per-token, per-expert eager
+            # matmuls, matching the module's own eager path (lines 298-302 of modeling_llada2_moe).
+            if expert_idx is not None:
+                g = torch.matmul(hidden_states, self.gate_proj[expert_idx].transpose(0, 1))
+                u = torch.matmul(hidden_states, self.up_proj[expert_idx].transpose(0, 1))
+                return torch.matmul(self.act_fn(g) * u, self.down_proj[expert_idx].transpose(0, 1))
+            out = torch.zeros_like(hidden_states)
+            for k in range(selected_experts.shape[1]):
+                eids = selected_experts[:, k]; w = routing_weights[:, k]
+                for e in torch.unique(eids).tolist():
+                    m = eids == e
+                    hs = hidden_states[m]
+                    g = torch.matmul(hs, self.gate_proj[e].transpose(0, 1))
+                    u = torch.matmul(hs, self.up_proj[e].transpose(0, 1))
+                    y = torch.matmul(self.act_fn(g) * u, self.down_proj[e].transpose(0, 1))
+                    out[m] += w[m].unsqueeze(-1) * y
+            return out
+
         n = 0
         for mod in model.modules():
-            if hasattr(mod, "_fuse_moe_forward") and hasattr(mod, "_forward"):
-                mod.forward = mod._forward.__get__(mod, type(mod)); n += 1
-        print(f"[exact_moe] forced {n} MoE blocks onto the non-fused exact path (length-invariant)")
+            if all(hasattr(mod, a) for a in ("gate_proj", "up_proj", "down_proj", "num_experts", "act_fn")) \
+               and getattr(mod, "gate_proj").dim() == 3:            # the fused EXPERTS module (3D stacked weights)
+                mod.forward = types.MethodType(_exact_experts, mod); n += 1
+        print(f"[exact_moe] patched {n} fused-experts modules to the row-independent exact path (length-invariant)")
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
 
     def gen(prompt_ids, use_cache):
