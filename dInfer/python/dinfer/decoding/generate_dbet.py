@@ -277,56 +277,56 @@ def _crop_cache(cache, length):
 
 
 @torch.no_grad()
-def _build_prefix_cache(model, x, upto, block_length, heavy_tau, heavy_top_k):
-    """Build the initial prefix cache over the settled HARD region [0, upto) (prompt-prefix). Returns
-    (DynamicCache with KV for [0,upto), prefix h_sel [1,upto,mD]). Block-causal mask over [0,upto)."""
-    device = x.device
-    if upto <= 0:
-        return _new_dynamic_cache(), None
-    embed = model.draft.frozen_embed
-    attn = build_block_causal_mask(upto, block_length, dtype=model.draft.frozen_embed.weight.dtype, device=device)
-    cache = _new_dynamic_cache()
-    sig = model.extract_heavy_signals(x[:, :upto], attention_mask=attn, inputs_embeds=embed(x[:, :upto]),
-                                      past_key_values=cache, use_cache=True)
-    return sig["past_key_values"], sig["h_sel"]                          # cache=[0,upto), prefix h_sel [1,upto,mD]
-
-
-@torch.no_grad()
-def decode_block_dbet_cached(model, x, bs, be, heavy_threshold, draft_threshold,
-                             max_iters, tau, stats, heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
+def decode_block_dbet_cached(model, x, bs, be, settled, heavy_cache, draft_cache, block_length,
+                             heavy_threshold, draft_threshold, max_iters, tau, stats,
+                             heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                              draft_committed_soft=False, draft_fix=True):
-    """DMax-style prefix KV cache, PER BLOCK (mirrors generate_cache.py: cache is fresh each block, no
-    cross-block carry, no finalization). ITER 0 = FULL [0,be) forward with use_cache -- identical to the
-    no-cache forward -- which builds the cache and yields the settled-prefix h_sel. ITERS 1+ = crop the block
-    KV off and PARTIAL-forward only [bs,be) reusing the fixed prefix KV (crop+append == DMax replace_position).
-    Correct = iso with decode_block_dbet up to bf16 non-associativity (proven: fp32 --exact_moe -> identical)."""
+    """INCREMENTAL cross-block prefix-KV cache (heavy AND draft). Persistent caches hold the settled prefix
+    [0, settled); on entry `settled == bs - blk` (or 0 for the first block) and the caches hold [0, settled).
+    Returns (heavy_cache, draft_cache, new_settled=bs).
+
+    ITER 0 = COMBINED forward (the user's design; goes BEYOND DMax, which re-forwards the whole prefix each
+    block): forward the newly-SETTLED region [settled, bs) as HARD embeds (mirrors the no-cache path feeding
+    completed blocks as embed(x)) TOGETHER with the current block [bs,be), reusing the cached prefix KV
+    [0,settled). One pass thus (a) FINALIZES the previous block's KV -> appended to the heavy cache (no separate
+    finalization forward), (b) yields that region's settled h_sel -> EXTENDS the draft prefix cache, and
+    (c) yields the current block's iter-0 logits/h_sel/h_last. Then crop the heavy cache back to bs.
+    ITERS 1+ = crop to bs, partial-forward only [bs,be) reusing the settled prefix KV.
+    The draft reads its cached prefix K/V (constant within the block), so its k_pre/v_pre are derived once per
+    settled block, not re-fused every round. Correct = iso with decode_block_dbet up to bf16 non-associativity
+    (the prefix is settled-HARD + block-causally isolated, so its cached KV/h_sel equal a fresh HARD forward's)."""
     device = x.device
     embed = model.draft.frozen_embed
-    mdt = model.draft.frozen_embed.weight.dtype
+    mdt = embed.weight.dtype
     active = (x[0:1, bs:be] == MASK_ID)                                  # decode region (excludes prompt tail)
-    blk = be - bs
-    prefix_embeds = embed(x[:, :bs])                                    # [1, bs, D] settled prefix (HARD)
-    block_embeds = embed(x[:, bs:be]).clone()                          # [1, blk, D]
-    m_full = build_block_causal_mask(be, blk, dtype=mdt, device=device)   # iter 0: block-causal over [0,be)
-    m_blk = torch.zeros(1, 1, blk, be, dtype=mdt, device=device)         # iters 1+: block attends all [0,be)
-    heavy_cache = None; prefix_hsel = None; block_logits = None
+    finalize_len = bs - settled                                         # region [settled,bs): prompt (b0) or prev block
+    m_full = build_block_causal_mask(be, block_length, dtype=mdt, device=device)   # block-causal over [0,be)
+    block_embeds = embed(x[:, bs:be]).clone()                          # [1, blk, D] current block (mask embeds)
+    block_hsel = block_hlast = block_logits = None
 
     it = 0
     while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
         _t = _now(device)
-        if heavy_cache is None:
-            # ITER 0: full [0,be) forward -> build the cache + the fixed prefix h_sel  (== the no-cache forward)
-            inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)
-            heavy_cache = _new_dynamic_cache()
-            sig = model.extract_heavy_signals(x[:, :be], attention_mask=m_full, inputs_embeds=inputs_embeds,
+        if it == 0:
+            # COMBINED forward: [ HARD settled region [settled,bs) ; current block [bs,be) ] over cached prefix
+            _crop_cache(heavy_cache, settled)                          # ensure the cache is exactly [0,settled)
+            hard_prefix = embed(x[:, settled:bs])                      # [1, finalize_len, D] HARD (== no-cache prefix feed)
+            inputs_embeds = torch.cat([hard_prefix, block_embeds], dim=1) if finalize_len > 0 else block_embeds
+            m = m_full[:, :, settled:be, :]                            # queries [settled,be) attend keys [0,be) block-causally
+            sig = model.extract_heavy_signals(x[:, settled:be], attention_mask=m, inputs_embeds=inputs_embeds,
                                               past_key_values=heavy_cache, use_cache=True)
-            heavy_cache = sig["past_key_values"]                       # [0,be)
-            prefix_hsel = sig["h_sel"][:, :bs]                          # settled prefix h_sel (fixed for the block)
-            block_logits, block_hsel, block_hlast = sig["logits"][:, bs:be], sig["h_sel"][:, bs:be], sig["h_last"][:, bs:be]
+            heavy_cache = sig["past_key_values"]                       # now [0,be)
+            _crop_cache(heavy_cache, bs)                               # finalize prev block, drop current-block provisional KV
+            if finalize_len > 0:                                       # EXTEND the draft prefix cache by the settled region
+                pos = torch.arange(settled, bs, device=device).unsqueeze(0)
+                model.extend_draft_prefix_cache(sig["h_sel"][:, :finalize_len], pos, draft_cache)
+            block_logits = sig["logits"][:, finalize_len:]
+            block_hsel, block_hlast = sig["h_sel"][:, finalize_len:], sig["h_last"][:, finalize_len:]
         else:
-            # ITERS 1+: crop the block KV off, partial-forward [bs,be) reusing the prefix (crop+append = replace)
+            # ITERS 1+: crop the block KV off, partial-forward [bs,be) reusing the settled prefix
             _crop_cache(heavy_cache, bs)
-            sig = model.extract_heavy_signals(x[:, bs:be], attention_mask=m_blk, inputs_embeds=block_embeds,
+            m = m_full[:, :, bs:be, :]
+            sig = model.extract_heavy_signals(x[:, bs:be], attention_mask=m, inputs_embeds=block_embeds,
                                               past_key_values=heavy_cache, use_cache=True)
             heavy_cache = sig["past_key_values"]                       # [0,be)
             block_logits, block_hsel, block_hlast = sig["logits"], sig["h_sel"], sig["h_last"]
@@ -344,7 +344,7 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_threshold, draft_threshold,
         if bool(breakflag) or not bool((x[0:1, bs:be] == MASK_ID).any()):
             break
 
-        # ---- draft: direct call with the block canvas + cached prefix h_sel (PrefixFuse recomputed; Phase 2 caches it)
+        # ---- draft: canvas = current block, prefix K/V read from the cross-block draft cache (h_sel_prefix=None) ----
         block_x = x[0, bs:be]; mask_pos = (block_x == MASK_ID)
         committed_before = active[0] & (~mask_pos)
         draft_ids = x[:, bs:be].clone()
@@ -352,7 +352,7 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_threshold, draft_threshold,
             draft_ids[0][committed_before] = MASK_ID
         _t = _now(device)
         d = model.draft(input_ids=draft_ids, heavy_logits=block_logits, h_sel_denoise=block_hsel,
-                        h_last_denoise=block_hlast, h_sel_prefix=prefix_hsel,
+                        h_last_denoise=block_hlast, h_sel_prefix=None, past_key_values=draft_cache,
                         attention_mask=None, position_ids=None, denoise_mask=None, tau=tau)
         stats.draft_time += _now(device) - _t; stats.draft_forwards += 1
         dlogits, dconf = d["logits"], d["conf"]
@@ -376,11 +376,13 @@ def decode_block_dbet_cached(model, x, bs, be, heavy_threshold, draft_threshold,
                 stats.draft_fixes += int(floc.numel())
         it += 1
 
-    # safety: never leave a [MASK] in the output (no finalization -- the cache is rebuilt fresh next block)
+    # safety: never leave a [MASK] in the output
     still = (x[0:1, bs:be] == MASK_ID)
     if still.any() and block_logits is not None:
         sp = still[0].nonzero(as_tuple=True)[0]
         x[0, bs + sp] = block_logits[0, sp].argmax(dim=-1)
+    _crop_cache(heavy_cache, bs)                                        # leave the cache at the settled prefix [0,bs)
+    return heavy_cache, draft_cache, bs
 
 
 @torch.no_grad()
@@ -419,15 +421,20 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
 
     stats = DbetGenerateStats()
     eos_cut = L
-    cached = use_cache and use_draft                                   # DMax-style per-block prefix-KV cache (DBet only)
+    cached = use_cache and use_draft                                   # incremental cross-block prefix-KV cache (DBet only)
+    # persistent caches spanning ALL blocks: hold the settled prefix [0, settled); grown one block at a time.
+    heavy_cache = _new_dynamic_cache() if cached else None
+    draft_cache = _new_dynamic_cache() if cached else None
+    settled = 0                                                        # length of prefix currently in the caches
     _t_wall = _now(device)
     for b in range(num_blocks):
         bs = first_block_start + b * block_length
         be = bs + block_length
         if cached:
-            decode_block_dbet_cached(
-                model, x, bs, be, heavy_threshold, draft_threshold,
-                max_iter_per_block, tau, stats, heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
+            heavy_cache, draft_cache, settled = decode_block_dbet_cached(
+                model, x, bs, be, settled, heavy_cache, draft_cache, block_length,
+                heavy_threshold, draft_threshold, max_iter_per_block, tau, stats,
+                heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
                 draft_tau=draft_tau, draft_top_k=draft_top_k,
                 draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
         else:

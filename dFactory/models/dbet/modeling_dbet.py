@@ -322,6 +322,17 @@ class DbetAttention(nn.Module):
         attn = attn.transpose(1, 2).reshape(b, c, -1)
         return self.dense(attn)
 
+    @torch.no_grad()
+    def cache_prefix(self, prefix_feat, cos, sin, past_key_values):
+        """Incrementally APPEND a settled-prefix chunk's K/V to the cross-block prefix cache. `prefix_feat`
+        [B,n,d] = the PrefixFuse feature for the chunk; `cos`/`sin` [B,n,rope] its rope at its TRUE absolute
+        positions. Mirrors the `prefix_kv` branch of `forward` (project -> key-LN -> rope k), but appends a chunk
+        at arbitrary positions so blocks are added one at a time as they settle. v is stored raw (as in forward)."""
+        _, k_pre, v_pre = self._project(prefix_feat)
+        k_pre = self.key_layernorm(k_pre)
+        k_pre = _apply_rope_single(k_pre, cos, sin)
+        past_key_values.update(k_pre, v_pre, self.layer_idx)
+
 
 class DbetDecoderLayer(nn.Module):
     """One draft layer (LLaDA-2.0 pre-norm block): residual + DbetAttention, residual + SwiGLU MLP. The MLP
@@ -466,6 +477,18 @@ class DbetDraftStack(nn.Module):
         conf = self.conf_head(hb) if self.conf_head is not None else None
         return {"logits": logits, "conf": conf, "h_draft": h_draft, "delta": h_draft - h_last_denoise}
 
+    @torch.no_grad()
+    def extend_prefix_cache(self, h_sel_delta, position_ids, past_key_values):
+        """Cross-block prefix-KV cache: fuse a newly-SETTLED prefix chunk (its `h_sel` at absolute
+        `position_ids`) and APPEND its per-layer K/V to `past_key_values`. PrefixFuse + the per-layer projection /
+        key-LN / rope are all POSITION-WISE, so fusing the chunk == fusing the whole prefix and slicing -> the
+        incremental cache is exact (bit-identical, no non-associativity). Call once per block with the block that
+        just settled, BEFORE that block's draft rounds. h_sel_delta [B,n,m*D]; position_ids [B,n]."""
+        f_pre = self.prefix_fuse(h_sel_delta)                        # tuple L x [B,n,d] (or shared feature)
+        cos, sin = self.rotary_emb(h_sel_delta, position_ids)        # rope at the chunk's TRUE absolute positions
+        for i, layer in enumerate(self.layers):
+            layer.attention.cache_prefix(f_pre[i], cos, sin, past_key_values)
+
 
 # ======================================================================================
 # Top-level — frozen heavy + drafter
@@ -579,6 +602,13 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
             "prefix_idx": prefix_idx, "canvas_idx": canvas_idx,
             "past_key_values": out.past_key_values if use_cache else None,
         }
+
+    # ---- cross-block prefix-KV cache growth (decode) ----
+    @torch.no_grad()
+    def extend_draft_prefix_cache(self, h_sel_delta, position_ids, past_key_values):
+        """Grow the drafter's cross-block prefix-KV cache by one just-settled block (see
+        `DbetDraftStack.extend_prefix_cache`). Thin wrapper so the decode loop stays out of the model internals."""
+        self.draft.extend_prefix_cache(h_sel_delta, position_ids, past_key_values)
 
     # ---- one draft forward ----
     def draft_forward(
