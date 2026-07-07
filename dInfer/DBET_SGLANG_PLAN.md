@@ -1,6 +1,9 @@
 # DBet × SGLang — batched inference plan
 
-**Status:** planning (2026-07-07). **Owner:** nick + Claude. **Goal:** get DBet's drafter-offload speedup
+**Status:** G1 ✅ + G2 ✅ DONE (2026-07-07) — sglang-DBet runs end-to-end and is ISO-ACCURATE (GSM8K n=100 = 89.0%
+vs eager-DBet 89.99%). Files: `decoding/generate_dbet_sglang.py`, `evaluations/eval_dbet_sglang_gsm8k.py`,
+`decoding/dbet_sglang_features.py` (tap), `load_drafter_standalone`. **NEXT = BATCHING** (the actual speedup;
+batch=1 has no win yet) → lm-eval → CUDA-graph tap. **Owner:** nick + Claude. **Goal:** get DBet's drafter-offload speedup
 to actually materialize by moving the heavy into **batched, compute-bound** serving (SGLang), since batch=1
 decode is memory-bandwidth-bound and neither the KV-cache nor the drafter offload converts to wall-clock there.
 
