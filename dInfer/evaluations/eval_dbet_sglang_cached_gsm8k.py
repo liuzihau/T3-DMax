@@ -59,9 +59,12 @@ def build(heavy_path, sel_default, max_length, use_cuda_graph, master_port="2352
     model = LLaDA2SGLangLM(config=model_config, expert_map_path=".").eval()
     model.load_weights(heavy_path, device=device)
     model = model.to(device)
+    sel = list(getattr(model_config, "sel_layers_list", sel_default))
+    # CRITICAL: enable the buffer tap BEFORE the ModelRunner captures the CUDA graph in its ctor -- else the graph
+    # has no copy_ ops and the buffer is never refreshed on replay (drafter reads stale h_sel).
+    model.model.enable_dbet_tap(sel, max_bs=1, max_len=256)
     runner = ModelRunner(model, device, enable_cuda_graph=use_cuda_graph, server_args=server_args,
                          max_length=max_length)
-    sel = list(getattr(model_config, "sel_layers_list", sel_default))
     return runner, sel, server_args, device
 
 

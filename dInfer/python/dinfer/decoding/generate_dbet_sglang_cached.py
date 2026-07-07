@@ -116,8 +116,11 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
         heavy_model = model.model.model
         # buffer covers a block forward (<= 2*block_length on cross-block); the long prompt prefill exceeds it and is
-        # skipped by the model's copy_ guard (we only need per-block features, never prefill).
-        heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
+        # skipped by the model's copy_ guard (we only need per-block features, never prefill). MUST be enabled BEFORE
+        # the runner captures its CUDA graph -> the driver enables it pre-ModelRunner; skip re-alloc if already on
+        # (re-allocating would orphan the buffers the graph captured).
+        if heavy_model._dbet is None:
+            heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix)
