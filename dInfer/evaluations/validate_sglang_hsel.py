@@ -126,10 +126,11 @@ def run_sglang(args):
     # cuda graph OFF so the tap hooks fire on our forward
     runner = ModelRunner(model, device, enable_cuda_graph=False, server_args=server_args, max_length=512)
 
-    DT = getattr(torch, args.dtype)
-    runner.model.to(DT)
-    if args.exact_moe:
-        exact_moe_patch(runner.model)
+    # DO NOT blanket-cast the model: it is already bf16 (set_default_dtype above), and .to(bf16) would also cast
+    # the rope cos_sin_cache to bf16 — the sgl_kernel rope requires it FLOAT32 ("cos_sin_cache should be float32").
+    # fp32 is unsupported by the sglang kernels (rope/MoE), so we validate in bf16 as-loaded.
+    if args.dtype != "bfloat16":
+        raise SystemExit("sglang model is bf16-only (custom kernels reject fp32); use --dtype bfloat16.")
     num_layers = len(runner.model.model.layers)                     # <-- reconcile if the handle differs
     sel = list(model_config.sel_layers_list) if hasattr(model_config, "sel_layers_list") else [1, 10, 19]
     tap = HeavyFeatureTap(runner.model.model.layers, sel_layers=sel, num_layers=num_layers)
