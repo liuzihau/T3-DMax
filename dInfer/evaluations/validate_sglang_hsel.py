@@ -99,9 +99,12 @@ def run_sglang(args):
     from sglang.srt import distributed
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     from sglang.srt.layers.moe import initialize_moe_config
-    from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
     from dinfer.decoding.diffusion_runner import ModelRunner
     from dinfer.decoding.dbet_sglang_features import HeavyFeatureTap
+    if args.buffer_tap:   # Phase-3 graph-safe tap: the model COPY that writes h_sel to buffers in forward()
+        from dinfer.model.modeling_llada2_moe_sglang_dbet import LLaDA2SGLangLM
+    else:
+        from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
@@ -123,8 +126,9 @@ def run_sglang(args):
     model = LLaDA2SGLangLM(config=model_config, expert_map_path=".").eval()
     model.load_weights(args.heavy_path, device=device)
     model = model.to(device)
-    # cuda graph OFF so the tap hooks fire on our forward
-    runner = ModelRunner(model, device, enable_cuda_graph=False, server_args=server_args, max_length=512)
+    # hooks need graphs OFF; the buffer tap (copy_ in forward) SURVIVES graph replay -> allow --cuda_graph with it
+    use_graph = args.cuda_graph and args.buffer_tap
+    runner = ModelRunner(model, device, enable_cuda_graph=use_graph, server_args=server_args, max_length=512)
 
     # DO NOT blanket-cast the model: it is already bf16 (set_default_dtype above), and .to(bf16) would also cast
     # the rope cos_sin_cache to bf16 — the sgl_kernel rope requires it FLOAT32 ("cos_sin_cache should be float32").
@@ -133,17 +137,25 @@ def run_sglang(args):
         raise SystemExit("sglang model is bf16-only (custom kernels reject fp32); use --dtype bfloat16.")
     num_layers = len(runner.model.model.layers)                     # <-- reconcile if the handle differs
     sel = list(model_config.sel_layers_list) if hasattr(model_config, "sel_layers_list") else [1, 10, 19]
-    # h_last must be POST-final-norm (eager appends self.norm(...) as hidden_states[-1]) -> hook runner.model.model.norm
-    tap = HeavyFeatureTap(runner.model.model.layers, sel_layers=sel, num_layers=num_layers,
-                          final_norm=runner.model.model.norm)
-
     tokenizer = AutoTokenizer.from_pretrained(args.heavy_path, trust_remote_code=True)
     x, P, be = build_block0_input(tokenizer, device)
     attn = block_causal_bool(be, device)
     pos = torch.arange(be, device=device).unsqueeze(0)
-    with torch.no_grad():
-        out = runner.forward(input_ids=x, position_ids=pos, attention_mask=attn, use_cache=False)
-    h_sel, h_last = tap.pop()
+
+    if args.buffer_tap:
+        runner.model.model.enable_dbet_tap(sel, max_bs=1, max_len=max(be, 512))
+        with torch.no_grad():
+            out = runner.forward(input_ids=x, position_ids=pos, attention_mask=attn, use_cache=False)
+        h_sel, h_last = runner.model.model.pop_dbet_features(1, be)
+        print(f"[buffer_tap] cuda_graph={use_graph} — h_sel from graph-safe buffers")
+    else:
+        # h_last must be POST-final-norm (eager appends self.norm(...)) -> hook runner.model.model.norm
+        tap = HeavyFeatureTap(runner.model.model.layers, sel_layers=sel, num_layers=num_layers,
+                              final_norm=runner.model.model.norm)
+        with torch.no_grad():
+            out = runner.forward(input_ids=x, position_ids=pos, attention_mask=attn, use_cache=False)
+        h_sel, h_last = tap.pop()
+        tap.remove()
     # diffusion_runner.ModelRunner.forward -> LLaDA2SGLangLM.forward -> MoeCausalLMOutputWithPast(.logits)
     logits = getattr(out, "logits", None)
     if logits is None:
@@ -154,7 +166,6 @@ def run_sglang(args):
                 "h_sel": h_sel.float().cpu(), "h_last": h_last.float().cpu(),
                 "logits": None if logits is None else logits.float().cpu()}, args.dump)
     print(f"[sglang] dumped h_sel{tuple(h_sel.shape)} h_last{tuple(h_last.shape)} -> {args.dump}")
-    tap.remove()
 
 
 # ======================================================================================
@@ -247,6 +258,10 @@ def main():
     p.add_argument("--dump", default="/tmp/g1_hsel.pt")
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     p.add_argument("--exact_moe", action="store_true")
+    p.add_argument("--buffer_tap", action="store_true",
+                   help="Phase-3: use the graph-safe buffer tap (modeling_llada2_moe_sglang_dbet) instead of hooks")
+    p.add_argument("--cuda_graph", action="store_true",
+                   help="with --buffer_tap: enable CUDA graphs (buffer copy_ survives replay; hooks would not)")
     args = p.parse_args()
     if args.mode == "sglang":
         run_sglang(args)
