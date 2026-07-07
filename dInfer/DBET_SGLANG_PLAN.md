@@ -76,6 +76,22 @@ features (batched [B, blk, *], per-seq conf-gated commits) → update block stat
 Note on "so many features": volume is NOT the problem — `logits` (150k×blk) already moves; `h_sel` is 3·D (a few
 MB/step). G1 is *plumbing to expose intermediate layers*, not bandwidth.
 
+### G1 — STARTED (2026-07-07): `decoding/dbet_sglang_features.py::HeavyFeatureTap`
+**Approach = forward hooks, NO model-file surgery.** The sglang heavy carries a SPLIT residual stream
+(`hidden_states`, `residual`; folded in `layer_communicator.prepare_attn`, modeling_llada2_moe_sglang.py:990).
+The eager hidden the drafter was trained on (`extract_heavy_signals` → `out.hidden_states[k]`) = the fully-added
+hidden, which at a layer boundary is **`hidden + residual`**. A forward hook on sglang layer `i` gets output
+`(hidden, residual, kv)`, so **`(out[0]+out[1]) == eager hidden_states[i+1]`**. ⇒ hook sglang layers `{k-1 : k in
+sel_layers}` for h_sel and the LAST layer for h_last (`hs[num_layers]`, pre-final-norm). Hidden is `[B, seq, D]`
+(this dInfer adaptation keeps 3-D, not SGLang's flat packing), so `h_sel = cat(sel, dim=-1)` is `[B, seq, m·D]`.
+Hooks fire in eager only → **CUDA graphs OFF** (Phase 3 = graph-captured buffers). Wire: build the tap on the
+heavy's decoder-layer ModuleList (`runner.model.model.layers` or wherever it resolves), `tap.pop()` after each
+`model_runner.forward`.
+**NEXT (the G1 gate): VALIDATE the tap == eager.** Two-process compare (avoids a double 16B load): (1) eager
+`extract_heavy_signals` on a fixed `[0,be)` block → dump `h_sel/h_last`+input; (2) sglang forward + tap on the
+same input → compare (fp32 ~1e-4; bf16 within rounding). A structural mismatch = wrong residual point. Do NOT
+build G2/G3 until this passes.
+
 ---
 
 ## 5. Phased plan
