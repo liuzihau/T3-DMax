@@ -35,27 +35,39 @@ class HeavyFeatureTap:
     `decoder_layers` = the heavy's decoder-layer ModuleList (e.g. runner.model.model.layers). Each layer's
     forward must return a tuple whose first two elements are (hidden_states, residual)."""
 
-    def __init__(self, decoder_layers, sel_layers, num_layers):
-        self.sel_layers = list(sel_layers)                  # eager hs indices, e.g. [1, 10, 19]
-        self.h_last_hs = num_layers                         # eager hs index of h_last (pre final-norm)
+    def __init__(self, decoder_layers, sel_layers, num_layers, final_norm=None):
+        self.sel_layers = list(sel_layers)                  # eager hs indices, e.g. [1, 10, 19] (intermediate, pre-norm)
+        self.h_last_hs = num_layers                         # eager hs index of h_last
         self._buf = {}                                      # {eager_hs_index: [B, seq, D]}
         self._handles = []
-        # sglang layer i -> eager hs index (i+1). Capture at layers {k-1} for sel k, and the last layer.
+        # h_sel: hook sglang layer (k-1) -> (hidden+residual) == eager hidden_states[k] (pre-norm intermediate)
         want = {k - 1: k for k in self.sel_layers}
-        want[num_layers - 1] = num_layers                   # last decoder layer -> hs[num_layers] = h_last
         for i, layer in enumerate(decoder_layers):
             if i in want:
-                self._handles.append(layer.register_forward_hook(self._make_hook(want[i])))
-        missing = [k for k in (self.sel_layers + [self.h_last_hs]) if (k - 1) not in range(num_layers)]
+                self._handles.append(layer.register_forward_hook(self._make_hidden_hook(want[i])))
+        # h_last: eager `hidden_states[-1]` is POST-final-norm (the eager model applies self.norm THEN appends).
+        # So hook the final-norm OUTPUT, not the last decoder layer (which is pre-norm -> would blow up rel-Δ).
+        if final_norm is not None:
+            self._handles.append(final_norm.register_forward_hook(self._make_norm_hook(self.h_last_hs)))
+        else:  # fallback: pre-norm last-layer hidden (ONLY correct if the eager h_last is pre-norm)
+            self._handles.append(decoder_layers[num_layers - 1].register_forward_hook(
+                self._make_hidden_hook(self.h_last_hs)))
+        missing = [k for k in self.sel_layers if (k - 1) not in range(num_layers)]
         if missing:
-            raise ValueError(f"sel/h_last indices {missing} out of range for num_layers={num_layers}")
+            raise ValueError(f"sel indices {missing} out of range for num_layers={num_layers}")
 
-    def _make_hook(self, hs_index):
+    def _make_hidden_hook(self, hs_index):
         def hook(_module, _inp, out):
-            # out = (hidden_states, residual, present_key_values); eager hs = hidden + residual
+            # decoder-layer out = (hidden_states, residual, present_kv); eager hs = hidden + residual
             h = out[0]
-            r = out[1] if len(out) > 1 else None
+            r = out[1] if isinstance(out, tuple) and len(out) > 1 else None
             self._buf[hs_index] = (h + r if r is not None else h).detach()
+        return hook
+
+    def _make_norm_hook(self, hs_index):
+        def hook(_module, _inp, out):
+            # final-norm out = post-norm hidden ([B,seq,D] tensor, or a (hidden, ...) tuple)
+            self._buf[hs_index] = (out[0] if isinstance(out, tuple) else out).detach()
         return hook
 
     def pop(self):

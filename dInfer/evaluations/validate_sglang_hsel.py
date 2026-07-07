@@ -133,7 +133,9 @@ def run_sglang(args):
         raise SystemExit("sglang model is bf16-only (custom kernels reject fp32); use --dtype bfloat16.")
     num_layers = len(runner.model.model.layers)                     # <-- reconcile if the handle differs
     sel = list(model_config.sel_layers_list) if hasattr(model_config, "sel_layers_list") else [1, 10, 19]
-    tap = HeavyFeatureTap(runner.model.model.layers, sel_layers=sel, num_layers=num_layers)
+    # h_last must be POST-final-norm (eager appends self.norm(...) as hidden_states[-1]) -> hook runner.model.model.norm
+    tap = HeavyFeatureTap(runner.model.model.layers, sel_layers=sel, num_layers=num_layers,
+                          final_norm=runner.model.model.norm)
 
     tokenizer = AutoTokenizer.from_pretrained(args.heavy_path, trust_remote_code=True)
     x, P, be = build_block0_input(tokenizer, device)
@@ -142,9 +144,12 @@ def run_sglang(args):
     with torch.no_grad():
         out = runner.forward(input_ids=x, position_ids=pos, attention_mask=attn, use_cache=False)
     h_sel, h_last = tap.pop()
-    logits = getattr(out, "full_logits", None)
+    # diffusion_runner.ModelRunner.forward -> LLaDA2SGLangLM.forward -> MoeCausalLMOutputWithPast(.logits)
+    logits = getattr(out, "logits", None)
+    if logits is None:
+        logits = getattr(out, "full_logits", None)
     if logits is not None:
-        logits = logits.view(1, be, -1)
+        logits = logits.reshape(1, be, -1)
     torch.save({"x": x.cpu(), "P": P, "be": be, "sel": sel, "num_layers": num_layers,
                 "h_sel": h_sel.float().cpu(), "h_last": h_last.float().cpu(),
                 "logits": None if logits is None else logits.float().cpu()}, args.dump)
@@ -195,14 +200,18 @@ def run_eager(args):
         print(f"  logits       max|Δ|={mx:.4f} mean|Δ|={mn:.5f} rel={r:.4f}  ARGMAX_MATCH={argm:.4f}")
 
     _, _, r0 = rel(e_hsel[..., :D], s_hsel[..., :D])
-    ok = (argm == argm and argm > 0.95) or (r0 < 0.25)
-    print(f"\nVERDICT: {'STRUCTURAL PASS' if ok else 'STRUCTURAL FAIL'} — "
-          + ("logits argmax agree and/or earliest h_sel rel-Δ is rounding-scale => same computation, build G2."
-             if ok else
-             "logits argmax disagree AND earliest h_sel rel-Δ large => wrong capture point / model mismatch."))
-    print("  (bf16 across two implementations: judge by ARGMAX_MATCH (should be ~1.0) + hs%d rel-Δ (rounding),"
-          " NOT absolute Δ — 20 layers of bf16 compound. The definitive test remains end-to-end drafter accuracy.)"
-          % sel[0])
+    _, _, hlast_r = rel(e_hlast, s_hlast)
+    have_logits = argm == argm
+    if have_logits:
+        ok = argm > 0.98 and hlast_r < 0.3
+        basis = f"ARGMAX_MATCH={argm:.3f} (want >0.98) AND h_last rel={hlast_r:.2f} (want <0.3)"
+    else:
+        ok = r0 < 0.2 and hlast_r < 0.3
+        basis = f"(no logits) hs{sel[0]} rel={r0:.3f} AND h_last rel={hlast_r:.2f}"
+    print(f"\nVERDICT: {'STRUCTURAL PASS' if ok else 'NEEDS REVIEW'} — {basis}")
+    print("  Decisive signal = logits ARGMAX_MATCH (the two heavies compute the same fn). The h_sel INTERMEDIATE")
+    print("  rel-Δ grows with depth (bf16 x two implementations); whether the drafter TOLERATES it is the")
+    print("  end-to-end G2 accuracy test, NOT this isolated compare.")
 
 
 def main():
