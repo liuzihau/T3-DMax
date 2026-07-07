@@ -4,15 +4,18 @@ the DBet drafter was trained on. If this passes, the sglang heavy is feature-com
 if it fails structurally, the drafter would get out-of-distribution features (stop and fix / retrain).
 
 Two modes, run as SEPARATE processes (avoids a double 16B load); they share one controlled block-0 forward
-via a dumped tensor file:
-  1) python evaluations/validate_sglang_hsel.py --mode sglang --heavy_path <DMax> --dump /tmp/g1.pt \
-         [--dtype float32 --exact_moe]
-  2) python evaluations/validate_sglang_hsel.py --mode eager  --heavy_path <DMax> --drafter_path <hf_ckpt> \
-         --dump /tmp/g1.pt [--dtype float32 --exact_moe]
+via a dumped tensor file. **The sglang model is bf16-only** (its rope / fused-MoE / attention are custom
+half-precision CUDA kernels — fp32 dispatch fails), so validate in bf16:
+  1) SGLANG env:  python evaluations/validate_sglang_hsel.py --mode sglang --heavy_path <ORIGINAL per-expert DMax> \
+         --dump /tmp/g1.pt --dtype bfloat16
+  2) dFactory env: python evaluations/validate_sglang_hsel.py --mode eager --heavy_path <merged DMax> \
+         --drafter_path <hf_ckpt> --dump /tmp/g1.pt --dtype bfloat16
 
-Run BOTH fp32 + --exact_moe (the fused MoE kernel asserts bf16; exact_moe swaps in a row-independent eager
-path) -> a STRUCTURAL match is max|Δ| ~1e-4. In bf16 expect ~0.1 rounding (still fine); a structural bug shows
-as Δ on the order of the hidden magnitude (>>1) and/or low logits-argmax agreement.
+Reading it: across two *different* implementations in bf16, absolute Δ compounds over 20 layers, so judge by
+**logits ARGMAX_MATCH (~1.0 = same computation)** and the **earliest sel layer's relative Δ** (rounding-scale =
+capture point correct), NOT absolute Δ. A structural bug = argmax disagreement + large earliest-layer rel-Δ.
+The definitive test remains end-to-end drafter accuracy (G2). `--heavy_path` for --mode sglang must be the
+ORIGINAL per-expert checkpoint (the sglang loader fuses experts itself; the merged ckpt fails to parse).
 
 NOTE: the --mode sglang setup mirrors evaluations/eval_dinfer_sglang.py (distributed/ServerArgs/ModelRunner).
 Reconcile with your working eval if the sglang API differs on your box; the eager side + the compare protocol
@@ -168,23 +171,37 @@ def run_eager(args):
 
     s_hsel = d["h_sel"].to(device); s_hlast = d["h_last"].to(device)
 
-    def rep(name, a, b):
+    def rel(a, b):
+        """(max|Δ|, mean|Δ|, mean|Δ| / mean|a|) — the relative ratio is the bf16-robust structural signal."""
         dd = (a - b).abs()
-        am = (a.argmax(-1) == b.argmax(-1)).float().mean().item() if a.dim() == 3 and a.shape[-1] > 64 else float("nan")
-        print(f"  {name:12s} shape={tuple(a.shape)} max|Δ|={dd.max().item():.6f} mean|Δ|={dd.mean().item():.7f}"
-              + (f" argmax_match={am:.4f}" if am == am else ""))
+        scale = a.abs().mean().item() + 1e-9
+        return dd.max().item(), dd.mean().item(), dd.mean().item() / scale
 
-    print(f"[eager vs sglang]  dtype={args.dtype} exact_moe={args.exact_moe}  sel_layers={sel}")
-    rep("h_sel", e_hsel, s_hsel)
-    rep("h_last", e_hlast, s_hlast)
+    print(f"[eager vs sglang]  dtype={args.dtype}  sel_layers={sel}  (sglang is bf16-only: fp32 unsupported)")
+    # per-sel-layer h_sel: split [B,seq,m*D] into the m sel layers; hs[sel[0]] has the LEAST bf16 compounding,
+    # so it's the cleanest test that the (hidden+residual) capture point is structurally correct.
+    D = e_hlast.shape[-1]; m = e_hsel.shape[-1] // D
+    for j in range(m):
+        mx, mn, r = rel(e_hsel[..., j * D:(j + 1) * D], s_hsel[..., j * D:(j + 1) * D])
+        tag = "  <== structural (earliest)" if j == 0 else ""
+        print(f"  h_sel[hs{sel[j]:>2}]  max|Δ|={mx:.4f} mean|Δ|={mn:.5f} rel={r:.4f}{tag}")
+    mx, mn, r = rel(e_hlast, s_hlast); print(f"  h_last       max|Δ|={mx:.4f} mean|Δ|={mn:.5f} rel={r:.4f}")
+    argm = float("nan")
     if d["logits"] is not None:
-        rep("logits", e_logits, d["logits"].to(device))
-    mx = (e_hsel - s_hsel).abs().max().item()
-    hid_scale = e_hsel.abs().mean().item()
-    print(f"\nVERDICT: h_sel max|Δ|={mx:.4f} vs hidden-scale {hid_scale:.3f}. "
-          + ("STRUCTURAL PASS (Δ<<scale => rounding; build G2)." if mx < max(0.5, 5 * hid_scale * 1e-2)
-             else "STRUCTURAL FAIL (Δ ~ hidden scale => wrong capture point / model mismatch). Investigate."))
-    print("  (fp32+exact_moe should be ~1e-4; bf16 ~0.1 = rounding, still a pass; only Δ~hidden-scale is a bug.)")
+        s_log = d["logits"].to(device)
+        mx, mn, r = rel(e_logits, s_log)
+        argm = (e_logits.argmax(-1) == s_log.argmax(-1)).float().mean().item()
+        print(f"  logits       max|Δ|={mx:.4f} mean|Δ|={mn:.5f} rel={r:.4f}  ARGMAX_MATCH={argm:.4f}")
+
+    _, _, r0 = rel(e_hsel[..., :D], s_hsel[..., :D])
+    ok = (argm == argm and argm > 0.95) or (r0 < 0.25)
+    print(f"\nVERDICT: {'STRUCTURAL PASS' if ok else 'STRUCTURAL FAIL'} — "
+          + ("logits argmax agree and/or earliest h_sel rel-Δ is rounding-scale => same computation, build G2."
+             if ok else
+             "logits argmax disagree AND earliest h_sel rel-Δ large => wrong capture point / model mismatch."))
+    print("  (bf16 across two implementations: judge by ARGMAX_MATCH (should be ~1.0) + hs%d rel-Δ (rounding),"
+          " NOT absolute Δ — 20 layers of bf16 compound. The definitive test remains end-to-end drafter accuracy.)"
+          % sel[0])
 
 
 def main():
