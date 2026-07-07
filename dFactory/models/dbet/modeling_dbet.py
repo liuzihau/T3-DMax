@@ -215,7 +215,8 @@ class HeavyModelConditioning(nn.Module):
     def __init__(self, config: DbetConfig):
         super().__init__()
         self.soft_embed = SoftEmbed(config)
-        self.denoise_fuse = HiddenFuse(config)
+        # per_layer_denoise_fuse: the canvas h_sel is injected PER-LAYER (in DbetDraftStack), not fused here at input
+        self.denoise_fuse = None if config.per_layer_denoise_fuse else HiddenFuse(config)
         d, D = config.resolved_draft_hidden_size, config.hidden_size
         self.input_proj = nn.Linear(D, d, bias=False) if d != D else None
         self.post_norm = LLaDA2MoeRMSNorm(d, eps=config.rms_norm_eps)
@@ -237,8 +238,9 @@ class HeavyModelConditioning(nn.Module):
             mask = denoise_mask.to(s.dtype)
             mask = mask[:, None, None] if mask.dim() == 1 else mask[..., None]
             s = s * mask
-        f_dn = self.denoise_fuse(h_sel_denoise)                       # [B,C,d]
-        return self.post_norm(e + s + f_dn)
+        if self.denoise_fuse is not None:                            # old path: fuse the canvas h_sel at the input
+            return self.post_norm(e + s + self.denoise_fuse(h_sel_denoise))
+        return self.post_norm(e + s)                                 # per-layer path: denoise injected in the stack
 
 
 # ======================================================================================
@@ -455,6 +457,15 @@ class DbetDraftStack(nn.Module):
         object.__setattr__(self, "frozen_final_norm", frozen_final_norm)
         self.conditioning = HeavyModelConditioning(config)
         self.prefix_fuse = PrefixFuse(config)   # one shared trunk -> L per-layer features (or 1 shared)
+        # per_layer_denoise_fuse: fuse the canvas h_sel S->L*d (PrefixFuse-style) + inject per layer via
+        # RMSNorm(x + f_dn[l]) (same combine as the input conditioning, applied at every layer). New params.
+        if config.per_layer_denoise_fuse:
+            self.denoise_layer_fuse = PrefixFuse(config)             # -> tuple of L x [B,C,d]
+            self.denoise_combine_norms = nn.ModuleList(
+                [LLaDA2MoeRMSNorm(config.resolved_draft_hidden_size, eps=config.rms_norm_eps)
+                 for _ in range(config.draft_num_layers)])
+        else:
+            self.denoise_layer_fuse = None
         self.rotary_emb = LLaDA2MoeRotaryEmbedding(config)
         self.layers = nn.ModuleList([_make_decoder_layer(config, i) for i in range(config.draft_num_layers)])
         self.norm = LLaDA2MoeRMSNorm(config.resolved_draft_hidden_size, eps=config.rms_norm_eps)
@@ -492,7 +503,10 @@ class DbetDraftStack(nn.Module):
         cos, sin = self.rotary_emb(x, position_ids)                       # [B, P+C, rope_dim], computed ONCE
 
         f_pre = self.prefix_fuse(h_sel_prefix) if h_sel_prefix is not None else None  # tuple of L × [B,P,d] | None
+        f_dn = self.denoise_layer_fuse(h_sel_denoise) if self.denoise_layer_fuse is not None else None  # L × [B,C,d]
         for i, layer in enumerate(self.layers):
+            if f_dn is not None:                                     # per-layer canvas h_sel: RMSNorm(x + f_dn[l])
+                x = self.denoise_combine_norms[i](x + f_dn[i])
             pk = None if f_pre is None else f_pre[i]
             x = layer(x, pk, cos, sin, attention_mask, past_key_values)
 

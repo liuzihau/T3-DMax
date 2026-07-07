@@ -50,6 +50,9 @@ def main():
     p.add_argument("--draft_num_layers", type=int, default=5)
     p.add_argument("--sel_layers", default="1,10,19")
     p.add_argument("--per_layer_prefix_fuse", action="store_true", default=True)
+    p.add_argument("--per_layer_denoise_fuse", action="store_true", default=False,
+                   help="NEW arch: inject the canvas h_sel PER-LAYER (S->L*d fuse + RMSNorm(x+f_dn[l])) instead of a "
+                        "single input-level DenoiseFuse. Requires retraining.")
     p.add_argument("--draft_ckpt", default=None,
                    help="dir with a TRAINED drafter (drafter-only hf_ckpt safetensors). If given, load draft.* "
                         "from it instead of warm-starting (use this to assemble the init for the heavy fine-tune).")
@@ -72,6 +75,7 @@ def main():
         **hd,
         draft_num_layers=args.draft_num_layers, sel_layers=args.sel_layers,
         per_layer_prefix_fuse=args.per_layer_prefix_fuse,
+        per_layer_denoise_fuse=args.per_layer_denoise_fuse,
         warmstart_from_heavy_bottom=False,          # we warm-start MANUALLY below; saved config stays False so
         heavy_path=args.heavy_path,                  # the trainer doesn't re-warmstart on meta at load time
     )

@@ -36,6 +36,8 @@ class DbetConfig(LLaDA2MoeConfig):
         sel_layers: str = "1,10,19",           # comma-sep heavy layer indices read by the fuses (m = count); shallow->deep
         per_layer_prefix_fuse: bool = True,    # prefix fuse: True = 1 shared trunk -> L per-layer heads (~Lx cheaper
                                                 #   than L independent fuses); False = 1 shared feature (DFlash)
+        per_layer_denoise_fuse: bool = False,  # canvas h_sel injection: False = single DenoiseFuse at the input (old);
+                                                #   True = PrefixFuse-style S->L*d, injected per-layer via RMSNorm(x + f_dn[l])
         # === Gated-MLP widths (every learned projection is a DbetGatedMLP) ===
         fuse_hidden_size: int = -1,            # intermediate width of the fuse + soft-embed MLPs; -1 -> draft_hidden_size
         head_intermediate_size: int = -1,      # intermediate width of the Δh + confidence head MLPs; -1 -> draft_intermediate_size
@@ -67,6 +69,7 @@ class DbetConfig(LLaDA2MoeConfig):
         self.position_embedding_type = str(position_embedding_type)
         self.sel_layers = sel_layers
         self.per_layer_prefix_fuse = bool(per_layer_prefix_fuse)
+        self.per_layer_denoise_fuse = bool(per_layer_denoise_fuse)
         self.fuse_hidden_size = int(fuse_hidden_size)
         self.head_intermediate_size = int(head_intermediate_size)
         self.soft_embed_temp = float(soft_embed_temp)
