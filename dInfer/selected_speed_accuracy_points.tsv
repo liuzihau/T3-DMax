@@ -1,0 +1,7 @@
+report	h	heavy_config	heavy_tok_s	heavy_accuracy_pct	draft_config	draft_tok_s	draft_accuracy_pct	speedup_pct	accuracy_drop_points
+No cache	0.9	heavy_h0.9	117.6000	91.3571	dbet_h0.9_d0.9_k3	180.3000	90.5231	53.3163	0.8340
+No cache	0.7	heavy_h0.7	143.9000	90.7506	dbet_h0.7_d0.95_k2	201.2000	89.4617	39.8193	1.2889
+No cache	0.5	heavy_h0.5	182.3000	85.8226	dbet_h0.5_d0.95_k3	216.6000	85.7468	18.8151	0.0758
+With cache	0.9	heavy_h0.9	111.1000	91.3571	dbet_h0.9_d0.9_k3_cache	184.2000	90.9022	65.7966	0.4549
+With cache	0.7	heavy_h0.7	160.6000	90.7506	dbet_h0.7_d0.9_k3_cache	194.7000	89.3859	21.2329	1.3647
+With cache	0.5	heavy_h0.5	187.4000	85.8226	dbet_h0.5_d0.9_k3_cache	212.0000	85.3677	13.1270	0.4549

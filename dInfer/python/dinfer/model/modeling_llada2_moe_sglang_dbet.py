@@ -1147,7 +1147,9 @@ class LLaDA2Model(nn.Module):
             )
             if self._dbet is not None and i in self._dbet["sel_at"]:   # graph-safe h_sel capture (hidden+residual)
                 _bs, _ql = hidden_states.shape[0], hidden_states.shape[1]
-                self._dbet["bufs"][self._dbet["sel_at"][i]][:_bs, :_ql].copy_(hidden_states + residual)
+                _buf = self._dbet["bufs"][self._dbet["sel_at"][i]]
+                if _ql <= _buf.shape[1]:                                # skip forwards bigger than the buffer (prefill)
+                    _buf[:_bs, :_ql].copy_(hidden_states + residual)
             if use_cache:
                 all_present_key_values.extend(present_key_values)
         if not self.pp_group.is_last_rank:
@@ -1165,7 +1167,9 @@ class LLaDA2Model(nn.Module):
                 hidden_states = self.norm(hidden_states)
             if self._dbet is not None:                                # graph-safe h_last capture (POST-final-norm)
                 _bs, _ql = hidden_states.shape[0], hidden_states.shape[1]
-                self._dbet["bufs"][self._dbet["hlast_hs"]][:_bs, :_ql].copy_(hidden_states)
+                _buf = self._dbet["bufs"][self._dbet["hlast_hs"]]
+                if _ql <= _buf.shape[1]:                               # skip forwards bigger than the buffer (prefill)
+                    _buf[:_bs, :_ql].copy_(hidden_states)
             return hidden_states, all_present_key_values
 
 

@@ -52,27 +52,28 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             replace_position, backend, active_index, embeddings, embedding_layer,
             is_cross_block=is_cross_block, block_length=block_length)
 
-        bs, be = block_loc.start, block_loc.end
-        blk = be - bs
+        be = block_loc.end
+        blk = block_length                                # the REAL current block (cross-block passes a 2-block span)
+        cur = be - blk                                    # current-block start (== block_loc.start when not cross)
         B = x.batch_size
-        # 2) pop the block's tapped features. cached forward is block-only -> q_len = blk (cross-block = 2*blk; the
-        #    current block is the LAST blk rows) <-- FLAG: confirm the tap length matches the forward on the box
-        qlen = 2 * blk if is_cross_block else blk
+        # 2) pop the tapped features. The forward spans block_loc.end-block_loc.start (= blk normally, 2*blk on the
+        #    cross-block first step); the CURRENT block is always the LAST blk rows.
+        qlen = be - block_loc.start
         h_sel_all, h_last_all = self.heavy_model.pop_dbet_features(B, qlen)
         h_sel = h_sel_all[:, -blk:]; h_last = h_last_all[:, -blk:]        # current block
         block_logits = output.logits[:, -blk:]                           # [B, blk, V]
 
-        active = active_index if active_index.shape[1] == blk else active_index[:, -blk:]
+        active = active_index[:, -blk:] if active_index.shape[1] != blk else active_index
 
         if bool(Breakflag):
             # block settled -> extend the drafter prefix cache with this block's (settled) h_sel for later blocks
-            pos = torch.arange(bs, be, device=x.device).unsqueeze(0)
+            pos = torch.arange(cur, be, device=x.device).unsqueeze(0)
             self.draft.extend_prefix_cache(h_sel, pos, self.draft_cache)
             self.settled = be
             return output, Breakflag, embeddings
 
-        # 3) DRAFT step (canvas = block, prefix = cross-block draft cache)
-        block_x = x.data[0, bs:be]
+        # 3) DRAFT step (canvas = current block, prefix = cross-block draft cache)
+        block_x = x.data[0, cur:be]
         mask_pos = (block_x == MASK_ID)
         committed_before = active[0] & (~mask_pos)
         draft_ids = x.data[:, bs:be].clone()
@@ -90,7 +91,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             ok = dc[mloc] >= self.draft_threshold
             keep = ~(torch.cumsum((~ok).long(), 0) > 0); keep[0] = True
             sel = mloc[keep]
-            x.data[0, bs + sel] = darg[sel]
+            x.data[0, cur + sel] = darg[sel]
             embeddings[0, sel] = _soft_embed(dlogits[0][sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
             self.draft_commits += int(sel.numel())
         # FIX: override a committed slot iff conf-head >= threshold AND the draft disagrees
@@ -98,7 +99,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             fix = committed_before & (dc >= self.draft_threshold) & (darg != block_x)
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
-                x.data[0, bs + floc] = darg[floc]
+                x.data[0, cur + floc] = darg[floc]
                 embeddings[0, floc] = _soft_embed(dlogits[0][floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
         return output, Breakflag, embeddings
 
@@ -114,7 +115,9 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
         heavy_model = model.model.model
-        heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=max(64, 2 * 32))
+        # buffer covers a block forward (<= 2*block_length on cross-block); the long prompt prefill exceeds it and is
+        # skipped by the model's copy_ guard (we only need per-block features, never prefill).
+        heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix)
