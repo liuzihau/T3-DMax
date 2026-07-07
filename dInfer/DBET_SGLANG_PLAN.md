@@ -87,10 +87,18 @@ sel_layers}` for h_sel and the LAST layer for h_last (`hs[num_layers]`, pre-fina
 Hooks fire in eager only → **CUDA graphs OFF** (Phase 3 = graph-captured buffers). Wire: build the tap on the
 heavy's decoder-layer ModuleList (`runner.model.model.layers` or wherever it resolves), `tap.pop()` after each
 `model_runner.forward`.
-**NEXT (the G1 gate): VALIDATE the tap == eager.** Two-process compare (avoids a double 16B load): (1) eager
-`extract_heavy_signals` on a fixed `[0,be)` block → dump `h_sel/h_last`+input; (2) sglang forward + tap on the
-same input → compare (fp32 ~1e-4; bf16 within rounding). A structural mismatch = wrong residual point. Do NOT
-build G2/G3 until this passes.
+**✅ G1 VALIDATED (2026-07-07, `evaluations/validate_sglang_hsel.py`).** bf16 (sglang kernels reject fp32),
+block-0 forward, sglang `DMax-Math-16B` (per-expert) vs eager `DMax-Math-16B-moe-merge` — SAME math model, both
+sides. Result: `hs1 rel=0.5%` (capture rule correct), `hs10 2.4%`, `hs19 5.2%` (bf16 compounding across two
+impls), `h_last rel=6.2%` (after fixing: h_last = POST-final-norm, hook `model.norm` output not the last layer),
+**logits ARGMAX_MATCH=98.4%** (the heavies compute the same fn). ⇒ the sglang heavy is feature-compatible with the
+eager-trained drafter; the tap is correct.
+**Gotchas hit + fixed (all in validate_sglang_hsel.py / the tap):** sglang env = `conda_env_bucket/dInfer`
+(sglang 0.5.3.post1); use the ORIGINAL per-expert checkpoint (loader fuses experts; merged fails to parse) AND the
+MATH model (base `DMax-16B` ≠ `DMax-Math-16B`); bf16-only (don't `.to(bf16)` — breaks the float32 rope cos_sin_cache);
+logits are `out.logits` not `.full_logits`; h_last is post-final-norm.
+**Residual, NOT yet proven:** whether the drafter DECODES well on ~5%-perturbed h_sel + a 98.4%-agreeing heavy —
+that's the end-to-end **G2** accuracy test (expect a slightly different-but-valid trajectory, cf. the cache saga).
 
 ---
 
