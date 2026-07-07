@@ -91,7 +91,7 @@ def load_drafter_standalone(drafter_path, heavy_path, device="cuda", dtype=torch
     `heavy_path` MUST be the same DMax-Math checkpoint the drafter was trained with (its exact embed/lm_head/norm)."""
     import glob
     import torch.nn as nn
-    from safetensors.torch import load_file
+    from safetensors import safe_open
     from models.dbet.configuration_dbet import DbetConfig
     from models.dbet.modeling_dbet import DbetDraftStack
     from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
@@ -102,14 +102,16 @@ def load_drafter_standalone(drafter_path, heavy_path, device="cuda", dtype=torch
     hcfg = LLaDA2MoeConfig.from_pretrained(heavy_path, trust_remote_code=True)
     V, Dh, eps = hcfg.vocab_size, hcfg.hidden_size, hcfg.rms_norm_eps
 
-    # pull ONLY embed / lm_head / final-norm from the heavy shards (scan until all found; lm_head may be tied)
+    # pull ONLY embed / lm_head / final-norm from the heavy shards (safe_open = lazy, loads just these tensors;
+    # model.norm is in the LAST shard so we may scan all, but only the 3 needed tensors are materialized)
     want = {"model.word_embeddings.weight", "lm_head.weight", "model.norm.weight"}
     got = {}
     for f in sorted(glob.glob(os.path.join(heavy_path, "*.safetensors"))):
-        shard = load_file(f)
-        for k in list(want):
-            if k in shard:
-                got[k] = shard[k]; want.discard(k)
+        with safe_open(f, framework="pt") as sf:
+            keys = set(sf.keys())
+            for k in list(want):
+                if k in keys:
+                    got[k] = sf.get_tensor(k); want.discard(k)
         if not want:
             break
     if "model.word_embeddings.weight" not in got or "model.norm.weight" not in got:
