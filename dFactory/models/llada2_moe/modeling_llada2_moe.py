@@ -52,10 +52,18 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_llada2_moe import LLaDA2MoeConfig
 from transformers.generation.utils import GenerationMixin
-from veomni.ops import causallm_loss_function, fused_moe_forward
-from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils.import_utils import is_liger_kernel_available
-from veomni.utils import logging
+try:
+    from veomni.ops import causallm_loss_function, fused_moe_forward
+    from veomni.distributed.parallel_state import get_parallel_state
+    from veomni.utils.import_utils import is_liger_kernel_available
+    from veomni.utils import logging
+except ImportError:   # veomni absent (e.g. the SGLang inference env): the DRAFTER path never calls the heavy fused
+    causallm_loss_function = fused_moe_forward = None       # MoE / training loss -> stubs; importing the model is fine
+    def get_parallel_state():                               # heavy fused-MoE (expert-parallel) path only
+        raise RuntimeError("veomni.get_parallel_state unavailable (fused heavy MoE not usable without veomni)")
+    def is_liger_kernel_available():                        # module-level gate -> False disables the liger fast path
+        return False
+    from transformers.utils import logging                  # provides .get_logger(__name__)
 
 if is_liger_kernel_available():
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction

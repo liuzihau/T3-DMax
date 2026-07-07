@@ -82,6 +82,64 @@ def load_dbet_model(drafter_path, heavy_path, device="cuda"):
     return model
 
 
+@torch.no_grad()
+def load_drafter_standalone(drafter_path, heavy_path, device="cuda", dtype=torch.bfloat16):
+    """G2 (SGLang) LEAN loader: the trained DBet DRAFTER ONLY — no 16B eager heavy, no veomni/fused-MoE. Builds a
+    `DbetDraftStack` and gives it the heavy's frozen embed / lm_head / final-norm loaded STANDALONE from
+    `heavy_path` (~1GB: word_embeddings + lm_head + model.norm). For running the eager drafter alongside the
+    SGLang heavy. Returns the DbetDraftStack in eval() on `device`/`dtype`.
+    `heavy_path` MUST be the same DMax-Math checkpoint the drafter was trained with (its exact embed/lm_head/norm)."""
+    import glob
+    import torch.nn as nn
+    from safetensors.torch import load_file
+    from models.dbet.configuration_dbet import DbetConfig
+    from models.dbet.modeling_dbet import DbetDraftStack
+    from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
+    from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeRMSNorm
+
+    drafter_path = os.path.abspath(drafter_path); heavy_path = os.path.abspath(heavy_path)
+    cfg = DbetConfig.from_pretrained(drafter_path)
+    hcfg = LLaDA2MoeConfig.from_pretrained(heavy_path, trust_remote_code=True)
+    V, Dh, eps = hcfg.vocab_size, hcfg.hidden_size, hcfg.rms_norm_eps
+
+    # pull ONLY embed / lm_head / final-norm from the heavy shards (scan until all found; lm_head may be tied)
+    want = {"model.word_embeddings.weight", "lm_head.weight", "model.norm.weight"}
+    got = {}
+    for f in sorted(glob.glob(os.path.join(heavy_path, "*.safetensors"))):
+        shard = load_file(f)
+        for k in list(want):
+            if k in shard:
+                got[k] = shard[k]; want.discard(k)
+        if not want:
+            break
+    if "model.word_embeddings.weight" not in got or "model.norm.weight" not in got:
+        raise KeyError(f"{heavy_path}: missing embed/norm weights (found {list(got)})")
+    emb_w = got["model.word_embeddings.weight"]
+    lm_w = got.get("lm_head.weight", emb_w)                          # tied lm_head -> reuse the embedding weight
+
+    embed = nn.Embedding(V, Dh); embed.weight = nn.Parameter(emb_w.clone(), requires_grad=False)
+    lm_head = nn.Linear(Dh, V, bias=False); lm_head.weight = nn.Parameter(lm_w.clone(), requires_grad=False)
+    final_norm = LLaDA2MoeRMSNorm(Dh, eps=eps)
+    final_norm.weight = nn.Parameter(got["model.norm.weight"].clone(), requires_grad=False)
+
+    draft = DbetDraftStack(cfg, embed, lm_head, final_norm)
+    sd = _load_drafter_state_dict(drafter_path)
+    sd = {k[len("draft."):]: v for k, v in sd.items() if k.startswith("draft.")}   # strip the ForDraftDecoding prefix
+    missing, unexpected = draft.load_state_dict(sd, strict=False)
+    drafter_missing = [k for k in missing if "frozen_" not in k]
+    if drafter_missing:
+        print(f"[drafter] WARNING: {len(drafter_missing)} params missing (untrained?): {drafter_missing[:4]}")
+    if unexpected:
+        print(f"[drafter] WARNING: {len(unexpected)} unexpected keys: {unexpected[:4]}")
+    # frozen embed/lm_head/final-norm are PLAIN attrs (object.__setattr__) -> draft.to() won't move them; do it here
+    for mod in (embed, lm_head, final_norm):
+        mod.to(device=device, dtype=dtype)
+    draft.eval().to(device=device, dtype=dtype)
+    print(f"[drafter] standalone: {len(sd)} tensors; embed/lm_head/norm from heavy; sel_layers={cfg.sel_layers_list}; "
+          f"{sum(p.numel() for p in draft.parameters()) / 1e6:.0f}M drafter params")
+    return draft
+
+
 def _load_drafter_state_dict(path):
     """Load the drafter safetensors (single file or sharded) into one dict."""
     from safetensors.torch import load_file

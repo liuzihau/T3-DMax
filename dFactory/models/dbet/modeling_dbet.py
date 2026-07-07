@@ -40,7 +40,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
-from veomni.utils.import_utils import is_liger_kernel_available
+try:
+    from veomni.utils.import_utils import is_liger_kernel_available
+except ImportError:   # veomni absent (SGLang inference env) -> no liger fast path (functionally identical)
+    def is_liger_kernel_available():
+        return False
 
 if is_liger_kernel_available():
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction
