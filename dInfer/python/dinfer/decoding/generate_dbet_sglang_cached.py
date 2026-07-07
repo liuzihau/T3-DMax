@@ -76,7 +76,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         block_x = x.data[0, cur:be]
         mask_pos = (block_x == MASK_ID)
         committed_before = active[0] & (~mask_pos)
-        draft_ids = x.data[:, bs:be].clone()
+        draft_ids = x.data[:, cur:be].clone()
         d = self.draft(input_ids=draft_ids, heavy_logits=block_logits, h_sel_denoise=h_sel, h_last_denoise=h_last,
                        h_sel_prefix=None, past_key_values=self.draft_cache,
                        attention_mask=None, position_ids=None, denoise_mask=None, tau=self.draft_tau)
