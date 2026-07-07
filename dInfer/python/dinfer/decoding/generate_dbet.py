@@ -386,6 +386,63 @@ def decode_block_dbet_cached(model, x, bs, be, settled, heavy_cache, draft_cache
 
 
 @torch.no_grad()
+def decode_block_heavy(model, x, bs, be, attn, threshold, max_iters, stats,
+                       heavy_tau=1.0, heavy_top_k=1):
+    """HEAVY-ONLY block decode = a FAITHFUL mirror of DMax's `ThresholdParallelDecoder.decode_uniform`
+    (parallel_strategy.py:542) + block loop (generate_uniform.py:319), so heavy-only == DMax's algorithm.
+    The selector (`dmax_commit_uniform` == `get_transfer_index_uniform`) and the top-1 soft-embed re-feed
+    already match; this adds the two DMax behaviours the drafter-oriented `decode_block_dbet` intentionally
+    drops (drafter logic there is UNTOUCHED):
+      (1) COMMITTED RE-DECODE: each iter overwrites ALL committed positions with the fresh heavy argmax
+          (`update = high_conf | (active & ~mask)`) -> the heavy self-corrects its own commits.
+      (2) EXIT on the DMax breakflag (`all active max_prob >= 0.9` OR `nothing changed`), running the loop to
+          breakflag rather than to "no mask left" -> includes DMax's post-fill stability forward.
+    No drafter, no KV cache (cache is a separate, algorithm-neutral speed knob)."""
+    device = x.device
+    embed = model.draft.frozen_embed
+    active = (x[0:1, bs:be] == MASK_ID)                          # decode region (all-mask at block start)
+    prefix_embeds = embed(x[:, :bs])
+    block_embeds = embed(x[:, bs:be]).clone()                   # iter input feed (== DMax prev_embeddings)
+    block_logits = None
+
+    it = 0
+    while it < max_iters:
+        inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)
+        _t = _now(device)
+        out = model.heavy_forward(inputs_embeds=inputs_embeds, attention_mask=attn, output_hidden_states=False)
+        block_logits = out.logits[:, bs:be]
+        stats.heavy_time += _now(device) - _t; stats.heavy_forwards += 1
+
+        curr = x[0, bs:be].clone()                              # pre-update block tokens
+        mask_idx = (curr == MASK_ID).unsqueeze(0)              # [1, blk]
+        x0, high_conf_idx, max_probs, _ = dmax_commit_uniform(block_logits, mask_idx, active, threshold)
+        x0b, hci = x0[0], high_conf_idx[0]
+        # DMax: overwrite (newly-high-conf masked | already-committed) with the fresh argmax
+        ui = (hci | (active[0] & (curr != MASK_ID))).nonzero(as_tuple=True)[0]
+        changed_any = bool((x0b[ui] != curr[ui]).any()) if ui.numel() > 0 else False   # BEFORE overwrite
+        if ui.numel() > 0:
+            x[0, bs + ui] = x0b[ui]
+        stats.heavy_commits += int(hci.sum())
+        # DMax breakflag: all active >= 0.9 (empty active -> all()=True) OR nothing changed
+        breakflag = bool((max_probs[0][active[0]] >= 0.9).all()) or (not changed_any)
+        # soft-embed re-feed: committed (active & ~new_mask) -> soft-embed; still-masked -> embed(MASK)
+        new_curr = x[0, bs:be]
+        block_embeds = embed(x[:, bs:be]).clone()
+        soft = (active[0] & (new_curr != MASK_ID)).nonzero(as_tuple=True)[0]
+        if soft.numel() > 0:
+            block_embeds[0, soft] = _soft_embed(block_logits[0, soft], embed, MASK_ID, heavy_tau, heavy_top_k)
+        if breakflag:
+            break
+        it += 1
+
+    # safety: never leave a [MASK] in the output
+    still = (x[0:1, bs:be] == MASK_ID)
+    if still.any() and block_logits is not None:
+        sp = still[0].nonzero(as_tuple=True)[0]
+        x[0, bs + sp] = block_logits[0, sp].argmax(dim=-1)
+
+
+@torch.no_grad()
 def generate_heavy(model, prompt_ids, gen_length, block_length,
                    heavy_threshold=0.9, max_iter_per_block=32, early_stop=True,
                    heavy_tau=1.0, heavy_top_k=1):
@@ -444,11 +501,15 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                 draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
         else:
             attn = build_block_causal_mask(be, block_length, dtype=model.draft.frozen_embed.weight.dtype, device=device)
-            decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
-                              max_iter_per_block, max_draft_iters, tau, stats, use_draft=use_draft,
-                              heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
-                              draft_tau=draft_tau, draft_top_k=draft_top_k,
-                              draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+            if use_draft:
+                decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
+                                  max_iter_per_block, max_draft_iters, tau, stats, use_draft=True,
+                                  heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
+                                  draft_tau=draft_tau, draft_top_k=draft_top_k,
+                                  draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+            else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
+                decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
+                                   heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)
         if early_stop:
             resp_lo = max(P, bs)
             seg = x[0, resp_lo:be]
