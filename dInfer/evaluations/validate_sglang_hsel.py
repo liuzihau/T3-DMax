@@ -213,6 +213,31 @@ def run_eager(args):
     print("  rel-Δ grows with depth (bf16 x two implementations); whether the drafter TOLERATES it is the")
     print("  end-to-end G2 accuracy test, NOT this isolated compare.")
 
+    # ---- G2 PRE-CHECK: does the eager DRAFTER produce the same commits on sglang vs eager features? ----
+    # This is the real G1->G2 risk, tested cheaply (one drafter forward each). Split block-0 into
+    # prefix=[0,fbs) / canvas=[fbs,be); run model.draft on (a) eager feats and (b) sglang feats; compare.
+    if d["logits"] is not None:
+        P = d["P"]; fbs = (P // 32) * 32; x_dev = d["x"].to(device); s_log = d["logits"].to(device)
+
+        def draft_out(hsel, hlast, logits):
+            return model.draft(
+                input_ids=x_dev[:, fbs:be],
+                heavy_logits=logits[:, fbs:be].to(DT),
+                h_sel_denoise=hsel[:, fbs:be].to(DT),
+                h_last_denoise=hlast[:, fbs:be].to(DT),
+                h_sel_prefix=(hsel[:, :fbs].to(DT) if fbs > 0 else None),
+                attention_mask=None, position_ids=None, denoise_mask=None, tau=None)
+
+        with torch.no_grad():
+            de = draft_out(e_hsel, e_hlast, e_logits)
+            ds = draft_out(s_hsel, s_hlast, s_log)
+        da = (de["logits"][0].argmax(-1) == ds["logits"][0].argmax(-1)).float().mean().item()
+        confd = (de["conf"] - ds["conf"]).abs().mean().item() if de["conf"] is not None else float("nan")
+        print(f"\n[G2 PRE-CHECK] eager DRAFTER on eager-feats vs sglang-feats: "
+              f"draft argmax_match={da:.4f}" + (f"  conf mean|Δ|={confd:.4f}" if confd == confd else ""))
+        print("  ~1.0 => drafter tolerates sglang features (same commits) => G2 decode will match => BUILD G2.")
+        print("  low  => drafter is sensitive to the ~5% h_sel shift => retrain drafter on sglang feats / rethink.")
+
 
 def main():
     p = argparse.ArgumentParser()
