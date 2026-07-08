@@ -79,6 +79,10 @@ def main():
     p.add_argument("--gen_length", type=int, default=512)
     p.add_argument("--block_length", type=int, default=32)
     p.add_argument("--heavy_threshold", type=float, default=0.9)
+    p.add_argument("--decoder", choices=["threshold", "fixed"], default="threshold",
+                   help="'threshold' = DMax ThresholdParallelDecoder; 'fixed' = vanilla-LLaDA fixed-steps "
+                        "(--steps per block, hard-token feed, requires --no_draft).")
+    p.add_argument("--steps", type=int, default=16, help="per-block denoise steps for --decoder fixed")
     p.add_argument("--draft_threshold", type=float, default=0.9)
     p.add_argument("--draft_fix_threshold", type=float, default=None,
                    help="separate conf gate for FIX (override committed slots); default = --draft_threshold. "
@@ -111,7 +115,13 @@ def main():
     else:
         draft = None
 
-    decoder = ThresholdParallelDecoder(temperature=0, threshold=args.heavy_threshold, mask_id=MASK_ID, eos_id=EOS_ID)
+    if args.decoder == "fixed":
+        if not args.no_draft:
+            raise SystemExit("--decoder fixed is the vanilla-LLaDA heavy baseline; pass --no_draft")
+        from dinfer.decoding.parallel_strategy import FixedParallelDecoder
+        decoder = FixedParallelDecoder(temperature=0, steps=args.steps, mask_id=MASK_ID)
+    else:
+        decoder = ThresholdParallelDecoder(temperature=0, threshold=args.heavy_threshold, mask_id=MASK_ID, eos_id=EOS_ID)
     cache_factory = KVCacheFactory("prefix", is_bd_model=True, backend="sglang", max_length=max_length)
     dllm = DbetBlockDiffusionLLM(
         runner, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True),
@@ -126,8 +136,9 @@ def main():
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or ".", exist_ok=True)
+    dec_tag = f"fixed_s{args.steps}" if args.decoder == "fixed" else f"h{args.heavy_threshold}"
     print(f"[sglang-dbet-cached] {len(rows)} ex gen={args.gen_length} block={args.block_length} "
-          f"graphs={args.cuda_graph} compile_draft={args.compile_draft} h{args.heavy_threshold} "
+          f"graphs={args.cuda_graph} compile_draft={args.compile_draft} dec={dec_tag} "
           f"d{args.draft_threshold} dfix{args.draft_fix_threshold if args.draft_fix_threshold is not None else args.draft_threshold} "
           f"k{args.draft_top_k} fix={not args.no_draft_fix} -> {args.out_path}")
 

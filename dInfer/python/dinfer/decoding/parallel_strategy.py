@@ -860,6 +860,36 @@ class FixedParallelDecoder(ParallelDecoder):
         x[:, block_start:block_end][transfer_index] = x0[transfer_index]
         broadcast_if_needed(x.data)
 
+    def decode_uniform(self, logits, block_start, block_end, x, active_index, embedding_layer,
+                       prev_embeddings=None, iter_threshold=None, top_k=1):
+        """Vanilla LLaDA fixed-steps decode in the forward_uniform (cached/graph) stack: commit the per-step
+        quota of highest-confidence masked slots; Breakflag when the block has no mask left. Always returns
+        embeddings=None so the next forward feeds HARD token ids (no soft-embed re-feed — the pre-DMax
+        baseline). Self-initializing: quotas + step counter reset when the block window moves or the previous
+        block used up its `steps` (a fresh block may span prompt tail, so all-mask can't be the trigger)."""
+        key = (int(block_start), int(block_end))
+        if getattr(self, "_uniform_key", None) != key or self.iter >= self.steps:
+            self.block_init(x[:, block_start:block_end], 0)
+            self._uniform_key = key
+        mask_index = (x[:, block_start:block_end] == self.mask_id)
+        assert mask_index.shape[1] == logits.shape[1]
+
+        curr_x = x[:, block_start:block_end]
+        x0, transfer_index = get_transfer_index(
+            logits,
+            self.temperature,
+            self.remasking,
+            mask_index,
+            curr_x,
+            self.num_transfer_tokens[:, min(self.iter, self.steps - 1)],
+            None,
+        )
+        self.iter += 1
+        x[:, block_start:block_end][transfer_index] = x0[transfer_index]
+        broadcast_if_needed(x.data)
+        Breakflag = not bool((x[:, block_start:block_end] == self.mask_id).any())
+        return Breakflag, None
+
 
 class HierarchyDecoder(ParallelDecoder):
     """Decode tokens hierarchically to force separate decisions."""
