@@ -18,7 +18,7 @@ tap length under the cached forward are the coupling points flagged inline).
 import torch
 
 from dinfer.decoding.generate_uniform import BlockDiffusionIteration, BlockDiffusionLLM
-from dinfer.decoding.generate_dbet import _soft_embed, _new_dynamic_cache, MASK_ID
+from dinfer.decoding.generate_dbet import _soft_embed, MASK_ID
 
 
 class DbetBlockDiffusionIteration(BlockDiffusionIteration):
@@ -37,12 +37,19 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
-        self.draft_cache = _new_dynamic_cache()        # prefix KV for [0, settled); grown per block
-        self.settled = 0                               # length currently in draft_cache
+        # FIXED-size prefix KV (static shape -> torch.compile fast path; a growing DynamicCache made the draft
+        # forward a new shape each block -> ~eager 3.9ms instead of the compiled 1.5ms floor).
+        self.max_prefix = 640                          # >= max settled gen tokens (gen_length up to ~600)
+        if draft is not None:
+            self.draft_cache = draft.new_fixed_prefix_cache(self.max_prefix, draft.frozen_embed.weight.device)
+        else:
+            self.draft_cache = None
         self.draft_commits = 0
 
     def reset(self):
-        self.draft_cache = _new_dynamic_cache(); self.settled = 0; self.draft_commits = 0
+        if self.draft_cache is not None:
+            self.draft_cache.reset()
+        self.draft_commits = 0
 
     @torch.no_grad()
     def forward_uniform(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask,
@@ -82,9 +89,16 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         mask_pos = (block_x == MASK_ID)
         committed_before = active[0] & (~mask_pos)
         draft_ids = x.data[:, cur:be].clone()
+        settled = self.draft_cache.settled
+        M = self.draft_cache.max_len
+        # STATIC-shape inputs so torch.compile stays on its fast path (values vary per block, SHAPES don't):
+        pos = torch.arange(settled, settled + blk, device=x.device).unsqueeze(0)       # canvas positions (== G2)
+        pmask = torch.zeros(1, 1, 1, M + blk, dtype=torch.bool, device=x.device)        # prefix mask (hides pad)
+        pmask[..., :settled] = True                                                     # valid settled prefix
+        pmask[..., M:] = True                                                           # canvas (bidirectional)
         d = self.draft(input_ids=draft_ids, heavy_logits=block_logits, h_sel_denoise=h_sel, h_last_denoise=h_last,
                        h_sel_prefix=None, past_key_values=self.draft_cache,
-                       attention_mask=None, position_ids=None, denoise_mask=None, tau=self.draft_tau)
+                       attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau)
         dlogits, dconf = d["logits"], d["conf"]
         if dconf is None:
             return output, Breakflag, embeddings

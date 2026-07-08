@@ -94,6 +94,35 @@ def _cache_layer_kv(cache, layer_idx):
     return k, v
 
 
+class FixedPrefixCache:
+    """FIXED-size cross-block prefix KV so the draft forward keeps a STATIC shape -> torch.compile stays on its
+    fast path (a growing DynamicCache makes every block a new shape -> recompile/dynamic -> ~eager speed). Buffers
+    are [n_layers] x [1, kv_heads, max_len, head_dim]; the attention always reads the full max_len buffer and the
+    caller passes a bool mask hiding the unfilled [settled:max_len]. rope is applied at WRITE time (as in the
+    DynamicCache path), so the pad rows (masked) never matter."""
+
+    def __init__(self, n_layers, kv_heads, head_dim, max_len, dtype, device):
+        self.k = [torch.zeros(1, kv_heads, max_len, head_dim, dtype=dtype, device=device) for _ in range(n_layers)]
+        self.v = [torch.zeros(1, kv_heads, max_len, head_dim, dtype=dtype, device=device) for _ in range(n_layers)]
+        self.max_len = int(max_len)
+        self.settled = 0
+
+    def reset(self):
+        self.settled = 0
+        for t in self.k:
+            t.zero_()
+        for t in self.v:
+            t.zero_()
+
+    def write(self, layer_idx, k, v):                           # k,v [1,H,n,hd] -> buffer[settled:settled+n]
+        e = min(self.settled + k.shape[2], self.max_len)        # clamp (drop far prefix if gen exceeds max_len)
+        n = e - self.settled
+        if n <= 0:
+            return
+        self.k[layer_idx][:, :, self.settled:e] = k[:, :, :n]
+        self.v[layer_idx][:, :, self.settled:e] = v[:, :, :n]
+
+
 # NOTE: the DMax-native heavy decode (decode_uniform: grid-aligned blocks, left-to-right threshold commit,
 # soft-embedding reveal) is DEFERRED to the inference stage. To match DMax/LLaDA-2.0's framework it will live
 # in a separate inference wrapper (a `DbetDiffusionLLM`, mirroring dInfer's DiffusionLLM classes), NOT in the
@@ -332,6 +361,9 @@ class DbetAttention(nn.Module):
             k_pre = _apply_rope_single(k_pre, cos[:, :p], sin[:, :p])     # prefix keeps its own positions
             if past_key_values is not None:
                 k_pre, v_pre = past_key_values.update(k_pre, v_pre, self.layer_idx)
+        elif isinstance(past_key_values, FixedPrefixCache):
+            k_pre = past_key_values.k[self.layer_idx]            # full max_len buffer (STATIC shape; mask hides pad)
+            v_pre = past_key_values.v[self.layer_idx]
         elif past_key_values is not None and _cache_seq_len(past_key_values) > 0:
             k_pre, v_pre = _cache_layer_kv(past_key_values, self.layer_idx)
         else:
@@ -358,7 +390,10 @@ class DbetAttention(nn.Module):
         _, k_pre, v_pre = self._project(prefix_feat)
         k_pre = self.key_layernorm(k_pre)
         k_pre = _apply_rope_single(k_pre, cos, sin)
-        past_key_values.update(k_pre, v_pre, self.layer_idx)
+        if isinstance(past_key_values, FixedPrefixCache):
+            past_key_values.write(self.layer_idx, k_pre, v_pre)  # write at settled offset (fixed buffer)
+        else:
+            past_key_values.update(k_pre, v_pre, self.layer_idx)
 
 
 class DbetDecoderLayer(nn.Module):
@@ -490,15 +525,17 @@ class DbetDraftStack(nn.Module):
         x = self.conditioning(input_ids, heavy_logits, h_sel_denoise, self.frozen_embed, tau, denoise_mask)
         b, c, _ = x.shape
 
-        # committed-context length P (for positions): from the prefix feature, else the cache, else 0.
-        if h_sel_prefix is not None:
-            p = h_sel_prefix.shape[1]
-        elif past_key_values is not None and _cache_seq_len(past_key_values) > 0:
-            p = _cache_seq_len(past_key_values)
-        else:
-            p = 0
-
+        # Positions: the decode passes a FIXED-shape position_ids so torch.compile never reads the Python int
+        # settled/seq-len (which would guard -> recompile per block). Only build defaults when not supplied.
         if position_ids is None:
+            if h_sel_prefix is not None:
+                p = h_sel_prefix.shape[1]
+            elif isinstance(past_key_values, FixedPrefixCache):
+                p = past_key_values.settled                      # logical prefix len (buffer is max_len; mask hides pad)
+            elif past_key_values is not None and _cache_seq_len(past_key_values) > 0:
+                p = _cache_seq_len(past_key_values)
+            else:
+                p = 0
             position_ids = torch.arange(p + c, device=x.device).unsqueeze(0).expand(b, -1)
         cos, sin = self.rotary_emb(x, position_ids)                       # [B, P+C, rope_dim], computed ONCE
 
@@ -527,6 +564,14 @@ class DbetDraftStack(nn.Module):
         cos, sin = self.rotary_emb(h_sel_delta, position_ids)        # rope at the chunk's TRUE absolute positions
         for i, layer in enumerate(self.layers):
             layer.attention.cache_prefix(f_pre[i], cos, sin, past_key_values)
+        if isinstance(past_key_values, FixedPrefixCache):            # all layers wrote at the same offset; advance once
+            past_key_values.settled = min(past_key_values.settled + h_sel_delta.shape[1], past_key_values.max_len)
+
+    def new_fixed_prefix_cache(self, max_len, device, dtype=torch.bfloat16):
+        """A FixedPrefixCache sized for THIS drafter (static-shape prefix -> torch.compile fast path in the decode)."""
+        cfg = self.config
+        hd = cfg.resolved_draft_hidden_size // cfg.draft_num_attention_heads
+        return FixedPrefixCache(cfg.draft_num_layers, cfg.draft_num_key_value_heads, hd, max_len, dtype, device)
 
 
 # ======================================================================================
