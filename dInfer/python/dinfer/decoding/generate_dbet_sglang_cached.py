@@ -45,15 +45,18 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         else:
             self.draft_cache = None
         self.draft_commits = 0
-        # FIX-quality diagnostic (off by default): compare each draft FIX decision on a committed slot to the
-        # heavy's 2nd-look (its logits at that slot, which is soft-embedded this forward = the verifier signal).
+        # FIX-quality DRY-RUN diagnostic (diag_on): the heavy decodes as PURE DMax (the draft NEVER commits); at
+        # each heavy run we dry-run the draft, record its token+conf at all committed slots, and compare to the NEXT
+        # heavy run's argmax (draft N vs heavy N+1). Raw records let us SWEEP the conf threshold offline.
         self.diag_on = False
-        self.diag_fix = {"committed": 0, "h2flip": 0, "dfix": 0, "tp": 0, "tp_right": 0, "fp": 0}
+        self._pending = None
+        self._dc, self._dneq, self._hflip, self._deqh = [], [], [], []   # conf, draft!=commit, heavy-flip, draft==heavy-next
 
     def reset(self):
         if self.draft_cache is not None:
             self.draft_cache.reset()
         self.draft_commits = 0
+        self._pending = None
 
     @torch.no_grad()
     def forward_uniform(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask,
@@ -64,6 +67,9 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values,
             replace_position, backend, active_index, embeddings, embedding_layer,
             is_cross_block=is_cross_block, block_length=block_length)
+
+        if self.diag_on:                                                 # FIX-quality dry-run diagnostic (heavy = pure DMax)
+            return self._diag_dry_step(output, Breakflag, embeddings, block_loc, block_length, x, active_index)
 
         if not self.draft_enabled:                                       # baseline: pure DMax heavy decode
             return output, Breakflag, embeddings
@@ -110,17 +116,6 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             return output, Breakflag, embeddings
         darg = dlogits[0].argmax(-1); dc = dconf[0]
 
-        if self.diag_on and bool(committed_before.any()):            # FIX-quality vs the heavy's 2nd-look
-            cb = committed_before
-            h2 = block_logits[0].argmax(-1)                          # heavy's opinion on committed (soft-embedded) slots
-            commit = block_x
-            dfix = cb & (dc >= self.draft_threshold) & (darg != commit)   # the draft WANTS to override
-            h2flip = cb & (h2 != commit)                             # the heavy's 2nd look would change it (real mistake)
-            tp = dfix & h2flip
-            f = self.diag_fix
-            f["committed"] += int(cb.sum()); f["h2flip"] += int(h2flip.sum()); f["dfix"] += int(dfix.sum())
-            f["tp"] += int(tp.sum()); f["tp_right"] += int((tp & (darg == h2)).sum()); f["fp"] += int((dfix & ~h2flip).sum())
-
         # EXTEND: left-to-right prefix commit of masked slots while conf >= threshold (>=1 for progress)
         mloc = mask_pos.nonzero(as_tuple=True)[0]
         if mloc.numel() > 0:
@@ -138,6 +133,71 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
                 x.data[0, cur + floc] = darg[floc]
                 embeddings[0, floc] = _soft_embed(dlogits[0][floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
         return output, Breakflag, embeddings
+
+    def _diag_dry_step(self, output, Breakflag, embeddings, block_loc, block_length, x, active_index):
+        """DRY-RUN FIX diagnostic. Heavy stays pure DMax (we never commit). Each run: (1) compare the PENDING draft
+        (from the previous run, same block) against THIS run's argmax = heavy N+1; (2) dry-run the draft on this
+        state and stash its token+conf at every committed slot for the next run's comparison. On Breakflag, extend
+        the drafter prefix cache (so its conditioning matches the real decode) and drop the pending."""
+        be = block_loc.end
+        blk = block_length
+        cur = be - blk
+        B = x.batch_size
+        block_logits = output.logits[:, -blk:]
+        h_argmax = block_logits[0].argmax(-1)                            # THIS heavy run's argmax = "heavy N+1" for pending
+        h_sel_all, h_last_all = self.heavy_model.pop_dbet_features(B, be - block_loc.start)
+        h_sel = h_sel_all[:, -blk:]; h_last = h_last_all[:, -blk:]
+
+        # (1) deferred compare: previous run's draft (same block) vs this run's heavy argmax
+        p = self._pending
+        if p is not None and p["cur"] == cur:
+            hn = h_argmax[p["idx"]]
+            self._dc.append(p["dconf"]); self._dneq.append(p["dtok"] != p["commit"])
+            self._hflip.append(hn != p["commit"]); self._deqh.append(p["dtok"] == hn)
+        self._pending = None
+
+        if bool(Breakflag):                                             # block settled by the heavy -> extend cache, done
+            pos = torch.arange(cur, be, device=x.device).unsqueeze(0)
+            self.draft.extend_prefix_cache(h_sel, pos, self.draft_cache)
+            return output, Breakflag, embeddings
+
+        # (2) dry-run the draft on this heavy state; record for the NEXT run's comparison (NEVER commit)
+        block_x = x.data[0, cur:be]
+        mask_pos = (block_x == MASK_ID)
+        active = active_index[:, -blk:] if active_index.shape[1] != blk else active_index
+        cb = active[0] & (~mask_pos)
+        if bool(mask_pos.any()) and bool(cb.any()):
+            settled = self.draft_cache.settled; M = self.draft_cache.max_len
+            pos = torch.arange(settled, settled + blk, device=x.device).unsqueeze(0)
+            pmask = torch.zeros(1, 1, 1, M + blk, dtype=torch.bool, device=x.device)
+            pmask[..., :settled] = True; pmask[..., M:] = True
+            d = self.draft(input_ids=x.data[:, cur:be].clone(), heavy_logits=block_logits, h_sel_denoise=h_sel,
+                           h_last_denoise=h_last, h_sel_prefix=None, past_key_values=self.draft_cache,
+                           attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau)
+            if d["conf"] is not None:
+                darg = d["logits"][0].argmax(-1); dc = d["conf"][0]
+                idx = cb.nonzero(as_tuple=True)[0]
+                self._pending = {"cur": cur, "idx": idx, "commit": block_x[idx].clone(),
+                                 "dtok": darg[idx].clone(), "dconf": dc[idx].clone()}
+        return output, Breakflag, embeddings
+
+    def diag_dry_report(self, thresholds=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)):
+        """Sweep the FIX conf threshold over the recorded (draft N vs heavy N+1) comparisons."""
+        import torch as _t
+        if not self._dc:
+            print("[FIX-DIAG dry-run] no comparisons recorded"); return
+        conf = _t.cat(self._dc); dneq = _t.cat(self._dneq); hflip = _t.cat(self._hflip); deqh = _t.cat(self._deqh)
+        n = conf.numel(); nflip = int(hflip.sum())
+        print(f"\n[FIX-DIAG dry-run] {n} committed-slot comparisons (draft N vs heavy N+1); heavy is pure DMax")
+        print(f"  heavy N+1 flips its own commit (the REAL mistake rate): {nflip}  ({100*nflip/max(n,1):.2f}%)")
+        print(f"  draft disagrees with commit at all (pre-threshold)    : {int(dneq.sum())}  ({100*int(dneq.sum())/max(n,1):.2f}%)")
+        print(f"  {'thr':>5} {'draft_flips':>11} {'precision':>10} {'recall':>8} {'token_acc':>10}")
+        for T in thresholds:
+            wf = (conf >= T) & dneq                                     # draft WANTS to flip at this threshold
+            nwf = int(wf.sum()); tp = int((wf & hflip).sum()); tpr = int((wf & deqh).sum())
+            print(f"  {T:>5} {nwf:>11} {100*tp/max(nwf,1):>9.1f}% {100*tp/max(nflip,1):>7.1f}% {100*tpr/max(nwf,1):>9.1f}%")
+        print("  precision=of draft-flips how many heavy also flips; recall=of heavy-flips how many draft catches; "
+              "token_acc=of draft-flips how many match heavy's token")
 
 
 class DbetBlockDiffusionLLM(BlockDiffusionLLM):

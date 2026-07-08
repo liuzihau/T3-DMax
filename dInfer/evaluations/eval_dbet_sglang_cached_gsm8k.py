@@ -83,8 +83,9 @@ def main():
     p.add_argument("--draft_top_k", type=int, default=2)
     p.add_argument("--draft_tau", type=float, default=1.0)
     p.add_argument("--no_draft_fix", action="store_true")
-    p.add_argument("--diag", action="store_true", help="FIX-quality diagnostic: compare draft FIX decisions vs the "
-                   "heavy's 2nd-look (its logits at the soft-embedded committed slots); prints precision/recall/token-acc")
+    p.add_argument("--diag", action="store_true", help="FIX-quality DRY-RUN diagnostic: heavy decodes as pure DMax "
+                   "(draft never commits); dry-run the draft each heavy run and compare to the NEXT heavy run's argmax; "
+                   "sweeps the conf threshold -> precision/recall/token-acc. Run WITHOUT --no_draft.")
     p.add_argument("--no_draft", action="store_true", help="pure heavy-only baseline in the SAME cached decode "
                    "(threshold can't disable the drafter: EXTEND always commits the leftmost slot for progress)")
     p.add_argument("--cuda_graph", action="store_true", help="enable CUDA graphs (default OFF -> debug the injection)")
@@ -169,19 +170,7 @@ def main():
           + (f" --limit {args.limit}" if args.limit else ""))
 
     if args.diag:
-        f = dllm.diff_iteration.diag_fix
-        dfix = max(f["dfix"], 1); h2 = max(f["h2flip"], 1); tp = max(f["tp"], 1); com = max(f["committed"], 1)
-        fn = f["h2flip"] - f["tp"]                                # heavy flips but draft missed
-        print("\n[FIX-DIAG] draft FIX decisions vs the heavy's 2nd-look (logits at the soft-embedded committed slots):")
-        print(f"  committed-slot evals : {f['committed']}")
-        print(f"  heavy 2nd-look flips : {f['h2flip']}  ({100*f['h2flip']/com:.2f}% of committed -- the real mistake rate)")
-        print(f"  draft WANTED to fix  : {f['dfix']}  ({100*f['dfix']/com:.2f}% of committed)")
-        print(f"  tp (draft-fix & heavy-flip)      : {f['tp']}")
-        print(f"  fp (draft-fix & heavy-KEEP, BAD) : {f['fp']}")
-        print(f"  fn (heavy-flip & draft-missed)   : {fn}")
-        print(f"  tp_right (tp & draft==heavy tok) : {f['tp_right']}")
-        print(f"  PRECISION tp/dfix={100*f['tp']/dfix:.1f}%  RECALL tp/flip={100*f['tp']/h2:.1f}%  "
-              f"TOKEN-ACC={100*f['tp_right']/tp:.1f}%  BAD-FIX fp/dfix={100*f['fp']/dfix:.1f}%")
+        dllm.diff_iteration.diag_dry_report()
 
 
 if __name__ == "__main__":
