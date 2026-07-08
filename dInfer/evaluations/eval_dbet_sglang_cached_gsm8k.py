@@ -81,6 +81,8 @@ def main():
     p.add_argument("--draft_top_k", type=int, default=2)
     p.add_argument("--draft_tau", type=float, default=1.0)
     p.add_argument("--no_draft_fix", action="store_true")
+    p.add_argument("--no_draft", action="store_true", help="pure heavy-only baseline in the SAME cached decode "
+                   "(threshold can't disable the drafter: EXTEND always commits the leftmost slot for progress)")
     p.add_argument("--cuda_graph", action="store_true", help="enable CUDA graphs (default OFF -> debug the injection)")
     p.add_argument("--compile_draft", action="store_true", help="torch.compile the drafter (the optimized draft time)")
     p.add_argument("--limit", type=int, default=None)
@@ -100,7 +102,8 @@ def main():
         runner, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True),
         cache_factory=cache_factory, draft=draft, sel_layers=sel,
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
-        draft_fix=not args.no_draft_fix, early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
+        draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
+        early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
 
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)

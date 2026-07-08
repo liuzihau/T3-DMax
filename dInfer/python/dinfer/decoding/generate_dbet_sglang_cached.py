@@ -26,12 +26,14 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
     (load_drafter_standalone), `heavy_model` = the LLaDA2Model with enable_dbet_tap() on (the graph-safe buffer tap).
     `draft_cache` = the drafter's cross-block prefix KV cache (grown per settled block)."""
 
-    def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True):
+    def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
+                 draft_enabled=True):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
         self.embed = draft.frozen_embed
-        self.draft_threshold = draft_threshold
+        self.draft_enabled = draft_enabled             # False -> pure heavy-only decode (baseline; the EXTEND's
+        self.draft_threshold = draft_threshold         #   keep[0]=True progress rule means threshold can't disable it)
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -51,6 +53,9 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values,
             replace_position, backend, active_index, embeddings, embedding_layer,
             is_cross_block=is_cross_block, block_length=block_length)
+
+        if not self.draft_enabled:                                       # baseline: pure DMax heavy decode
+            return output, Breakflag, embeddings
 
         be = block_loc.end
         blk = block_length                                # the REAL current block (cross-block passes a 2-block span)
@@ -109,7 +114,7 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
     call enable the model's buffer tap once. Everything else (cache, cuda graphs, prefix) is DMax's, untouched."""
 
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
-                 draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
+                 draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
                  early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
@@ -123,6 +128,6 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
             heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
-            draft_top_k=draft_top_k, draft_fix=draft_fix)
+            draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration
