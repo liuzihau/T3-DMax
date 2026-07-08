@@ -27,13 +27,16 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
     `draft_cache` = the drafter's cross-block prefix KV cache (grown per settled block)."""
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
-                 draft_enabled=True):
+                 draft_enabled=True, draft_fix_threshold=None):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
         self.embed = draft.frozen_embed if draft is not None else None   # draft=None -> heavy-only baseline
         self.draft_enabled = draft_enabled             # False -> pure heavy-only decode (baseline; the EXTEND's
         self.draft_threshold = draft_threshold         #   keep[0]=True progress rule means threshold can't disable it)
+        # FIX gets its own gate (golden diag: FIX is net-positive only at conf>=0.9 while EXTEND works lower);
+        # None -> same as draft_threshold (the old single-knob behavior)
+        self.draft_fix_threshold = draft_threshold if draft_fix_threshold is None else draft_fix_threshold
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -128,9 +131,9 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             x.data[0, cur + sel] = darg[sel]
             embeddings[0, sel] = _soft_embed(dlogits[0][sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
             self.draft_commits += int(sel.numel())
-        # FIX: override a committed slot iff conf-head >= threshold AND the draft disagrees
+        # FIX: override a committed slot iff conf-head >= its OWN threshold AND the draft disagrees
         if self.draft_fix and bool(committed_before.any()):
-            fix = committed_before & (dc >= self.draft_threshold) & (darg != block_x)
+            fix = committed_before & (dc >= self.draft_fix_threshold) & (darg != block_x)
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x.data[0, cur + floc] = darg[floc]
@@ -236,7 +239,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
 
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
-                 early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
+                 draft_fix_threshold=None, early_stop=True, maximum_unroll=1, expected_tpf=15,
+                 backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -249,6 +253,7 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
             heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
-            draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled)
+            draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
+            draft_fix_threshold=draft_fix_threshold)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration

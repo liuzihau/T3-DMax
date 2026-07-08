@@ -80,6 +80,9 @@ def main():
     p.add_argument("--block_length", type=int, default=32)
     p.add_argument("--heavy_threshold", type=float, default=0.9)
     p.add_argument("--draft_threshold", type=float, default=0.9)
+    p.add_argument("--draft_fix_threshold", type=float, default=None,
+                   help="separate conf gate for FIX (override committed slots); default = --draft_threshold. "
+                        "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
     p.add_argument("--draft_top_k", type=int, default=2)
     p.add_argument("--draft_tau", type=float, default=1.0)
     p.add_argument("--no_draft_fix", action="store_true")
@@ -115,6 +118,7 @@ def main():
         cache_factory=cache_factory, draft=draft, sel_layers=sel,
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
+        draft_fix_threshold=args.draft_fix_threshold,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
     if args.diag:
         dllm.diff_iteration.diag_on = True
@@ -124,7 +128,8 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or ".", exist_ok=True)
     print(f"[sglang-dbet-cached] {len(rows)} ex gen={args.gen_length} block={args.block_length} "
           f"graphs={args.cuda_graph} compile_draft={args.compile_draft} h{args.heavy_threshold} "
-          f"d{args.draft_threshold} k{args.draft_top_k} fix={not args.no_draft_fix} -> {args.out_path}")
+          f"d{args.draft_threshold} dfix{args.draft_fix_threshold if args.draft_fix_threshold is not None else args.draft_threshold} "
+          f"k{args.draft_top_k} fix={not args.no_draft_fix} -> {args.out_path}")
 
     if args.compile_draft and rows:                                   # warm up the compiled draft OFF the timer
         wmsg = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=rows[0]["question"])}]
