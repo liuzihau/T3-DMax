@@ -46,17 +46,20 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             self.draft_cache = None
         self.draft_commits = 0
         # FIX-quality DRY-RUN diagnostic (diag_on): the heavy decodes as PURE DMax (the draft NEVER commits); at
-        # each heavy run we dry-run the draft, record its token+conf at all committed slots, and compare to the NEXT
-        # heavy run's argmax (draft N vs heavy N+1). Raw records let us SWEEP the conf threshold offline.
+        # each heavy run we dry-run the draft and record token+conf+commit at all committed slots; when the block
+        # CONVERGES (Breakflag) every record is resolved against the block's FINAL tokens (the GOLDEN). Raw records
+        # let us SWEEP the conf threshold offline, both step-level and unique-slot-level.
         self.diag_on = False
-        self._pending = None
-        self._dc, self._dneq, self._hflip, self._deqh = [], [], [], []   # conf, draft!=commit, heavy-flip, draft==heavy-next
+        self._blk_recs = []                            # this block's per-step records, resolved vs golden at Breakflag
+        self._diag_blk = 0                             # running block counter -> unique slot keys across prompts
+        self._dc, self._dneq, self._gflip, self._deqg, self._skey = [], [], [], [], []
+        # conf, draft!=commit, commit!=golden, draft==golden, unique-slot key
 
     def reset(self):
         if self.draft_cache is not None:
             self.draft_cache.reset()
         self.draft_commits = 0
-        self._pending = None
+        self._blk_recs = []                            # NOT _diag_blk: slot keys must stay unique across prompts
 
     @torch.no_grad()
     def forward_uniform(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask,
@@ -135,33 +138,36 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         return output, Breakflag, embeddings
 
     def _diag_dry_step(self, output, Breakflag, embeddings, block_loc, block_length, x, active_index):
-        """DRY-RUN FIX diagnostic. Heavy stays pure DMax (we never commit). Each run: (1) compare the PENDING draft
-        (from the previous run, same block) against THIS run's argmax = heavy N+1; (2) dry-run the draft on this
-        state and stash its token+conf at every committed slot for the next run's comparison. On Breakflag, extend
-        the drafter prefix cache (so its conditioning matches the real decode) and drop the pending."""
+        """DRY-RUN FIX diagnostic vs GOLDEN. Heavy stays pure DMax (we never commit). Each run we dry-run the draft
+        and stash token+conf+commit at every committed slot; at Breakflag the block is settled, so x holds the
+        block's FINAL tokens (the golden) and every stashed record resolves against them: was the commit ultimately
+        wrong, did the draft disagree, and did the draft name the golden token. Then extend the drafter prefix
+        cache (so its conditioning matches the real decode) and clear the block's records."""
         be = block_loc.end
         blk = block_length
         cur = be - blk
         B = x.batch_size
         block_logits = output.logits[:, -blk:]
-        h_argmax = block_logits[0].argmax(-1)                            # THIS heavy run's argmax = "heavy N+1" for pending
         h_sel_all, h_last_all = self.heavy_model.pop_dbet_features(B, be - block_loc.start)
         h_sel = h_sel_all[:, -blk:]; h_last = h_last_all[:, -blk:]
 
-        # (1) deferred compare: previous run's draft (same block) vs this run's heavy argmax
-        p = self._pending
-        if p is not None and p["cur"] == cur:
-            hn = h_argmax[p["idx"]]
-            self._dc.append(p["dconf"]); self._dneq.append(p["dtok"] != p["commit"])
-            self._hflip.append(hn != p["commit"]); self._deqh.append(p["dtok"] == hn)
-        self._pending = None
+        if self._blk_recs and self._blk_recs[0]["cur"] != cur:          # block moved on without Breakflag -> stale
+            self._blk_recs = []
 
-        if bool(Breakflag):                                             # block settled by the heavy -> extend cache, done
+        if bool(Breakflag):                                             # block settled -> x[cur:be] IS the golden
+            golden = x.data[0, cur:be]
+            for r in self._blk_recs:
+                g = golden[r["idx"]]
+                self._dc.append(r["dconf"]); self._dneq.append(r["dtok"] != r["commit"])
+                self._gflip.append(g != r["commit"]); self._deqg.append(r["dtok"] == g)
+                self._skey.append(self._diag_blk * blk + r["idx"])
+            self._blk_recs = []
+            self._diag_blk += 1
             pos = torch.arange(cur, be, device=x.device).unsqueeze(0)
             self.draft.extend_prefix_cache(h_sel, pos, self.draft_cache)
             return output, Breakflag, embeddings
 
-        # (2) dry-run the draft on this heavy state; record for the NEXT run's comparison (NEVER commit)
+        # dry-run the draft on this heavy state; stash for resolution at block convergence (NEVER commit)
         block_x = x.data[0, cur:be]
         mask_pos = (block_x == MASK_ID)
         active = active_index[:, -blk:] if active_index.shape[1] != blk else active_index
@@ -177,27 +183,51 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             if d["conf"] is not None:
                 darg = d["logits"][0].argmax(-1); dc = d["conf"][0]
                 idx = cb.nonzero(as_tuple=True)[0]
-                self._pending = {"cur": cur, "idx": idx, "commit": block_x[idx].clone(),
-                                 "dtok": darg[idx].clone(), "dconf": dc[idx].clone()}
+                self._blk_recs.append({"cur": cur, "idx": idx, "commit": block_x[idx].clone(),
+                                       "dtok": darg[idx].clone(), "dconf": dc[idx].clone()})
         return output, Breakflag, embeddings
 
     def diag_dry_report(self, thresholds=(0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)):
-        """Sweep the FIX conf threshold over the recorded (draft N vs heavy N+1) comparisons."""
+        """Sweep the FIX conf threshold over the recorded (draft step-N vs GOLDEN) comparisons. Step-level rows
+        count every (heavy run, committed slot) pair = every FIX opportunity; the slot-level block dedups to unique
+        committed slots (a wrong commit sitting for k runs counts once) and asks 'did the draft EVER catch it'."""
         import torch as _t
         if not self._dc:
             print("[FIX-DIAG dry-run] no comparisons recorded"); return
-        conf = _t.cat(self._dc); dneq = _t.cat(self._dneq); hflip = _t.cat(self._hflip); deqh = _t.cat(self._deqh)
-        n = conf.numel(); nflip = int(hflip.sum())
-        print(f"\n[FIX-DIAG dry-run] {n} committed-slot comparisons (draft N vs heavy N+1); heavy is pure DMax")
-        print(f"  heavy N+1 flips its own commit (the REAL mistake rate): {nflip}  ({100*nflip/max(n,1):.2f}%)")
+        conf = _t.cat(self._dc); dneq = _t.cat(self._dneq); gflip = _t.cat(self._gflip); deqg = _t.cat(self._deqg)
+        n = conf.numel(); nflip = int(gflip.sum())
+        print(f"\n[FIX-DIAG dry-run vs GOLDEN] {n} committed-slot comparisons (draft step N vs block-final token); "
+              f"heavy is pure DMax")
+        print(f"  commit != golden (step-level wrong-commit exposure)   : {nflip}  ({100*nflip/max(n,1):.2f}%)")
         print(f"  draft disagrees with commit at all (pre-threshold)    : {int(dneq.sum())}  ({100*int(dneq.sum())/max(n,1):.2f}%)")
         print(f"  {'thr':>5} {'draft_flips':>11} {'precision':>10} {'recall':>8} {'token_acc':>10}")
         for T in thresholds:
             wf = (conf >= T) & dneq                                     # draft WANTS to flip at this threshold
-            nwf = int(wf.sum()); tp = int((wf & hflip).sum()); tpr = int((wf & deqh).sum())
-            print(f"  {T:>5} {nwf:>11} {100*tp/max(nwf,1):>9.1f}% {100*tp/max(nflip,1):>7.1f}% {100*tpr/max(nwf,1):>9.1f}%")
-        print("  precision=of draft-flips how many heavy also flips; recall=of heavy-flips how many draft catches; "
-              "token_acc=of draft-flips how many match heavy's token")
+            nwf = int(wf.sum()); tp = int((wf & gflip).sum()); tpg = int((wf & deqg).sum())
+            print(f"  {T:>5} {nwf:>11} {100*tp/max(nwf,1):>9.1f}% {100*tp/max(nflip,1):>7.1f}% {100*tpg/max(nwf,1):>9.1f}%")
+        print("  precision=of draft-flips how many commits were golden-wrong; recall=of golden-wrong exposures how "
+              "many the draft flips; token_acc=of draft-flips how many name the GOLDEN token")
+
+        # ---- slot-level: dedup to unique committed slots; 'ever' semantics across the block's runs ----
+        key = _t.cat(self._skey)
+        uk, inv = key.unique(return_inverse=True)
+        S = uk.numel()
+        def _slots(mask):
+            hit = _t.zeros(S, dtype=_t.bool, device=mask.device); hit[inv[mask]] = True; return hit
+        wrong = _slots(gflip)                                           # slot was golden-wrong at >=1 run
+        nw = int(wrong.sum())
+        print(f"\n  slot-level: {S} unique committed slots; ever golden-wrong: {nw}  ({100*nw/max(S,1):.2f}%)")
+        cov = _slots(dneq & gflip & deqg)                               # draft named golden while commit was wrong
+        print(f"  draft EVER names golden while commit wrong (pre-thr)  : {int((cov & wrong).sum())}  "
+              f"(ceiling recall {100*int((cov & wrong).sum())/max(nw,1):.1f}%)")
+        print(f"  {'thr':>5} {'caught_slots':>12} {'slot_recall':>11} {'false_alarm_slots':>17}")
+        for T in thresholds:
+            wf = (conf >= T) & dneq
+            caught = _slots(wf & gflip & deqg) & wrong                  # flip fired on a wrong commit WITH the golden token
+            fa = _slots(wf & ~gflip)                                    # flip fired while the commit was already golden
+            print(f"  {T:>5} {int(caught.sum()):>12} {100*int(caught.sum())/max(nw,1):>10.1f}% {int(fa.sum()):>17}")
+        print("  caught=slot had a wrong commit and the draft flipped it TO the golden token at >=1 run; "
+              "false_alarm=slot where a flip fired while the commit already equalled the golden")
 
 
 class DbetBlockDiffusionLLM(BlockDiffusionLLM):
