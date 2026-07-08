@@ -87,6 +87,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # 3) DRAFT step (canvas = current block, prefix = cross-block draft cache)
         block_x = x.data[0, cur:be]
         mask_pos = (block_x == MASK_ID)
+        if not bool(mask_pos.any()):                  # heavy already committed the whole block -> no slot to EXTEND;
+            return output, Breakflag, embeddings      # skip the draft forward (would only FIX, not worth ~2.5ms)
         committed_before = active[0] & (~mask_pos)
         draft_ids = x.data[:, cur:be].clone()
         settled = self.draft_cache.settled
