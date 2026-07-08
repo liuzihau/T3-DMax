@@ -31,7 +31,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
-        self.embed = draft.frozen_embed
+        self.embed = draft.frozen_embed if draft is not None else None   # draft=None -> heavy-only baseline
         self.draft_enabled = draft_enabled             # False -> pure heavy-only decode (baseline; the EXTEND's
         self.draft_threshold = draft_threshold         #   keep[0]=True progress rule means threshold can't disable it)
         self.draft_tau = draft_tau
@@ -124,7 +124,7 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
         # skipped by the model's copy_ guard (we only need per-block features, never prefill). MUST be enabled BEFORE
         # the runner captures its CUDA graph -> the driver enables it pre-ModelRunner; skip re-alloc if already on
         # (re-allocating would orphan the buffers the graph captured).
-        if heavy_model._dbet is None:
+        if draft is not None and heavy_model._dbet is None:
             heavy_model.enable_dbet_tap(sel_layers, max_bs=1, max_len=256)
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,

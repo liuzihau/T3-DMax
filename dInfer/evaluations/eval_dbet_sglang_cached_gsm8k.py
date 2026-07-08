@@ -32,7 +32,7 @@ from transformers import AutoTokenizer, AutoConfig                              
 MASK_ID, EOS_ID = 156895, 156892
 
 
-def build(heavy_path, sel_default, max_length, use_cuda_graph, master_port="23521"):
+def build(heavy_path, sel_default, max_length, use_cuda_graph, enable_tap=True, master_port="23521"):
     """Bring up the sglang heavy from the TAP COPY (modeling_llada2_moe_sglang_dbet) + a cached ModelRunner."""
     from sglang.srt.server_args import ServerArgs
     from sglang.srt import distributed
@@ -61,8 +61,10 @@ def build(heavy_path, sel_default, max_length, use_cuda_graph, master_port="2352
     model = model.to(device)
     sel = list(getattr(model_config, "sel_layers_list", sel_default))
     # CRITICAL: enable the buffer tap BEFORE the ModelRunner captures the CUDA graph in its ctor -- else the graph
-    # has no copy_ ops and the buffer is never refreshed on replay (drafter reads stale h_sel).
-    model.model.enable_dbet_tap(sel, max_bs=1, max_len=256)
+    # has no copy_ ops and the buffer is never refreshed on replay (drafter reads stale h_sel). Skipped for --no_draft
+    # (pure heavy-only baseline: LLaDA/DMax through the identical decode, no drafter, no tap).
+    if enable_tap:
+        model.model.enable_dbet_tap(sel, max_bs=1, max_len=256)
     runner = ModelRunner(model, device, enable_cuda_graph=use_cuda_graph, server_args=server_args,
                          max_length=max_length)
     return runner, sel, server_args, device
@@ -70,8 +72,8 @@ def build(heavy_path, sel_default, max_length, use_cuda_graph, master_port="2352
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--heavy_path", required=True, help="ORIGINAL per-expert DMax-Math (sglang heavy + drafter frozen)")
-    p.add_argument("--drafter_path", required=True)
+    p.add_argument("--heavy_path", required=True, help="per-expert sglang heavy (DMax-Math / LLaDA2); also frozen drafter pieces")
+    p.add_argument("--drafter_path", default=None, help="required unless --no_draft (heavy-only baseline)")
     p.add_argument("--tokenizer_path", default=None)
     p.add_argument("--out_path", required=True)
     p.add_argument("--gen_length", type=int, default=512)
@@ -90,11 +92,18 @@ def main():
     args = p.parse_args()
 
     from dinfer import BlockIteratorFactory, KVCacheFactory, ThresholdParallelDecoder
+    use_draft = not args.no_draft
     max_length = args.gen_length + 256
-    runner, sel, server_args, device = build(args.heavy_path, (1, 10, 19), max_length, args.cuda_graph)
-    draft = load_drafter_standalone(args.drafter_path, args.heavy_path, device=str(device))
-    if args.compile_draft:
-        draft = torch.compile(draft)
+    runner, sel, server_args, device = build(args.heavy_path, (1, 10, 19), max_length, args.cuda_graph,
+                                             enable_tap=use_draft)
+    if use_draft:
+        if not args.drafter_path:
+            raise SystemExit("--drafter_path is required unless --no_draft")
+        draft = load_drafter_standalone(args.drafter_path, args.heavy_path, device=str(device))
+        if args.compile_draft:
+            draft = torch.compile(draft)
+    else:
+        draft = None
 
     decoder = ThresholdParallelDecoder(temperature=0, threshold=args.heavy_threshold, mask_id=MASK_ID, eos_id=EOS_ID)
     cache_factory = KVCacheFactory("prefix", is_bd_model=True, backend="sglang", max_length=max_length)
