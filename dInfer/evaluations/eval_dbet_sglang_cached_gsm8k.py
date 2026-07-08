@@ -121,6 +121,15 @@ def main():
           f"graphs={args.cuda_graph} compile_draft={args.compile_draft} h{args.heavy_threshold} "
           f"d{args.draft_threshold} k{args.draft_top_k} fix={not args.no_draft_fix} -> {args.out_path}")
 
+    if args.compile_draft and rows:                                   # warm up the compiled draft OFF the timer
+        wmsg = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=rows[0]["question"])}]
+        wpid = tok.apply_chat_template(wmsg, add_generation_prompt=True, tokenize=True, return_tensors="pt").to(device)
+        for _ in range(2):
+            dllm.diff_iteration.reset()
+            dllm.generate(wpid, gen_length=args.gen_length, block_length=args.block_length)
+        torch.cuda.synchronize()
+        print("[warmup] compiled draft warmed (2 generates) -> timed loop is steady-state")
+
     t0 = time.time(); tot_tok = 0; tot_wall = 0.0; tot_fwd = 0; tot_dc = 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
         for i, row in enumerate(rows):
