@@ -4,7 +4,12 @@
 # eager). 18 runs. SGLang first (fast, numbers early), eager LLaDA last (slowest). A failed run logs
 # and the sweep continues.
 #
-#   DR=/path/to/drafter [HEAVY=../DMax-Math-16B] [LIMIT=500] [GEN=512] bash evaluations/baseline_night.sh
+#   DR=/path/to/drafter [HEAVY=../DMax-Math-16B] [LLADA=../LLaDA2.0-mini] [LIMIT=500] [GEN=512] \
+#     bash evaluations/baseline_night.sh
+#
+# LLaDA rows use the OFFICIAL LLaDA2.0 weights ($LLADA) and official decode semantics: eager loads the
+# checkpoint's own generate() via trust_remote_code; sglang uses FixedParallelDecoder.decode_uniform
+# (official schedule + 0.95-overshoot + mid-block EOS exit) on the same weights.
 #
 # Empty LIMIT = full GSM8K test (1319). Everything lands in $OUT (jsonl + .log per run), then
 # summarize_baseline.py writes summary.tsv (accuracy + heavy/ex + draft/ex + wall/ex + tok/s).
@@ -12,6 +17,7 @@
 cd "$(dirname "$0")/.." || exit 1                       # dInfer root (evaluations/ paths below)
 
 HEAVY=${HEAVY:-../DMax-Math-16B}
+LLADA=${LLADA:-../LLaDA2.0-mini}
 DR=${DR:?set DR to the drafter ckpt path}
 LIMIT=${LIMIT:-}
 GEN=${GEN:-512}
@@ -38,7 +44,8 @@ EAGER=(python evaluations/eval_dbet_gsm8k.py --heavy_path "$HEAVY" --drafter_pat
 
 # ---------- SGLANG (fast) ----------
 for s in 16 9 6; do
-  run "sglang_llada_s${s}" "${SGL[@]}" --no_draft --decoder fixed --steps "$s"
+  run "sglang_llada_s${s}" python evaluations/eval_dbet_sglang_cached_gsm8k.py --heavy_path "$LLADA" \
+      --gen_length "$GEN" --block_length 32 --cuda_graph --no_draft --decoder fixed --steps "$s"
 done
 for h in 0.5 0.7 0.9; do
   run "sglang_dmax_h${h}" "${SGL[@]}" --no_draft --heavy_threshold "$h"
@@ -56,8 +63,8 @@ for h in 0.5 0.7 0.9; do
   # eager decode has ONE draft threshold gating both EXTEND and FIX -> 0.9 == d0.9+dfix0.9
   run "eager_dbet_h${h}" "${EAGER[@]}" --heavy_threshold "$h" --draft_threshold 0.9 --draft_top_k 2
 done
-for s in 16 9 6; do                                     # slowest family last
-  run "eager_llada_s${s}" python evaluations/eval_llada_gsm8k.py --heavy_path "$HEAVY" \
+for s in 16 9 6; do                                     # slowest family last (official non-fused eager MoE)
+  run "eager_llada_s${s}" python evaluations/eval_llada_gsm8k.py --model_path "$LLADA" \
       --gen_length "$GEN" --block_length 32 --steps "$s"
 done
 
