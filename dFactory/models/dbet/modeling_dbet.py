@@ -569,9 +569,9 @@ class DbetDraftStack(nn.Module):
 
     def new_fixed_prefix_cache(self, max_len, device, dtype=torch.bfloat16):
         """A FixedPrefixCache sized for THIS drafter (static-shape prefix -> torch.compile fast path in the decode)."""
-        cfg = self.config
-        hd = cfg.resolved_draft_hidden_size // cfg.draft_num_attention_heads
-        return FixedPrefixCache(cfg.draft_num_layers, cfg.draft_num_key_value_heads, hd, max_len, dtype, device)
+        cfg = self.config                                           # use RESOLVED head counts (raw fields may be -1)
+        return FixedPrefixCache(cfg.draft_num_layers, cfg.resolved_draft_num_key_value_heads,
+                                cfg.draft_head_dim, max_len, dtype, device)
 
 
 # ======================================================================================
