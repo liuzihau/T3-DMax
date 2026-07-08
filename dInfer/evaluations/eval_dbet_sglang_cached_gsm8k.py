@@ -83,6 +83,8 @@ def main():
     p.add_argument("--draft_top_k", type=int, default=2)
     p.add_argument("--draft_tau", type=float, default=1.0)
     p.add_argument("--no_draft_fix", action="store_true")
+    p.add_argument("--diag", action="store_true", help="FIX-quality diagnostic: compare draft FIX decisions vs the "
+                   "heavy's 2nd-look (its logits at the soft-embedded committed slots); prints precision/recall/token-acc")
     p.add_argument("--no_draft", action="store_true", help="pure heavy-only baseline in the SAME cached decode "
                    "(threshold can't disable the drafter: EXTEND always commits the leftmost slot for progress)")
     p.add_argument("--cuda_graph", action="store_true", help="enable CUDA graphs (default OFF -> debug the injection)")
@@ -113,6 +115,8 @@ def main():
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
+    if args.diag:
+        dllm.diff_iteration.diag_on = True
 
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
@@ -163,6 +167,18 @@ def main():
           f"draft_commits/ex={tot_dc/n:.1f}  (heavy-only baseline ~927 tok/s; draft_commits=0 => injection NOT hit)")
     print(f"[sglang-dbet-cached] grade: python {os.path.join(_HERE,'val_gsm8k.py')} --pred-path {args.out_path}"
           + (f" --limit {args.limit}" if args.limit else ""))
+
+    if args.diag:
+        f = dllm.diff_iteration.diag_fix
+        dfix = max(f["dfix"], 1); h2 = max(f["h2flip"], 1); tp = max(f["tp"], 1); com = max(f["committed"], 1)
+        print("\n[FIX-DIAG] draft FIX decisions vs the heavy's 2nd-look (logits at the soft-embedded committed slots):")
+        print(f"  committed-slot evals : {f['committed']}")
+        print(f"  heavy 2nd-look flips : {f['h2flip']}  ({100*f['h2flip']/com:.1f}% of committed -- the real mistake rate)")
+        print(f"  draft WANTED to fix  : {f['dfix']}  ({100*f['dfix']/com:.1f}% of committed)")
+        print(f"  PRECISION  tp/dfix   : {100*f['tp']/dfix:.1f}%   (of the draft's fixes, how many the heavy also flips)")
+        print(f"  RECALL     tp/flip   : {100*f['tp']/h2:.1f}%   (of the heavy's fixes, how many the draft catches)")
+        print(f"  TOKEN-ACC  of tp     : {100*f['tp_right']/tp:.1f}%   (of caught fixes, draft token == heavy's)")
+        print(f"  BAD FIXES  fp/dfix   : {100*f['fp']/dfix:.1f}%   (draft overrides a slot the heavy would KEEP)")
 
 
 if __name__ == "__main__":

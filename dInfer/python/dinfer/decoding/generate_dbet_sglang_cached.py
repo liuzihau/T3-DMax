@@ -45,6 +45,10 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         else:
             self.draft_cache = None
         self.draft_commits = 0
+        # FIX-quality diagnostic (off by default): compare each draft FIX decision on a committed slot to the
+        # heavy's 2nd-look (its logits at that slot, which is soft-embedded this forward = the verifier signal).
+        self.diag_on = False
+        self.diag_fix = {"committed": 0, "h2flip": 0, "dfix": 0, "tp": 0, "tp_right": 0, "fp": 0}
 
     def reset(self):
         if self.draft_cache is not None:
@@ -105,6 +109,17 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         if dconf is None:
             return output, Breakflag, embeddings
         darg = dlogits[0].argmax(-1); dc = dconf[0]
+
+        if self.diag_on and bool(committed_before.any()):            # FIX-quality vs the heavy's 2nd-look
+            cb = committed_before
+            h2 = block_logits[0].argmax(-1)                          # heavy's opinion on committed (soft-embedded) slots
+            commit = block_x
+            dfix = cb & (dc >= self.draft_threshold) & (darg != commit)   # the draft WANTS to override
+            h2flip = cb & (h2 != commit)                             # the heavy's 2nd look would change it (real mistake)
+            tp = dfix & h2flip
+            f = self.diag_fix
+            f["committed"] += int(cb.sum()); f["h2flip"] += int(h2flip.sum()); f["dfix"] += int(dfix.sum())
+            f["tp"] += int(tp.sum()); f["tp_right"] += int((tp & (darg == h2)).sum()); f["fp"] += int((dfix & ~h2flip).sum())
 
         # EXTEND: left-to-right prefix commit of masked slots while conf >= threshold (>=1 for progress)
         mloc = mask_pos.nonzero(as_tuple=True)[0]
