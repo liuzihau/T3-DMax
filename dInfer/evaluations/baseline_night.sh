@@ -21,12 +21,14 @@ mkdir -p "$OUT"
 LIM=()
 [ -n "$LIMIT" ] && LIM=(--limit "$LIMIT")
 
-run() {  # run <tag> <cmd...>
+run() {  # run <tag> <cmd...>  — a failed run's partial jsonl is moved aside so a rerun retries it
   local tag=$1; shift
   if [ -s "$OUT/$tag.jsonl" ]; then echo "=== [skip] $tag (jsonl exists) ==="; return; fi
   echo "=== [$(date +%H:%M:%S)] $tag ==="
-  "$@" --out_path "$OUT/$tag.jsonl" "${LIM[@]}" >"$OUT/$tag.log" 2>&1 \
-    || echo "!!! $tag FAILED (see $OUT/$tag.log)"
+  if ! "$@" --out_path "$OUT/$tag.jsonl" "${LIM[@]}" >"$OUT/$tag.log" 2>&1; then
+    [ -e "$OUT/$tag.jsonl" ] && mv "$OUT/$tag.jsonl" "$OUT/$tag.jsonl.failed"
+    echo "!!! $tag FAILED (see $OUT/$tag.log)"
+  fi
 }
 
 SGL=(python evaluations/eval_dbet_sglang_cached_gsm8k.py --heavy_path "$HEAVY" \

@@ -119,7 +119,7 @@ def main():
         if not args.no_draft:
             raise SystemExit("--decoder fixed is the vanilla-LLaDA heavy baseline; pass --no_draft")
         from dinfer.decoding.parallel_strategy import FixedParallelDecoder
-        decoder = FixedParallelDecoder(temperature=0, steps=args.steps, mask_id=MASK_ID)
+        decoder = FixedParallelDecoder(temperature=0, steps=args.steps, mask_id=MASK_ID, eos_id=EOS_ID)
     else:
         decoder = ThresholdParallelDecoder(temperature=0, threshold=args.heavy_threshold, mask_id=MASK_ID, eos_id=EOS_ID)
     cache_factory = KVCacheFactory("prefix", is_bd_model=True, backend="sglang", max_length=max_length)

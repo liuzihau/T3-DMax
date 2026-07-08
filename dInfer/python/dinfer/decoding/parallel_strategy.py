@@ -827,11 +827,13 @@ class FixedParallelDecoder(ParallelDecoder):
             steps,
             remasking='low_confidence',
             mask_id=126336,
+            eos_id=126081,
     ):
         super().__init__(temperature, remasking, mask_id)
         self.steps = steps
         self.iter = 0
         self.mask_id = mask_id
+        self.eos_id = eos_id                # the generate wrappers read decoder.eos_id (TokenArray, early stop)
 
     def block_init(self, block_x, block_id):
         # TODO(zhengda) fix steps when distributed version changes gen length.
