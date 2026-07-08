@@ -171,14 +171,17 @@ def main():
     if args.diag:
         f = dllm.diff_iteration.diag_fix
         dfix = max(f["dfix"], 1); h2 = max(f["h2flip"], 1); tp = max(f["tp"], 1); com = max(f["committed"], 1)
+        fn = f["h2flip"] - f["tp"]                                # heavy flips but draft missed
         print("\n[FIX-DIAG] draft FIX decisions vs the heavy's 2nd-look (logits at the soft-embedded committed slots):")
         print(f"  committed-slot evals : {f['committed']}")
-        print(f"  heavy 2nd-look flips : {f['h2flip']}  ({100*f['h2flip']/com:.1f}% of committed -- the real mistake rate)")
-        print(f"  draft WANTED to fix  : {f['dfix']}  ({100*f['dfix']/com:.1f}% of committed)")
-        print(f"  PRECISION  tp/dfix   : {100*f['tp']/dfix:.1f}%   (of the draft's fixes, how many the heavy also flips)")
-        print(f"  RECALL     tp/flip   : {100*f['tp']/h2:.1f}%   (of the heavy's fixes, how many the draft catches)")
-        print(f"  TOKEN-ACC  of tp     : {100*f['tp_right']/tp:.1f}%   (of caught fixes, draft token == heavy's)")
-        print(f"  BAD FIXES  fp/dfix   : {100*f['fp']/dfix:.1f}%   (draft overrides a slot the heavy would KEEP)")
+        print(f"  heavy 2nd-look flips : {f['h2flip']}  ({100*f['h2flip']/com:.2f}% of committed -- the real mistake rate)")
+        print(f"  draft WANTED to fix  : {f['dfix']}  ({100*f['dfix']/com:.2f}% of committed)")
+        print(f"  tp (draft-fix & heavy-flip)      : {f['tp']}")
+        print(f"  fp (draft-fix & heavy-KEEP, BAD) : {f['fp']}")
+        print(f"  fn (heavy-flip & draft-missed)   : {fn}")
+        print(f"  tp_right (tp & draft==heavy tok) : {f['tp_right']}")
+        print(f"  PRECISION tp/dfix={100*f['tp']/dfix:.1f}%  RECALL tp/flip={100*f['tp']/h2:.1f}%  "
+              f"TOKEN-ACC={100*f['tp_right']/tp:.1f}%  BAD-FIX fp/dfix={100*f['fp']/dfix:.1f}%")
 
 
 if __name__ == "__main__":
