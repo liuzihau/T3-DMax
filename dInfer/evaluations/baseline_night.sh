@@ -4,8 +4,8 @@
 # eager). 18 runs. SGLang first (fast, numbers early), eager LLaDA last (slowest). A failed run logs
 # and the sweep continues.
 #
-#   DR=/path/to/drafter [HEAVY=../DMax-Math-16B] [LLADA=../LLaDA2.0-mini] [LIMIT=500] [GEN=512] \
-#     bash evaluations/baseline_night.sh
+#   DR=/path/to/drafter [HEAVY=../DMax-Math-16B] [HEAVY_EAGER=../DMax-Math-16B-moe-merge] \
+#     [LLADA=../LLaDA2.0-mini] [LIMIT=500] [GEN=512] bash evaluations/baseline_night.sh
 #
 # LLaDA rows use the OFFICIAL LLaDA2.0 weights ($LLADA) and official decode semantics: eager loads the
 # checkpoint's own generate() via trust_remote_code; sglang uses FixedParallelDecoder.decode_uniform
@@ -16,7 +16,8 @@
 
 cd "$(dirname "$0")/.." || exit 1                       # dInfer root (evaluations/ paths below)
 
-HEAVY=${HEAVY:-../DMax-Math-16B}
+HEAVY=${HEAVY:-../DMax-Math-16B}                        # sglang stack: per-expert layout
+HEAVY_EAGER=${HEAVY_EAGER:-../DMax-Math-16B-moe-merge}  # eager stack: merged/fused-MoE layout (load_dbet_model)
 LLADA=${LLADA:-../LLaDA2.0-mini}
 DR=${DR:?set DR to the drafter ckpt path}
 LIMIT=${LIMIT:-}
@@ -39,7 +40,7 @@ run() {  # run <tag> <cmd...>  — a failed run's partial jsonl is moved aside s
 
 SGL=(python evaluations/eval_dbet_sglang_cached_gsm8k.py --heavy_path "$HEAVY" \
      --gen_length "$GEN" --block_length 32 --cuda_graph)
-EAGER=(python evaluations/eval_dbet_gsm8k.py --heavy_path "$HEAVY" --drafter_path "$DR" \
+EAGER=(python evaluations/eval_dbet_gsm8k.py --heavy_path "$HEAVY_EAGER" --drafter_path "$DR" \
        --gen_length "$GEN" --block_length 32)
 
 # ---------- SGLANG (fast) ----------
