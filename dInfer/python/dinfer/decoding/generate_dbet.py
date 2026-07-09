@@ -240,7 +240,8 @@ class DbetGenerateStats:
 def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                      draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None):
+                      draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
+                      dmax_faithful=True):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -249,7 +250,12 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
     Block-based split (matches the heavy's block structure): the draft's PREFIX = earlier blocks [0,bs), its
     CANVAS = the whole current block [bs,be) (committed re-predictable + masked). Committed slots are shown to
     the draft as HARD tokens (default; consistent with training) or SOFT `MASK + heavy-soft-embed`
-    (`draft_committed_soft`). `use_draft=False` -> byte-for-byte DMax. attn = block-causal over [0,be)."""
+    (`draft_committed_soft`). `use_draft=False` -> byte-for-byte DMax. attn = block-causal over [0,be).
+    `dmax_faithful` (default True, 2026-07-10): apply DMax's decode_uniform semantics like decode_block_heavy —
+    (1) COMMITTED RE-DECODE each iter (heavy self-corrects its commits AND the drafter's), (2) EXIT on the DMax
+    breakflag (all active max_prob >= 0.9 OR nothing changed) instead of "no mask left" — the block runs DMax's
+    post-fill verification rounds. False = the pre-0709 LOOSE variant (exit at no-mask, commits never revised):
+    fewer heavy forwards but wrong commits are unrepairable except by drafter FIX (85.1% vs 90.2% at h0.5)."""
     if draft_fix_threshold is None:                       # FIX gets its own gate; None = old single-knob behavior
         draft_fix_threshold = draft_threshold
     device = x.device
@@ -263,7 +269,9 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
     canvas_idx = torch.zeros(1, be, dtype=torch.bool, device=device); canvas_idx[0, bs:be] = True
 
     it = 0
-    while it < max_iters and bool((x[0:1, bs:be] == MASK_ID).any()):
+    while it < max_iters:
+        if not dmax_faithful and not bool((x[0:1, bs:be] == MASK_ID).any()):
+            break                                                     # LOOSE: stop as soon as the block is full
         inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)   # [1, be, D] soft feed
         # ================= HEAVY forward + DMax decode_uniform commit (unchanged from DMax) =================
         _t = _now(device)
@@ -276,20 +284,36 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
         stats.heavy_time += _now(device) - _t
         stats.heavy_forwards += 1
 
-        mask_idx = (x[0:1, bs:be] == MASK_ID)
-        x0, high_conf_idx, _, breakflag = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
-        hci = high_conf_idx[0].nonzero(as_tuple=True)[0]
-        if hci.numel() > 0:
-            x[0, bs + hci] = x0[0, hci]
-            stats.heavy_commits += int(hci.numel())
+        curr = x[0, bs:be].clone()                                    # pre-update block tokens
+        mask_idx = (curr == MASK_ID).unsqueeze(0)
+        x0, high_conf_idx, max_probs, breakflag = dmax_commit_uniform(block_logits, mask_idx, active, heavy_threshold)
+        if dmax_faithful:
+            # DMax decode_uniform: overwrite (newly-high-conf masked | ALL committed — incl. drafter commits,
+            # which the heavy may thus revise/reject) with the fresh argmax; breakflag adds the nothing-changed
+            # condition so post-fill verification rounds terminate exactly like the sglang/dinfer path.
+            ui_mask = high_conf_idx[0] | (active[0] & (curr != MASK_ID))
+            ui = ui_mask.nonzero(as_tuple=True)[0]
+            changed_any = bool((x0[0][ui] != curr[ui]).any()) if ui.numel() > 0 else False
+            if ui.numel() > 0:
+                x[0, bs + ui] = x0[0][ui]
+            stats.heavy_commits += int(high_conf_idx[0].sum())
+            breakflag = bool((max_probs[0][active[0]] >= 0.9).all()) or (not changed_any)
+        else:
+            hci = high_conf_idx[0].nonzero(as_tuple=True)[0]
+            if hci.numel() > 0:
+                x[0, bs + hci] = x0[0, hci]
+                stats.heavy_commits += int(hci.numel())
         # re-soft-embed ALL committed from the heavy's fresh logits (heavy re-verifies / re-encodes)
         committed = active[0] & (x[0, bs:be] != MASK_ID)
         ci = committed.nonzero(as_tuple=True)[0]
         if ci.numel() > 0:
             block_embeds[0, ci] = _soft_embed(block_logits[0, ci], embed, MASK_ID, heavy_tau, heavy_top_k)
 
-        # ---- DMax EXIT rule (heavy is the arbiter): breakflag OR no mask left -> block DONE, no draft this step ----
-        if bool(breakflag) or not bool((x[0:1, bs:be] == MASK_ID).any()):
+        # ---- DMax EXIT rule (heavy is the arbiter): block DONE -> no draft this step ----
+        if dmax_faithful:
+            if bool(breakflag):
+                break
+        elif bool(breakflag) or not bool((x[0:1, bs:be] == MASK_ID).any()):
             break
         if not use_draft:                                             # HEAVY-ONLY = pure DMax
             it += 1
@@ -550,7 +574,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
-                  use_cache=False, progress_desc=None):
+                  use_cache=False, progress_desc=None, dmax_faithful=True):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -571,6 +595,9 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
     stats = DbetGenerateStats()
     eos_cut = L
     cached = use_cache and use_draft                                   # incremental cross-block prefix-KV cache (DBet only)
+    if cached and dmax_faithful:
+        print("[dbet] NOTE: --use_cache path keeps the pre-0709 LOOSE exit semantics (no committed re-decode / "
+              "no post-fill verification); faithful mode applies to the no-cache path only.")
     # persistent caches spanning ALL blocks: hold the settled prefix [0, settled); grown one block at a time.
     heavy_cache = _new_dynamic_cache() if cached else None
     draft_cache = _new_dynamic_cache() if cached else None
@@ -599,7 +626,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
                                   draft_tau=draft_tau, draft_top_k=draft_top_k,
                                   draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
-                                  draft_fix_threshold=draft_fix_threshold)
+                                  draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)

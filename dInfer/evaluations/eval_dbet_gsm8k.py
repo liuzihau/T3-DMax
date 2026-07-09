@@ -70,6 +70,10 @@ def main():
     p.add_argument("--draft_committed_soft", action="store_true",
                    help="show heavy-committed slots to the draft as MASK+soft-embed (re-predictable) not hard tokens.")
     p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
+    p.add_argument("--loose_exit", action="store_true",
+                   help="pre-0709 DBet loop semantics: exit at no-mask, commits never revised by the heavy. "
+                        "Default (off) = DMax-faithful: committed re-decode + post-fill verification rounds, "
+                        "matching decode_block_heavy and the sglang/dinfer decode_uniform.")
     p.add_argument("--use_cache", action="store_true",
                    help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
     p.add_argument("--no_early_stop", action="store_true")
@@ -106,7 +110,7 @@ def main():
                 draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
                 draft_fix_threshold=args.draft_fix_threshold,
-                use_cache=args.use_cache)
+                use_cache=args.use_cache, dmax_faithful=not args.loose_exit)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits

@@ -45,10 +45,13 @@ def summarize(jsonl_path):
 
     heavy = mean("heavy_forwards") if "heavy_forwards" in rows[0] else mean("forwards")
     draft = mean("draft_forwards") if "draft_forwards" in rows[0] else 0.0
+    # draft_commits exists in BOTH schemas (eager + sglang) — the actual drafter activity signal
+    dcommit = mean("draft_commits") if "draft_commits" in rows[0] else 0.0
     tok = mean("gen_tokens")
     wall = mean("wall_time")
     tps = tok / wall if wall and wall == wall and wall > 0 else float("nan")
-    return {"n": n, "heavy/ex": heavy, "draft/ex": draft, "tok/ex": tok, "wall/ex": wall, "tok/s": tps}
+    return {"n": n, "heavy/ex": heavy, "draft/ex": draft, "dcommit/ex": dcommit,
+            "tok/ex": tok, "wall/ex": wall, "tok/s": tps}
 
 
 def main():
@@ -59,7 +62,7 @@ def main():
 
     files = sorted(glob.glob(os.path.join(args.dir, "*.jsonl")))
     out_path = args.out or os.path.join(args.dir, "summary.tsv")
-    cols = ["config", "n", "accuracy", "heavy/ex", "draft/ex", "tok/ex", "wall/ex", "tok/s"]
+    cols = ["config", "n", "accuracy", "heavy/ex", "draft/ex", "dcommit/ex", "tok/ex", "wall/ex", "tok/s"]
     lines = ["\t".join(cols)]
     for f in files:
         s = summarize(f)
@@ -69,7 +72,7 @@ def main():
         acc = grade(f)
         name = os.path.splitext(os.path.basename(f))[0]
         lines.append("\t".join([name, str(s["n"]), f"{acc:.2f}%", f"{s['heavy/ex']:.1f}",
-                                f"{s['draft/ex']:.1f}", f"{s['tok/ex']:.0f}",
+                                f"{s['draft/ex']:.1f}", f"{s['dcommit/ex']:.1f}", f"{s['tok/ex']:.0f}",
                                 f"{s['wall/ex']:.2f}", f"{s['tok/s']:.1f}"]))
         print(lines[-1])
     with open(out_path, "w", encoding="utf-8") as fh:
