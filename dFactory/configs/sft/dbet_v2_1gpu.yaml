@@ -1,0 +1,106 @@
+# DBet TRAIN-V2 -- G/A dual-rollout + mask-route + on-policy round (experiment.md §train-v2), 1 H200.
+#
+# Recipe per step (heavy FROZEN; ~9 heavy fwds + 4 drafter fwds, ~4.5x v1 heavy compute):
+#   G rollout: 5 careful passes @0.9 -> reference dist p + trust window (last committed prefix per block)
+#   A pass:    1 reckless pass @ sampled {0.3,0.5,0.7} -> dense wrong commits (the training stage)
+#   Drafter:   2 routes on the post-A state -- H (commits hard) / M (commits re-MASKed)
+#   Verifier:  1 pass (soft re-feed) -> p'
+#   Loss:      H: 0.1*CE(p') + 1.0*L1(p') + 0.1*CE(golden) ; M: 0.3*CE(p)[trust] + 0.7*L1(p') + 0.1*CE(golden)
+#   Sendback:  route-H commits (extend 0.8 / fix 0.9 / k2) -> 1 heavy pass -> re-commit -> rounds 3-5 again
+#
+# Same 1-GPU constraints as dbet_bd_1gpu.yaml (no FSDP on 1 GPU -> eager cuda build, model unwrapped).
+# Launch:
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dbet_v2.py configs/sft/dbet_v2_1gpu.yaml
+model:
+  config_path: ./dbet_init
+  model_path: ./dbet_init                # fresh start; point at a trained hf_ckpt to CONTINUE from v1 weights
+  tokenizer_path: ../DMax-Math-16B-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 1.0             # V2 REQUIREMENT: sigma=1 -> the noisy answer region arrives ALL-MASK;
+  noise_range_high: 1.0            #   the G/A rollouts generate the training states themselves.
+  revealed_corrupt_rate: 0.0       # inert at sigma=1 (nothing is revealed)
+  num_workers: 16
+
+train:
+  output_dir: ./dbet_v2_outputs
+  data_parallel_mode: ddp
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  num_train_epochs: 1
+  max_steps: 20000                  # v2 step ~4.5x v1 heavy compute -> fewer steps per night; scale as needed
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true      # fp32 drafter + bf16 fused experts (same trick as v1 1-GPU)
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  broadcast_model_weights_from_rank0: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_steps: 5000
+  save_epochs: 1
+  save_hf_weights: true
+  # --- shared DBet knobs ---
+  block_diffusion_mode: true
+  block_size: 32
+  heavy_commit_threshold: 0.5      # INERT for the v2 step (A samples its own); used by the shared eval probe
+  conf_loss_weight: 1.0
+  align_ce_weight: 0.1             # route H: CE toward the verifier p'
+  align_l1_weight: 1.0             # route H: L1 toward p'
+  golden_ce_weight: 0.1            # both routes: small golden-text nudge (counterweight to a wrong p)
+  heavy_soft_tau: 1.0              # soft re-feed temperature (G rollout / verifier / heavy commits in round 2)
+  heavy_soft_top_k: 1
+  # --- V2 knobs ---
+  g_passes: 5                      # careful-reference rollout length
+  g_threshold: 0.9
+  a_thresholds: "0.3,0.5,0.7"      # reckless commit threshold, sampled per micro-batch
+  m_ce_p_weight: 0.3               # route M: CE toward the careful reference p (trust-window only)
+  m_l1_weight: 0.7                 # route M: L1 toward the verifier p'
+  sendback_extend_threshold: 0.8   # on-policy round: drafter EXTEND gate
+  sendback_fix_threshold: 0.9      #   drafter FIX gate
+  sendback_top_k: 2                #   drafter-commit soft-embed top-k
+  sendback_tau: 1.0
+  # --- loss decay over the remaining region (committed slots use peak weight 1.0, no decay) ---
+  loss_decay_mode: dflash
+  loss_decay_base: 0.9
+  loss_decay_floor: 0.1
+  loss_decay_head: 0.95
+  loss_decay_tail: 0.8
+  loss_decay_window: 6
+  loss_decay_gamma: 16.0
+  same_token_labels: true
+  # --- metrics + held-out validation (the v1 sigma-sweep eval stays as the drafter-quality probe) ---
+  use_wandb: false
+  log_steps: 20
+  eval_steps: 500
+  eval_holdout_size: 128
+  eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
+  eval_at_start: true
+  eval_tpf: 6
+  eval_heavy_second: true
+  skip_nonfinite_steps: true
