@@ -18,7 +18,11 @@ cd "$(dirname "$0")/.." || exit 1                       # dInfer root (evaluatio
 
 HEAVY=${HEAVY:-../DMax-Math-16B}                        # sglang stack: per-expert layout
 HEAVY_EAGER=${HEAVY_EAGER:-../DMax-Math-16B-moe-merge}  # eager stack: merged/fused-MoE layout (load_dbet_model)
-LLADA=${LLADA:-../LLaDA2.0-mini}
+LLADA=${LLADA:-../LLaDA2.0-mini}                        # sglang LLaDA rows: per-expert layout
+LLADA_EAGER=${LLADA_EAGER:-../LLaDA2.0-mini-moe-merge}  # eager LLaDA rows: MERGED layout (fused impl). Build once:
+                                                        #   cd ../dFactory && PYTHONPATH=$(pwd)/VeOmni:$(pwd) \
+                                                        #   python scripts/moe_convertor.py -i ../LLaDA2.0-mini \
+                                                        #     -o ../LLaDA2.0-mini-moe-merge -m merge
 DR=${DR:?set DR to the drafter ckpt path}
 LIMIT=${LIMIT:-}
 GEN=${GEN:-512}
@@ -64,9 +68,9 @@ for h in 0.5 0.7 0.9; do
   # eager decode has ONE draft threshold gating both EXTEND and FIX -> 0.9 == d0.9+dfix0.9
   run "eager_dbet_h${h}" "${EAGER[@]}" --heavy_threshold "$h" --draft_threshold 0.9 --draft_top_k 2
 done
-for s in 16 9 6; do                                     # slowest family last (official non-fused eager MoE)
-  run "eager_llada_s${s}" python evaluations/eval_llada_gsm8k.py --model_path "$LLADA" \
-      --gen_length "$GEN" --block_length 32 --steps "$s"
+for s in 16 9 6; do
+  run "eager_llada_s${s}" python evaluations/eval_llada_gsm8k.py --model_path "$LLADA_EAGER" \
+      --model_impl fused --gen_length "$GEN" --block_length 32 --steps "$s"
 done
 
 # ---------- SUMMARY ----------

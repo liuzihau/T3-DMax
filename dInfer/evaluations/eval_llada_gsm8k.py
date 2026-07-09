@@ -1,11 +1,18 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# LLaDA-2.0 GSM8K decode driver (EAGER, official): loads the OFFICIAL checkpoint (e.g. ../LLaDA2.0-mini)
-# with trust_remote_code and calls ITS OWN `model.generate(...)` — the reference block-diffusion decode from
-# inclusionAI/LLaDA2.X (per-step quota over the full block_length + >threshold overshoot + mid-block EOS
-# early-exit). Nothing re-implemented; heavy forwards are counted by wrapping model.forward (the official
-# generate calls self.forward once per denoise step).
+# LLaDA-2.0 GSM8K decode driver (EAGER, official algorithm): calls the OFFICIAL `model.generate(...)` — the
+# reference block-diffusion decode from inclusionAI/LLaDA2.X (per-step quota over the full block_length +
+# >threshold overshoot + mid-block EOS early-exit). Heavy forwards are counted by wrapping model.forward
+# (generate calls self.forward once per denoise step).
+#
+# Two loaders, SAME algorithm (dFactory's vendored generate() is AST-verified semantically identical to the
+# HF checkpoint's — only mask construction style and line wrapping differ):
+#   --model_impl fused  (default): vendored LLaDA2MoeModelLM, fused-MoE kernels + sdpa. ~6x faster/forward;
+#       REQUIRES a MERGED checkpoint: python scripts/moe_convertor.py -i ../LLaDA2.0-mini \
+#           -o ../LLaDA2.0-mini-moe-merge -m merge   (run from dFactory with VeOmni on PYTHONPATH)
+#   --model_impl remote: the checkpoint's own remote code (non-fused per-expert MoE) — the byte-authentic
+#       reference; use for spot-check A/Bs, too slow for full sweeps (~230ms vs ~40ms per forward).
 #
 # Output jsonl (same keys as the sglang driver -> one summarizer works for both):
 #   {"answer", "question", "forwards", "gen_tokens", "wall_time"}
@@ -14,11 +21,16 @@
 import argparse
 import json
 import os
+import sys
 import time
 
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_T3_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+_DFACTORY = os.path.join(_T3_ROOT, "dFactory")
+if os.path.isdir(_DFACTORY) and _DFACTORY not in sys.path:
+    sys.path.insert(0, _DFACTORY)
 
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
@@ -42,10 +54,29 @@ def load_gsm8k_test(limit=None, gt_jsonl_path=None):
     return rows
 
 
+def load_fused(model_path, device="cuda"):
+    """Vendored LLaDA2MoeModelLM with fused-MoE + sdpa (the DMax-eager-speed path). `model_path` MUST be a
+    MERGED checkpoint (moe_convertor.py -m merge); its generate() is the verified-identical official decode."""
+    from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
+    from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM
+
+    hcfg = LLaDA2MoeConfig.from_pretrained(model_path, trust_remote_code=True)
+    if not str(hcfg.model_type).endswith("_veomni"):
+        hcfg.model_type = str(hcfg.model_type) + "_veomni"
+    hcfg.moe_implementation = "fused"
+    m = LLaDA2MoeModelLM.from_pretrained(
+        model_path, config=hcfg, dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation="sdpa")
+    return m.eval().to(device)
+
+
 def main():
-    p = argparse.ArgumentParser(description="LLaDA-2.0 GSM8K decode (official checkpoint + official generate)")
+    p = argparse.ArgumentParser(description="LLaDA-2.0 GSM8K decode (official generate; fused or remote impl)")
     p.add_argument("--model_path", required=True,
-                   help="official LLaDA2.0 checkpoint dir (e.g. ../LLaDA2.0-mini); its remote code supplies generate()")
+                   help="LLaDA2.0 checkpoint dir: MERGED (e.g. ../LLaDA2.0-mini-moe-merge) for --model_impl "
+                        "fused, or the original HF layout for --model_impl remote")
+    p.add_argument("--model_impl", choices=["fused", "remote"], default="fused",
+                   help="fused = vendored fused-MoE class (fast; needs merged ckpt); remote = the checkpoint's "
+                        "own code (authentic reference, ~6x slower/forward)")
     p.add_argument("--tokenizer_path", default=None)
     p.add_argument("--out_path", required=True)
     p.add_argument("--gen_length", type=int, default=512)
@@ -60,8 +91,11 @@ def main():
 
     mp = os.path.abspath(args.model_path)
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or mp), trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        mp, trust_remote_code=True, dtype=torch.bfloat16, low_cpu_mem_usage=True).to(args.device).eval()
+    if args.model_impl == "fused":
+        model = load_fused(mp, args.device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            mp, trust_remote_code=True, dtype=torch.bfloat16, low_cpu_mem_usage=True).to(args.device).eval()
     eos_id = int(getattr(model.config, "eos_token_id", 156892) or 156892)
 
     # count denoise forwards: the official generate() calls self.forward per step; an instance attribute
@@ -76,8 +110,9 @@ def main():
 
     rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or ".", exist_ok=True)
-    print(f"[gsm8k-llada-official] {len(rows)} ex gen={args.gen_length} block={args.block_length} "
-          f"steps={args.steps} thr={args.threshold} T={args.temperature} eos={eos_id} -> {args.out_path}")
+    print(f"[gsm8k-llada-official] {len(rows)} ex impl={args.model_impl} gen={args.gen_length} "
+          f"block={args.block_length} steps={args.steps} thr={args.threshold} T={args.temperature} "
+          f"eos={eos_id} -> {args.out_path}")
 
     t0 = time.time(); tot_tok = 0; tot_wall = 0.0; tot_fwd = 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
