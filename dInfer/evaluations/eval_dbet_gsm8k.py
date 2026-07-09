@@ -58,6 +58,8 @@ def main():
     p.add_argument("--block_length", type=int, default=32, help="MUST match training (32).")
     p.add_argument("--heavy_threshold", type=float, default=0.9, help="heavy decode_uniform commit confidence.")
     p.add_argument("--draft_threshold", type=float, default=0.7, help="trained conf-head gate for drafter commits.")
+    p.add_argument("--draft_fix_threshold", type=float, default=None,
+                   help="separate conf gate for FIX (override committed slots); default = --draft_threshold.")
     p.add_argument("--max_iters_per_block", type=int, default=32)
     p.add_argument("--max_draft_iters", type=int, default=1, help="drafter passes per heavy forward.")
     p.add_argument("--heavy_only", action="store_true", help="pure-DMax baseline (no drafter) via the same harness.")
@@ -103,6 +105,7 @@ def main():
                 heavy_tau=args.heavy_tau, heavy_top_k=args.heavy_top_k,
                 draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
+                draft_fix_threshold=args.draft_fix_threshold,
                 use_cache=args.use_cache)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards

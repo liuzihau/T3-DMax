@@ -233,7 +233,7 @@ class DbetGenerateStats:
 def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                      draft_committed_soft=False, draft_fix=True):
+                      draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -243,6 +243,8 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
     CANVAS = the whole current block [bs,be) (committed re-predictable + masked). Committed slots are shown to
     the draft as HARD tokens (default; consistent with training) or SOFT `MASK + heavy-soft-embed`
     (`draft_committed_soft`). `use_draft=False` -> byte-for-byte DMax. attn = block-causal over [0,be)."""
+    if draft_fix_threshold is None:                       # FIX gets its own gate; None = old single-knob behavior
+        draft_fix_threshold = draft_threshold
     device = x.device
     embed = model.draft.frozen_embed
     active = (x[0:1, bs:be] == MASK_ID)                                # original decode region (all-mask at block start)
@@ -317,9 +319,9 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             x[0, bs + sel] = darg[sel]
             block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
             stats.draft_commits += int(sel.numel())
-        # ---- FIX: override a committed slot only if conf-head >= draft_threshold AND the draft disagrees ----
+        # ---- FIX: override a committed slot only if conf-head >= its OWN threshold AND the draft disagrees ----
         if draft_fix and bool(committed_before.any()):
-            fix = committed_before & (dc >= draft_threshold) & (darg != block_x)
+            fix = committed_before & (dc >= draft_fix_threshold) & (darg != block_x)
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x[0, bs + floc] = darg[floc]
@@ -359,7 +361,7 @@ def _crop_cache(cache, length):
 def decode_block_dbet_cached(model, x, bs, be, settled, heavy_cache, draft_cache, block_length,
                              heavy_threshold, draft_threshold, max_iters, tau, stats,
                              heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                             draft_committed_soft=False, draft_fix=True):
+                             draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None):
     """INCREMENTAL cross-block prefix-KV cache (heavy AND draft). Persistent caches hold the settled prefix
     [0, settled); on entry `settled == bs - blk` (or 0 for the first block) and the caches hold [0, settled).
     Returns (heavy_cache, draft_cache, new_settled=bs).
@@ -374,6 +376,8 @@ def decode_block_dbet_cached(model, x, bs, be, settled, heavy_cache, draft_cache
     The draft reads its cached prefix K/V (constant within the block), so its k_pre/v_pre are derived once per
     settled block, not re-fused every round. Correct = iso with decode_block_dbet up to bf16 non-associativity
     (the prefix is settled-HARD + block-causally isolated, so its cached KV/h_sel equal a fresh HARD forward's)."""
+    if draft_fix_threshold is None:                       # FIX gets its own gate; None = old single-knob behavior
+        draft_fix_threshold = draft_threshold
     device = x.device
     embed = model.draft.frozen_embed
     mdt = embed.weight.dtype
@@ -447,7 +451,7 @@ def decode_block_dbet_cached(model, x, bs, be, settled, heavy_cache, draft_cache
             block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
             stats.draft_commits += int(sel.numel())
         if draft_fix and bool(committed_before.any()):
-            fix = committed_before & (dc >= draft_threshold) & (darg != block_x)
+            fix = committed_before & (dc >= draft_fix_threshold) & (darg != block_x)
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x[0, bs + floc] = darg[floc]
@@ -538,7 +542,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_threshold=0.9, draft_threshold=0.7, max_iter_per_block=32,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
-                  draft_committed_soft=False, draft_fix=True, use_cache=False, progress_desc=None):
+                  draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
+                  use_cache=False, progress_desc=None):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -577,7 +582,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                 heavy_threshold, draft_threshold, max_iter_per_block, tau, stats,
                 heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
                 draft_tau=draft_tau, draft_top_k=draft_top_k,
-                draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+                draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
+                draft_fix_threshold=draft_fix_threshold)
         else:
             attn = build_block_causal_mask(be, block_length, dtype=model.draft.frozen_embed.weight.dtype, device=device)
             if use_draft:
@@ -585,7 +591,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   max_iter_per_block, max_draft_iters, tau, stats, use_draft=True,
                                   heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
                                   draft_tau=draft_tau, draft_top_k=draft_top_k,
-                                  draft_committed_soft=draft_committed_soft, draft_fix=draft_fix)
+                                  draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
+                                  draft_fix_threshold=draft_fix_threshold)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)
