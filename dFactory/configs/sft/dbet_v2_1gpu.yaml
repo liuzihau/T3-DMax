@@ -9,17 +9,26 @@
 #   Sendback:  route-H commits (extend 0.8 / fix 0.9 / k2) -> 1 heavy pass -> re-commit -> rounds 3-5 again
 #
 # Same 1-GPU constraints as dbet_bd_1gpu.yaml (no FSDP on 1 GPU -> eager cuda build, model unwrapped).
+#
+# FINETUNE FROM THE v1 DRAFTER (global_step_30000-v1): build the init dir ONCE (full heavy + trained drafter
+# + a fresh CORRECT config.json -- the exported hf_ckpt's config is degraded and drafter-only):
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
+#       --heavy_path ../DMax-Math-16B-moe-merge --out_dir ./dbet_v2_init \
+#       --draft_num_layers 5 --sel_layers 1,10,19 \
+#       --draft_ckpt ./dbet_outputs/checkpoints/global_step_30000-v1/hf_ckpt
+# FRESH DATA (v1 consumed ~40k random samples of the full file; this slice is ~97% unseen + documented):
+#   sed -n '40001,60000p' my_data/postprocess_train.jsonl > my_data/postprocess_train_40k_60k.jsonl
 # Launch:
 #   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dbet_v2.py configs/sft/dbet_v2_1gpu.yaml
 model:
-  config_path: ./dbet_init
-  model_path: ./dbet_init                # fresh start; point at a trained hf_ckpt to CONTINUE from v1 weights
+  config_path: ./dbet_v2_init
+  model_path: ./dbet_v2_init             # v1-trained drafter injected via build_dbet_init --draft_ckpt (above)
   tokenizer_path: ../DMax-Math-16B-moe-merge
   attn_implementation: sdpa
   moe_implementation: fused
 
 data:
-  train_path: ./my_data/postprocess_train.jsonl
+  train_path: ./my_data/postprocess_train_40k_60k.jsonl   # lines 40001-60000 (build with the sed above)
   data_type: conversation
   datasets_type: mapping
   dataloader_type: native
@@ -39,7 +48,7 @@ train:
   global_batch_size: 1
   micro_batch_size: 1
   num_train_epochs: 1
-  max_steps: 20000                  # v2 step ~4.5x v1 heavy compute -> fewer steps per night; scale as needed
+  max_steps: 20000                  # == the 20k-example slice: exactly one shuffled epoch of fresh data
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
@@ -97,7 +106,7 @@ train:
   # --- metrics + held-out validation (the v1 sigma-sweep eval stays as the drafter-quality probe) ---
   use_wandb: false
   log_steps: 20
-  eval_steps: 500
+  eval_steps: 1000                  # v2 steps are ~4.5x slower -> eval less often
   eval_holdout_size: 128
   eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
   eval_at_start: true
