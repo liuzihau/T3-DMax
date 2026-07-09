@@ -29,8 +29,12 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _T3_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _DFACTORY = os.path.join(_T3_ROOT, "dFactory")
-if os.path.isdir(_DFACTORY) and _DFACTORY not in sys.path:
-    sys.path.insert(0, _DFACTORY)
+# VeOmni must be importable BEFORE models.llada2_moe is imported: its module-level
+# `from veomni.ops import fused_moe_forward` is try/except'd to None, and a None kernel crashes the fused
+# forward later ("'NoneType' object is not callable"). Same insert generate_dbet.py does.
+for _p in (_DFACTORY, os.path.join(_DFACTORY, "VeOmni")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
@@ -58,8 +62,14 @@ def load_fused(model_path, device="cuda"):
     """Vendored LLaDA2MoeModelLM with fused-MoE + sdpa (the DMax-eager-speed path). `model_path` MUST be a
     MERGED checkpoint (moe_convertor.py -m merge); its generate() is the verified-identical official decode."""
     from models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
+    from models.llada2_moe import modeling_llada2_moe as _mod
     from models.llada2_moe.modeling_llada2_moe import LLaDA2MoeModelLM
 
+    if _mod.fused_moe_forward is None:
+        raise RuntimeError(
+            "fused-MoE kernel unavailable: `from veomni.ops import fused_moe_forward` failed at import time. "
+            "Ensure dFactory/VeOmni is on sys.path (this driver inserts it — check the path exists) or run in "
+            "an env with veomni installed; or fall back to --model_impl remote.")
     hcfg = LLaDA2MoeConfig.from_pretrained(model_path, trust_remote_code=True)
     if not str(hcfg.model_type).endswith("_veomni"):
         hcfg.model_type = str(hcfg.model_type) + "_veomni"
