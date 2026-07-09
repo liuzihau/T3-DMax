@@ -50,20 +50,27 @@ PAD_ID = 156892
 #                          model loading
 # ============================================================================
 def _backfill_heavy_fields(cfg, hcfg):
-    """The drafter's heavy-facing base fields (its -1 sizes resolve to these) MUST mirror the heavy — that's
-    how the drafter was built. Some transformers versions drop base-config fields when (de)serializing a
-    subclass config (seen: num_key_value_heads -> 0 in the dFactory env => ZeroDivision in DbetAttention),
-    so backfill anything missing/zero from the heavy config we load anyway."""
+    """The drafter's heavy-facing base fields MUST mirror the frozen heavy (the drafter reuses its embed /
+    lm_head / hiddens, and the -1 draft sizes resolve to them). Trained hf_ckpt config.jsons have shipped with
+    these at CLASS DEFAULTS (hidden_size 1024, num_key_value_heads 0, ... -> ZeroDivision in DbetAttention /
+    warm-start size mismatch), so mirror them from the heavy config UNCONDITIONALLY — hcfg is the ground truth
+    for the heavy the drafter runs against. Also repair draft_* overrides saved as 0 (never valid; 0 means the
+    field was lost -> restore -1 = match heavy)."""
     fields = ("num_key_value_heads", "num_attention_heads", "hidden_size", "intermediate_size",
               "head_dim", "rope_theta", "rms_norm_eps", "vocab_size", "max_position_embeddings")
     fixed = []
     for k in fields:
         hv = getattr(hcfg, k, None)
-        if hv and not getattr(cfg, k, None):
+        if hv is not None and getattr(cfg, k, None) != hv:
             setattr(cfg, k, hv)
             fixed.append(f"{k}={hv}")
+    for k in ("draft_hidden_size", "draft_num_attention_heads", "draft_num_key_value_heads",
+              "draft_intermediate_size", "fuse_hidden_size", "head_intermediate_size"):
+        if getattr(cfg, k, -1) == 0:
+            setattr(cfg, k, -1)
+            fixed.append(f"{k}: 0->-1")
     if fixed:
-        print(f"[dbet] config backfilled from heavy (missing/zero in drafter config.json): {', '.join(fixed)}")
+        print(f"[dbet] config mirrored from heavy (drafter config.json had defaults/zeros): {', '.join(fixed)}")
 
 
 def load_dbet_model(drafter_path, heavy_path, device="cuda"):
