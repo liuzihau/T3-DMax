@@ -152,10 +152,10 @@ class LLaDA2TrainingArguments(TrainingArguments):
     align_l1_weight: float = field(default=1.0, metadata={"help": "weight of L1/TV(draft, heavy) -- soft align (=1-accept)."})
     golden_ce_weight: float = field(default=0.1, metadata={"help": "small CE(draft, golden) nudge; 0 = pure DSpark "
                                                                   "(match heavy only). Higher re-buys divergence risk."})
-    align_to_2nd_pass: bool = field(default=False, metadata={"help": "if True: drafter REPLACES the heavy's 2nd "
-        "(verification) pass -- target = 2nd-pass logits over the FULL region (committed re-predicted + remaining), "
-        "so it drafts fixes to wrong 1st-pass commits; committed = peak weight. +1 frozen heavy forward/step. "
-        "Pair with a low heavy_commit_threshold (e.g. 0.5). False = match the 1st pass on remaining only."})
+    align_to_2nd_pass: bool = field(default=True, metadata={"help": "REMOVED KNOB (must stay True; kept only so "
+        "old yamls parse): the target is ALWAYS the heavy's 2nd (verifier) pass over committed+remaining. The old "
+        "False route targeted the PRE-commit 1st-pass logits on remaining-only -- an input/target mismatch (the "
+        "drafter's input is the POST-commit state) with zero FIX supervision. Setting False aborts at startup."})
     heavy_soft_tau: float = field(default=1.0, metadata={"help": "soft-embed temperature for re-feeding committed "
                                                                  "positions to the 2nd (verifier) pass."})
     heavy_soft_top_k: int = field(default=1, metadata={"help": "soft-embed top-k for the 2nd-pass committed re-feed."})
@@ -277,6 +277,11 @@ def _drafter_only_state_dict(state_dict):
 def main():
     dist.init_process_group(backend=get_nccl_backend())
     args = parse_args(Arguments)
+    if not args.train.align_to_2nd_pass:
+        raise ValueError(
+            "align_to_2nd_pass=False was REMOVED (2026-07-09): it targeted the heavy's PRE-commit 1st-pass "
+            "logits while the drafter's input is the POST-commit state (input/target mismatch, zero FIX "
+            "supervision). The verifier-pass target is now unconditional; delete the flag from the yaml.")
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")

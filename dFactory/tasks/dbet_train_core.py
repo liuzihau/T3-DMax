@@ -180,13 +180,13 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
     """DBet core step (requires the dual stream already in micro_batch: input_ids=[noisy|clean] [B,2L],
     attention_mask=[B,1,2L,2L] block-diffusion prototype, position_ids=[B,2L], noisy_input_ids=[B,L]).
     Returns loss/n_micro_batches (and a metrics dict if return_metrics).
-    `align_to_2nd_pass` (config): if True, the drafter learns to REPLACE the heavy's 2nd (verification) pass --
-    target = 2nd-pass logits over the FULL answer region (committed re-predicted + remaining), so it can draft
-    fixes to wrong 1st-pass commits; committed positions get the peak (first-masked-index) weight, no decay.
-    If False (default), the drafter matches the heavy's 1st pass on the remaining region only."""
+    Target = the heavy's 2nd (VERIFIER) pass, ALWAYS: the drafter's input is the POST-commit state, so the only
+    coherent target is the heavy's next-step distribution (commits re-fed as soft embeds) over the FULL answer
+    region -- committed re-predicted at peak weight (FIX supervision) + remaining decayed (EXTEND supervision).
+    (The old `align_to_2nd_pass=False` route targeted the PRE-commit 1st-pass logits on remaining-only: an
+    input/target mismatch with zero FIX signal. Removed 2026-07-09; the config flag now only guards startup.)"""
     core = model.module if hasattr(model, "module") else model         # unwrap FSDP1 if present
     bs = args.train.block_size
-    two_pass = bool(getattr(args.train, "align_to_2nd_pass", False))
 
     logits, conf, remaining, clean_ids, heavy_logits, post_commit = dbet_forward(
         core, micro_batch, args, mask_id, return_heavy_logits=True, return_post_commit=True)
@@ -201,19 +201,13 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
     rem = rem_orig & sup
     w = decay_weights(remaining, bs, **decay_kwargs(args)) * sup.float()   # decay (block-position correct), zeroed off-sup
 
-    committed = None
-    if two_pass:
-        # FULL supervised region = committed | remaining; target = 2nd heavy (verifier) pass; committed = peak weight.
-        tau = float(getattr(args.train, "heavy_soft_tau", 1.0))
-        topk = int(getattr(args.train, "heavy_soft_top_k", 1))
-        target_logits = _heavy_verify_pass(core, micro_batch, heavy_logits, committed_ctx, mask_id, tau, topk)
-        committed = committed_ctx & sup                               # supervised commits (for loss + fix metrics)
-        region = sup                                                  # supervised masked region (= committed | rem)
-        w = w.clone()
-        w[committed] = 1.0                                            # committed -> first-masked-index weight (no decay)
-    else:
-        target_logits = heavy_logits                                  # match the heavy 1st pass, remaining only
-        region = rem
+    # FULL supervised region = committed | remaining; target = 2nd heavy (verifier) pass; committed = peak weight.
+    tau = float(getattr(args.train, "heavy_soft_tau", 1.0))
+    topk = int(getattr(args.train, "heavy_soft_top_k", 1))
+    target_logits = _heavy_verify_pass(core, micro_batch, heavy_logits, committed_ctx, mask_id, tau, topk)
+    committed = committed_ctx & sup                                   # supervised commits (for loss + fix metrics)
+    region = sup                                                      # supervised masked region (= committed | rem)
+    w[committed] = 1.0                                                # committed -> first-masked-index weight (no decay)
 
     wl = w[region]                                                    # [n]
     denom = wl.sum().clamp_min(1.0)
@@ -261,7 +255,7 @@ def dbet_train_step(model, micro_batch, n_micro_batches, args, mask_id=MASK_ID, 
         "eos_acc": float(((darg == clean_ids) & eos_m).float().sum() / eos_m.float().sum().clamp_min(1)),  # termination
         "n_remaining": int(rem.sum()),
     }
-    if two_pass and committed is not None and bool(committed.any()):
+    if bool(committed.any()):
         h2c = target_logits[committed].argmax(-1)                     # 2nd-pass call on committed positions
         commit_tok = post_commit[committed]                          # what the 1st pass committed
         draftc = logits[committed].argmax(-1)
