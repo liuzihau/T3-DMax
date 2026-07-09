@@ -49,6 +49,23 @@ PAD_ID = 156892
 # ============================================================================
 #                          model loading
 # ============================================================================
+def _backfill_heavy_fields(cfg, hcfg):
+    """The drafter's heavy-facing base fields (its -1 sizes resolve to these) MUST mirror the heavy — that's
+    how the drafter was built. Some transformers versions drop base-config fields when (de)serializing a
+    subclass config (seen: num_key_value_heads -> 0 in the dFactory env => ZeroDivision in DbetAttention),
+    so backfill anything missing/zero from the heavy config we load anyway."""
+    fields = ("num_key_value_heads", "num_attention_heads", "hidden_size", "intermediate_size",
+              "head_dim", "rope_theta", "rms_norm_eps", "vocab_size", "max_position_embeddings")
+    fixed = []
+    for k in fields:
+        hv = getattr(hcfg, k, None)
+        if hv and not getattr(cfg, k, None):
+            setattr(cfg, k, hv)
+            fixed.append(f"{k}={hv}")
+    if fixed:
+        print(f"[dbet] config backfilled from heavy (missing/zero in drafter config.json): {', '.join(fixed)}")
+
+
 def load_dbet_model(drafter_path, heavy_path, device="cuda"):
     """Assemble DBet for inference: the FROZEN DMax heavy (fused MoE) + the trained drafter weights.
     `drafter_path` = the drafter-only hf_ckpt (heavy.* dropped at save; loaded strict=False).
@@ -67,6 +84,7 @@ def load_dbet_model(drafter_path, heavy_path, device="cuda"):
     if not str(hcfg.model_type).endswith("_veomni"):
         hcfg.model_type = str(hcfg.model_type) + "_veomni"
     hcfg.moe_implementation = "fused"
+    _backfill_heavy_fields(cfg, hcfg)
     heavy = LLaDA2MoeModelLM.from_pretrained(
         heavy_path, config=hcfg, dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation="sdpa")
 
@@ -100,6 +118,7 @@ def load_drafter_standalone(drafter_path, heavy_path, device="cuda", dtype=torch
     drafter_path = os.path.abspath(drafter_path); heavy_path = os.path.abspath(heavy_path)
     cfg = DbetConfig.from_pretrained(drafter_path)
     hcfg = LLaDA2MoeConfig.from_pretrained(heavy_path, trust_remote_code=True)
+    _backfill_heavy_fields(cfg, hcfg)
     V, Dh, eps = hcfg.vocab_size, hcfg.hidden_size, hcfg.rms_norm_eps
 
     # pull ONLY embed / lm_head / final-norm from the heavy shards (safe_open = lazy, loads just these tensors;
