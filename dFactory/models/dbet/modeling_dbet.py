@@ -492,6 +492,66 @@ class DbetConfidenceHead(nn.Module):
         return torch.sigmoid(self.mlp(hb)).squeeze(-1)
 
 
+class DbetMarkovHead(nn.Module):
+    """DSpark-style semi-autoregressive logits-BIAS head (DeepSpec markov_head.py) — the fix for suffix decay:
+    a parallel drafter predicts positions independently, so acceptance decays fast past the first token; this
+    head adds a cheap left-to-right correction  logits[k] += W2·f(W1[token[k-1]], hb[k])  with rank r << V.
+    Teacher-forced (parallel) at training via `block_bias`; chained on the drafter's own sampled tokens at
+    inference via `step_bias`. W2 is ZERO-INIT so an added head is an exact no-op at step 0 (safe warm
+    continuation from a markov-less checkpoint, same philosophy as the zero-init Δh head).
+    Types: 'vanilla' pure low-rank bigram (DSpark's shipped default); 'gated' bias gated by the drafter hidden;
+    'rnn' GRU-style state carrying the whole chain prefix (unrolled per block at training)."""
+
+    def __init__(self, config: DbetConfig):
+        super().__init__()
+        V, r = int(config.vocab_size), int(config.markov_rank)
+        d = config.resolved_draft_hidden_size
+        self.head_type = str(config.markov_head_type).lower()
+        self.rank = r
+        self.markov_w1 = nn.Embedding(V, r)
+        self.markov_w2 = nn.Linear(r, V, bias=False)
+        nn.init.zeros_(self.markov_w2.weight)                          # no-op at init
+        if self.head_type == "gated":
+            self.gate_proj = nn.Linear(d + r, r)
+        elif self.head_type == "rnn":
+            self.joint_proj = nn.Linear(2 * r + d, 3 * r)              # [state; W1[prev]; hb] -> [gate; cand; out]
+        elif self.head_type != "vanilla":
+            raise ValueError(f"unknown markov_head_type {self.head_type!r}")
+
+    def step_bias(self, prev_ids: torch.Tensor, hb: Optional[torch.Tensor] = None,
+                  state: Optional[torch.Tensor] = None):
+        """One chain step: prev_ids [...], hb [..., d] (gated/rnn) -> (bias [..., V], new_state|None)."""
+        e = self.markov_w1(prev_ids.long())
+        if self.head_type == "vanilla":
+            return self.markov_w2(e), None
+        if self.head_type == "gated":
+            g = torch.sigmoid(self.gate_proj(torch.cat([hb, e], dim=-1)))
+            return self.markov_w2(g * e), None
+        if state is None:
+            state = torch.zeros_like(e)
+        gate_raw, cand_raw, out_raw = self.joint_proj(torch.cat([state, e, hb], dim=-1)).chunk(3, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        new_state = gate * state + (1.0 - gate) * torch.tanh(cand_raw)
+        return self.markov_w2(torch.tanh(out_raw)), new_state
+
+    def block_bias(self, prev_ids: torch.Tensor, hb: Optional[torch.Tensor], block_size: int) -> torch.Tensor:
+        """Teacher-forced bias over a full sequence [B,L] -> [B,L,V]. vanilla/gated: ONE parallel op (the prev
+        tokens are known upfront — teacher forcing); rnn: head-only unroll over block positions, state reset
+        per block, still batched over B×num_blocks."""
+        if self.head_type in ("vanilla", "gated"):
+            bias, _ = self.step_bias(prev_ids, hb)
+            return bias
+        B, L = prev_ids.shape
+        nb = L // block_size
+        pid = prev_ids.view(B, nb, block_size)
+        h = hb.view(B, nb, block_size, -1)
+        state, outs = None, []
+        for k in range(block_size):
+            bias, state = self.step_bias(pid[:, :, k], h[:, :, k], state)
+            outs.append(bias)
+        return torch.stack(outs, dim=2).view(B, L, -1)
+
+
 # ======================================================================================
 # Drafter stack — the trainable body (everything except the frozen heavy)
 # ======================================================================================
@@ -528,6 +588,7 @@ class DbetDraftStack(nn.Module):
         self.norm = LLaDA2MoeRMSNorm(config.resolved_draft_hidden_size, eps=config.rms_norm_eps)
         self.delta_head = DbetDeltaHead(config)
         self.conf_head = DbetConfidenceHead(config) if config.use_confidence_head else None
+        self.markov_head = DbetMarkovHead(config) if int(getattr(config, "markov_rank", 0)) > 0 else None
 
     def forward(
         self,
@@ -543,6 +604,8 @@ class DbetDraftStack(nn.Module):
         tau: Optional[float] = None,
         commit_mix_mask: Optional[torch.Tensor] = None,
         commit_mix_alpha: Optional[float] = None,
+        markov_prev_ids: Optional[torch.Tensor] = None,
+        markov_block_size: Optional[int] = None,
     ) -> dict:
         cfg = self.config
         tau = tau if tau is not None else cfg.soft_embed_temp
@@ -575,8 +638,13 @@ class DbetDraftStack(nn.Module):
         hb = self.norm(x)
         h_draft = self.delta_head(hb, h_last_denoise)
         logits = self.frozen_lm_head(self.frozen_final_norm(h_draft))
+        # teacher-forced markov bias (TRAINING path; FSDP-safe because it runs inside forward). Inference
+        # applies the bias OUTSIDE the (compiled) forward: parallel for known left-neighbors, chained for the
+        # EXTEND walk — see the decode loops.
+        if markov_prev_ids is not None and self.markov_head is not None:
+            logits = logits + self.markov_head.block_bias(markov_prev_ids, hb, markov_block_size)
         conf = self.conf_head(hb) if self.conf_head is not None else None
-        return {"logits": logits, "conf": conf, "h_draft": h_draft, "delta": h_draft - h_last_denoise}
+        return {"logits": logits, "conf": conf, "h_draft": h_draft, "delta": h_draft - h_last_denoise, "hb": hb}
 
     @torch.no_grad()
     def extend_prefix_cache(self, h_sel_delta, position_ids, past_key_values):

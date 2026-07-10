@@ -112,10 +112,19 @@ def dbet_forward(core, micro_batch, args, mask_id=MASK_ID, return_post_commit=Fa
     post_commit, remaining = heavy_commit(noisy_logits, noisy_ids, mask_id, bs, thr)
 
     # 3) drafter forward: clean(+prompt) hidden -> prefix KV; noisy -> canvas; mask = [clean ; noisy]
+    # markov teacher forcing: prev[k] = the left neighbor's token — its REAL token where revealed/committed
+    # (on-distribution with inference, where the walk starts from a real commit), golden otherwise. Parallel:
+    # all prevs are known upfront, so the bias is one batched op inside the drafter forward (rnn: head-only
+    # unroll). prev[0] = its own token (prompt position, never supervised — harmless).
+    mk_kw = {}
+    if getattr(core.draft, "markov_head", None) is not None:
+        teacher = torch.where(post_commit == mask_id, clean_ids, post_commit)
+        mk_kw = {"markov_prev_ids": torch.cat([teacher[:, :1], teacher[:, :-1]], dim=1),
+                 "markov_block_size": bs}
     out = core.draft(
         input_ids=post_commit, heavy_logits=noisy_logits,
         h_sel_denoise=noisy_h_sel, h_last_denoise=noisy_h_last, h_sel_prefix=clean_h_sel,
-        attention_mask=derive_drafter_mask(attn, L), position_ids=pos, denoise_mask=None, tau=None,
+        attention_mask=derive_drafter_mask(attn, L), position_ids=pos, denoise_mask=None, tau=None, **mk_kw,
     )
     ret = [out["logits"], out["conf"], remaining, clean_ids]
     if return_heavy_logits:

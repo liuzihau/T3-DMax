@@ -56,6 +56,10 @@ def main():
     p.add_argument("--draft_ckpt", default=None,
                    help="dir with a TRAINED drafter (drafter-only hf_ckpt safetensors). If given, load draft.* "
                         "from it instead of warm-starting (use this to assemble the init for the heavy fine-tune).")
+    p.add_argument("--markov_rank", type=int, default=0,
+                   help="DSpark semi-AR logits-bias head rank (0 = no head). Zero-init W2 -> exact no-op at "
+                        "step 0, so adding it on top of a trained --draft_ckpt is a safe warm continuation.")
+    p.add_argument("--markov_head_type", default="vanilla", choices=["vanilla", "gated", "rnn"])
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
 
@@ -76,6 +80,7 @@ def main():
         draft_num_layers=args.draft_num_layers, sel_layers=args.sel_layers,
         per_layer_prefix_fuse=args.per_layer_prefix_fuse,
         per_layer_denoise_fuse=args.per_layer_denoise_fuse,
+        markov_rank=args.markov_rank, markov_head_type=args.markov_head_type,
         warmstart_from_heavy_bottom=False,          # we warm-start MANUALLY below; saved config stays False so
         heavy_path=args.heavy_path,                  # the trainer doesn't re-warmstart on meta at load time
     )

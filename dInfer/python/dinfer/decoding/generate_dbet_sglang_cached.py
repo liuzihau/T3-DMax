@@ -132,7 +132,17 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         dlogits, dconf = d["logits"], d["conf"]
         if dconf is None:
             return output, Breakflag, embeddings
-        darg = dlogits[0].argmax(-1); dc = dconf[0]
+        dc = dconf[0]
+        dlog_eff = dlogits[0]
+        mh = getattr(self.draft, "markov_head", None)
+        hb0 = d["hb"][0] if (mh is not None and "hb" in d) else None
+        if mh is not None:
+            dlog_eff = dlog_eff.clone()
+            ci = committed_before.nonzero(as_tuple=True)[0]          # parallel bias: actual left neighbors known
+            if ci.numel() > 0:
+                bias_c, _ = mh.step_bias(x.data[0, cur + ci - 1], hb0[ci] if hb0 is not None else None)
+                dlog_eff[ci] = dlog_eff[ci] + bias_c.to(dlog_eff.dtype)
+        darg = dlog_eff.argmax(-1)
 
         # EXTEND: left-to-right prefix commit of masked slots while conf >= threshold (>=1 for progress)
         mloc = mask_pos.nonzero(as_tuple=True)[0]
@@ -140,8 +150,16 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             ok = dc[mloc] >= self.draft_threshold
             keep = ~(torch.cumsum((~ok).long(), 0) > 0); keep[0] = True
             sel = mloc[keep]
+            if mh is not None:                                       # semi-AR walk: chain the just-chosen token
+                prev = x.data[0, cur + int(sel[0]) - 1]
+                state = None
+                for s in sel.tolist():
+                    bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
+                    dlog_eff[s] = dlog_eff[s] + bias_s.to(dlog_eff.dtype)
+                    prev = dlog_eff[s].argmax(-1)
+                darg = dlog_eff.argmax(-1)
             x.data[0, cur + sel] = darg[sel]
-            embeddings[0, sel] = _soft_embed(dlogits[0][sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
+            embeddings[0, sel] = _soft_embed(dlog_eff[sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
             self.draft_commits += int(sel.numel())
         # FIX: override a committed slot iff conf-head >= its OWN threshold AND the draft disagrees
         if self.draft_fix and bool(committed_before.any()):
@@ -149,7 +167,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x.data[0, cur + floc] = darg[floc]
-                embeddings[0, floc] = _soft_embed(dlogits[0][floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
+                embeddings[0, floc] = _soft_embed(dlog_eff[floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
         return output, Breakflag, embeddings
 
     def _diag_dry_step(self, output, Breakflag, embeddings, block_loc, block_length, x, active_index):
@@ -197,8 +215,15 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
                            attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau,
                            **self._mix_kwargs(cb))
             if d["conf"] is not None:
-                darg = d["logits"][0].argmax(-1); dc = d["conf"][0]
+                dlog0 = d["logits"][0]
+                mh = getattr(self.draft, "markov_head", None)
                 idx = cb.nonzero(as_tuple=True)[0]
+                if mh is not None and idx.numel() > 0:               # deployment-matched: actual-left-neighbor bias
+                    hb0 = d["hb"][0] if "hb" in d else None
+                    bias_c, _ = mh.step_bias(x.data[0, cur + idx - 1], hb0[idx] if hb0 is not None else None)
+                    dlog0 = dlog0.clone()
+                    dlog0[idx] = dlog0[idx] + bias_c.to(dlog0.dtype)
+                darg = dlog0.argmax(-1); dc = d["conf"][0]
                 self._blk_recs.append({"cur": cur, "idx": idx, "commit": block_x[idx].clone(),
                                        "dtok": darg[idx].clone(), "dconf": dc[idx].clone()})
         return output, Breakflag, embeddings

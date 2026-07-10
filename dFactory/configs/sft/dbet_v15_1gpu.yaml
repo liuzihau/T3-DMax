@@ -1,0 +1,103 @@
+# DBet "v1.5" -- CONTINUE the v1 recipe from global_step_30000-v1 with the DSpark semi-AR MARKOV HEAD.
+#
+# Rationale (experiment.md §train-v2-verdict): the measured wall is per-call yield (~1.3 tok/call, acc6 0.42)
+# = DSpark's "suffix decay" (parallel drafters can't model intra-block dependencies). Their fix: a lightweight
+# serial logits-bias head  logits[k] += W2·f(W1[tok[k-1]])  -- teacher-forced (parallel) at training, chained
+# on the drafter's own tokens at inference. W2 is ZERO-INIT -> step 0 is exactly 30000-v1 (safe continuation).
+# DSpark reports +16-18% accepted length over DFlash; our pre-registered target: tok/call 1.3 -> >=1.55.
+# Everything else = the v1 recipe untouched (loss was still descending at 30k -> this also delivers the
+# "train to 50-60k total" extension).
+#
+# Build the continuation init ONCE (v1 drafter + fresh zero-init markov head + correct config.json):
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH python scripts/build_dbet_init.py \
+#       --heavy_path ../DMax-Math-16B-moe-merge --out_dir ./dbet_v15_init \
+#       --draft_num_layers 5 --sel_layers 1,10,19 \
+#       --draft_ckpt ./dbet_outputs/checkpoints/global_step_30000-v1/hf_ckpt \
+#       --markov_rank 256 --markov_head_type vanilla
+# Fresh data slice (v1 consumed a random ~40k of the shuffled full file; documented disjoint-ish slice):
+#   sed -n '60001,90000p' my_data/postprocess_train.jsonl > my_data/postprocess_train_60k_90k.jsonl
+# Launch:
+#   PYTHONPATH=$(pwd)/VeOmni:$(pwd):$PYTHONPATH bash train.sh tasks/train_dbet.py configs/sft/dbet_v15_1gpu.yaml
+model:
+  config_path: ./dbet_v15_init
+  model_path: ./dbet_v15_init
+  tokenizer_path: ../DMax-Math-16B-moe-merge
+  attn_implementation: sdpa
+  moe_implementation: fused
+
+data:
+  train_path: ./my_data/postprocess_train_60k_90k.jsonl
+  data_type: conversation
+  datasets_type: mapping
+  dataloader_type: native
+  max_seq_len: 2048
+  text_keys: messages
+  noise_range_low: 0.4              # v1 recipe: reveal 0-60% leftmost per block
+  noise_range_high: 1.0
+  revealed_corrupt_rate: 0.0
+  num_workers: 16
+
+train:
+  output_dir: ./dbet_v15_outputs
+  data_parallel_mode: ddp
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 1
+  micro_batch_size: 1
+  num_train_epochs: 1
+  max_steps: 30000                  # +30k on top of v1's 30k = the ~60k-total extension
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  optimizer: adamw
+  beta1: 0.9
+  beta2: 0.999
+  lr: 1.0e-4                        # markov head learns from scratch; the warm body tolerated 1e-4 in v1
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  broadcast_model_weights_from_rank0: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_steps: 5000
+  save_epochs: 1
+  save_hf_weights: true
+  # --- v1 recipe knobs, unchanged ---
+  block_diffusion_mode: true
+  block_size: 32
+  heavy_commit_threshold: 0.5
+  conf_loss_weight: 1.0
+  align_ce_weight: 0.1
+  align_l1_weight: 1.0
+  golden_ce_weight: 0.1
+  align_to_2nd_pass: true
+  heavy_soft_tau: 1.0
+  heavy_soft_top_k: 1
+  loss_decay_mode: dflash
+  loss_decay_base: 0.9
+  loss_decay_floor: 0.1
+  loss_decay_head: 0.95
+  loss_decay_tail: 0.8
+  loss_decay_window: 6
+  loss_decay_gamma: 16.0
+  same_token_labels: true
+  # --- metrics / eval ---
+  use_wandb: false
+  log_steps: 20
+  eval_steps: 1000
+  eval_holdout_size: 128
+  eval_sigmas: "0.1,0.3,0.5,0.7,0.9"
+  eval_at_start: true               # step-0 eval should REPRODUCE v1's numbers exactly (zero-init no-op check)
+  eval_tpf: 6
+  eval_heavy_second: true
+  skip_nonfinite_steps: true

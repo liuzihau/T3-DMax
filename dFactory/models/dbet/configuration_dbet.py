@@ -47,6 +47,8 @@ class DbetConfig(LLaDA2MoeConfig):
         # === Heads ===
         use_delta_head: bool = True,           # Δh residual on heavy's last hidden -> frozen lm_head (zero-init; step0 == heavy)
         use_confidence_head: bool = True,      # trained "will the heavy accept this draft?" head; off -> no abstention
+        markov_rank: int = 0,                  # DSpark semi-AR logits-bias head rank; 0 = no head (v1 behavior)
+        markov_head_type: str = "vanilla",     # 'vanilla' (low-rank bigram) | 'gated' (hidden-gated) | 'rnn' (chained state)
         # === Frozen-from-heavy + warm-start ===
         freeze_embedding: bool = True,         # heavy W_E reused, frozen
         freeze_lm_head: bool = True,           # heavy lm_head reused, frozen
@@ -76,6 +78,8 @@ class DbetConfig(LLaDA2MoeConfig):
         self.soft_embed_temp_min = float(soft_embed_temp_min)
         self.use_delta_head = bool(use_delta_head)
         self.use_confidence_head = bool(use_confidence_head)
+        self.markov_rank = int(markov_rank)
+        self.markov_head_type = str(markov_head_type)
         self.freeze_embedding = bool(freeze_embedding)
         self.freeze_lm_head = bool(freeze_lm_head)
         self.freeze_final_norm = bool(freeze_final_norm)

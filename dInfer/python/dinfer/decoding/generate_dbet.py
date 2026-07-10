@@ -73,6 +73,24 @@ def _backfill_heavy_fields(cfg, hcfg):
         print(f"[dbet] config mirrored from heavy (drafter config.json had defaults/zeros): {', '.join(fixed)}")
 
 
+def _infer_markov_from_sd(cfg, sd, prefix="draft."):
+    """The training exporter can write a degraded config.json (missing markov_rank) — which would silently
+    DROP a trained markov head at load. Infer the head config from the weights themselves: rank from W1's
+    shape, type from which extra projection exists."""
+    k1 = f"{prefix}markov_head.markov_w1.weight"
+    if k1 not in sd:
+        return
+    rank = int(sd[k1].shape[1])
+    htype = ("rnn" if f"{prefix}markov_head.joint_proj.weight" in sd
+             else "gated" if f"{prefix}markov_head.gate_proj.weight" in sd
+             else "vanilla")
+    if int(getattr(cfg, "markov_rank", 0)) != rank or str(getattr(cfg, "markov_head_type", "")) != htype:
+        print(f"[dbet] markov head inferred from checkpoint weights: rank={rank} type={htype} "
+              f"(config.json said rank={getattr(cfg, 'markov_rank', 0)})")
+        cfg.markov_rank = rank
+        cfg.markov_head_type = htype
+
+
 def load_dbet_model(drafter_path, heavy_path, device="cuda"):
     """Assemble DBet for inference: the FROZEN DMax heavy (fused MoE) + the trained drafter weights.
     `drafter_path` = the drafter-only hf_ckpt (heavy.* dropped at save; loaded strict=False).
@@ -92,11 +110,12 @@ def load_dbet_model(drafter_path, heavy_path, device="cuda"):
         hcfg.model_type = str(hcfg.model_type) + "_veomni"
     hcfg.moe_implementation = "fused"
     _backfill_heavy_fields(cfg, hcfg)
+    sd = _load_drafter_state_dict(drafter_path)
+    _infer_markov_from_sd(cfg, sd, prefix="draft.")
     heavy = LLaDA2MoeModelLM.from_pretrained(
         heavy_path, config=hcfg, dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation="sdpa")
 
     model = DbetForDraftDecoding(cfg, _heavy=heavy)
-    sd = _load_drafter_state_dict(drafter_path)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     drafter_missing = [k for k in missing if k.startswith("draft.") and "frozen_" not in k]
     if drafter_missing:
@@ -126,6 +145,8 @@ def load_drafter_standalone(drafter_path, heavy_path, device="cuda", dtype=torch
     cfg = DbetConfig.from_pretrained(drafter_path)
     hcfg = LLaDA2MoeConfig.from_pretrained(heavy_path, trust_remote_code=True)
     _backfill_heavy_fields(cfg, hcfg)
+    _sd_probe = _load_drafter_state_dict(drafter_path)
+    _infer_markov_from_sd(cfg, _sd_probe, prefix="draft.")
     V, Dh, eps = hcfg.vocab_size, hcfg.hidden_size, hcfg.rms_norm_eps
 
     # pull ONLY embed / lm_head / final-norm from the heavy shards (safe_open = lazy, loads just these tensors;
@@ -344,8 +365,21 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
         if dconf is None:                                            # no conf head -> can't gate; back to heavy
             it += 1
             continue
-        darg = dlogits[0].argmax(-1)                                 # [blk]
         dc = dconf[0]                                                # [blk]
+        dlog_eff = dlogits[0]                                        # effective (possibly markov-biased) logits
+        mh = getattr(model.draft, "markov_head", None)
+        hb0 = d["hb"][0] if (mh is not None and "hb" in d) else None
+        if mh is not None:
+            dlog_eff = dlog_eff.clone()
+            # committed slots: parallel bias from the ACTUAL left neighbor (known; prefix-shaped commits ->
+            # the neighbor is committed/settled; slot 0's neighbor = previous block's last token). rnn head
+            # uses zero state here (single-step approximation); the EXTEND walk below chains state properly.
+            ci = committed_before.nonzero(as_tuple=True)[0]
+            if ci.numel() > 0:
+                prev_tok = x[0, bs + ci - 1]
+                bias_c, _ = mh.step_bias(prev_tok, hb0[ci] if hb0 is not None else None)
+                dlog_eff[ci] = dlog_eff[ci] + bias_c.to(dlog_eff.dtype)
+        darg = dlog_eff.argmax(-1)                                   # [blk]
 
         # ---- EXTEND: left-to-right prefix commit of masked slots while conf >= draft_threshold (always >=1 for progress)
         mloc = mask_pos.nonzero(as_tuple=True)[0]                    # block-local masked indices (ascending)
@@ -354,8 +388,18 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             keep = ~(torch.cumsum((~ok).long(), 0) > 0)             # prefix up to first below-threshold
             keep[0] = True
             sel = mloc[keep]
+            if mh is not None:
+                # semi-AR walk (DSpark): bias each slot with the token JUST CHOSEN at its left, in order.
+                # The conf gate (sel) is unchanged — the conf head never sees the bias; only tokens change.
+                prev = x[0, bs + int(sel[0]) - 1]
+                state = None
+                for s in sel.tolist():
+                    bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
+                    dlog_eff[s] = dlog_eff[s] + bias_s.to(dlog_eff.dtype)
+                    prev = dlog_eff[s].argmax(-1)
+                darg = dlog_eff.argmax(-1)
             x[0, bs + sel] = darg[sel]
-            block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
+            block_embeds[0, sel] = _soft_embed(dlog_eff[sel], embed, MASK_ID, draft_tau, draft_top_k)
             stats.draft_commits += int(sel.numel())
         # ---- FIX: override a committed slot only if conf-head >= its OWN threshold AND the draft disagrees ----
         if draft_fix and bool(committed_before.any()):
@@ -363,7 +407,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x[0, bs + floc] = darg[floc]
-                block_embeds[0, floc] = _soft_embed(dlogits[0][floc], embed, MASK_ID, draft_tau, draft_top_k)
+                block_embeds[0, floc] = _soft_embed(dlog_eff[floc], embed, MASK_ID, draft_tau, draft_top_k)
                 stats.draft_fixes += int(floc.numel())
         it += 1
 
