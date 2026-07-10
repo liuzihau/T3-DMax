@@ -249,6 +249,7 @@ class HeavyModelConditioning(nn.Module):
         d, D = config.resolved_draft_hidden_size, config.hidden_size
         self.input_proj = nn.Linear(D, d, bias=False) if d != D else None
         self.post_norm = LLaDA2MoeRMSNorm(d, eps=config.rms_norm_eps)
+        self.mask_token_id = int(config.mask_token_id)
 
     def forward(
         self,
@@ -258,8 +259,16 @@ class HeavyModelConditioning(nn.Module):
         frozen_embed: nn.Embedding,
         tau: float,
         denoise_mask: Optional[torch.Tensor] = None,
+        commit_mix_mask: Optional[torch.Tensor] = None,
+        commit_mix_alpha: float = 0.5,
     ) -> torch.Tensor:
         e = frozen_embed(input_ids)                                   # [B,C,D]
+        if commit_mix_mask is not None and bool(commit_mix_mask.any()):
+            # route H/M interpolation at committed slots: alpha*E(token) + (1-alpha)*E(MASK)
+            # (alpha=1 == route H hard embed; alpha=0 == route M's E(MASK); post_norm rescales downstream)
+            mask_e = frozen_embed(torch.tensor([self.mask_token_id], device=e.device))[0]
+            e = e.clone()
+            e[commit_mix_mask] = commit_mix_alpha * e[commit_mix_mask] + (1.0 - commit_mix_alpha) * mask_e
         if self.input_proj is not None:
             e = self.input_proj(e)                                    # [B,C,d]
         s = self.soft_embed(heavy_logits, frozen_embed.weight, tau)   # [B,C,d]  (MASK #4 gates this branch)
@@ -519,10 +528,13 @@ class DbetDraftStack(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
+        commit_mix_mask: Optional[torch.Tensor] = None,
+        commit_mix_alpha: float = 0.5,
     ) -> dict:
         cfg = self.config
         tau = tau if tau is not None else cfg.soft_embed_temp
-        x = self.conditioning(input_ids, heavy_logits, h_sel_denoise, self.frozen_embed, tau, denoise_mask)
+        x = self.conditioning(input_ids, heavy_logits, h_sel_denoise, self.frozen_embed, tau, denoise_mask,
+                              commit_mix_mask=commit_mix_mask, commit_mix_alpha=commit_mix_alpha)
         b, c, _ = x.shape
 
         # Positions: the decode passes a FIXED-shape position_ids so torch.compile never reads the Python int
@@ -703,6 +715,8 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         position_ids: Optional[torch.Tensor] = None,
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
+        commit_mix_mask: Optional[torch.Tensor] = None,
+        commit_mix_alpha: float = 0.5,
     ) -> dict:
         """Slice the heavy signals into prefix/canvas and run `DbetDraftStack.forward`. Assumes a contiguous
         [prefix ; canvas] layout per sequence (the common single-block case); for ragged layouts the caller
@@ -725,6 +739,7 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
             h_sel_prefix=gather(signals["h_sel"], prefix_idx) if prefix_idx.any() else None,
             past_key_values=past_key_values, attention_mask=attention_mask,
             position_ids=position_ids, denoise_mask=denoise_mask, tau=tau,
+            commit_mix_mask=commit_mix_mask, commit_mix_alpha=commit_mix_alpha,
         )
 
     # ---- end-to-end (training / eval) ----

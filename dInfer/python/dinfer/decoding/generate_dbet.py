@@ -241,7 +241,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                       draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
-                      dmax_faithful=True):
+                      dmax_faithful=True, draft_committed_mix=None):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -329,8 +329,14 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             draft_ids[0, _cb] = MASK_ID                              # single advanced-index assign (in-place, safe)
         signals["input_ids"] = draft_ids
         signals["prefix_idx"], signals["canvas_idx"] = prefix_idx, canvas_idx
+        # route H/M interpolation: committed slots' input embed = alpha*E(token) + (1-alpha)*E(MASK)
+        # (ids stay HARD; the blend happens inside the drafter's conditioning. alpha=0 == draft_committed_soft)
+        _mix_kw = {}
+        if draft_committed_mix is not None and bool(committed_before.any()):
+            _mix_kw = {"commit_mix_mask": committed_before.unsqueeze(0),
+                       "commit_mix_alpha": float(draft_committed_mix)}
         _t = _now(device)
-        d = model.draft_forward(signals, attention_mask=None, tau=tau)
+        d = model.draft_forward(signals, attention_mask=None, tau=tau, **_mix_kw)
         stats.draft_time += _now(device) - _t
         stats.draft_forwards += 1
         dlogits, dconf = d["logits"], d["conf"]                       # [1, blk, V], [1, blk] over the WHOLE block
@@ -574,7 +580,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   max_draft_iters=1, tau=None, early_stop=True, use_draft=True,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
-                  use_cache=False, progress_desc=None, dmax_faithful=True):
+                  use_cache=False, progress_desc=None, dmax_faithful=True, draft_committed_mix=None):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -626,7 +632,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   heavy_tau=heavy_tau, heavy_top_k=heavy_top_k,
                                   draft_tau=draft_tau, draft_top_k=draft_top_k,
                                   draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
-                                  draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful)
+                                  draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful,
+                                  draft_committed_mix=draft_committed_mix)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)
