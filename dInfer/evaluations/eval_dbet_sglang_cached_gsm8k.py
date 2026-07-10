@@ -87,6 +87,10 @@ def main():
     p.add_argument("--draft_fix_threshold", type=float, default=None,
                    help="separate conf gate for FIX (override committed slots); default = --draft_threshold. "
                         "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
+    p.add_argument("--draft_committed_mix", type=str, default=None,
+                   help="committed-slot input mode for the drafter (applies to the real decode AND --diag): "
+                        "'conf' = DMax confidence-weighted p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed "
+                        "H/M interpolation (1.0 hard, 0.0 MASK); default None = hard (route H, v1-comparable).")
     p.add_argument("--draft_top_k", type=int, default=2)
     p.add_argument("--draft_tau", type=float, default=1.0)
     p.add_argument("--no_draft_fix", action="store_true")
@@ -128,7 +132,7 @@ def main():
         cache_factory=cache_factory, draft=draft, sel_layers=sel,
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
-        draft_fix_threshold=args.draft_fix_threshold,
+        draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
     if args.diag:
         dllm.diff_iteration.diag_on = True
@@ -140,6 +144,7 @@ def main():
     print(f"[sglang-dbet-cached] {len(rows)} ex gen={args.gen_length} block={args.block_length} "
           f"graphs={args.cuda_graph} compile_draft={args.compile_draft} dec={dec_tag} "
           f"d{args.draft_threshold} dfix{args.draft_fix_threshold if args.draft_fix_threshold is not None else args.draft_threshold} "
+          f"mix={args.draft_committed_mix or 'hard'} "
           f"k{args.draft_top_k} fix={not args.no_draft_fix} -> {args.out_path}")
 
     if args.compile_draft and rows:                                   # warm up the compiled draft OFF the timer

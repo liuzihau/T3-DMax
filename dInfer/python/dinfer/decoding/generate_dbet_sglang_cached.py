@@ -27,7 +27,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
     `draft_cache` = the drafter's cross-block prefix KV cache (grown per settled block)."""
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
-                 draft_enabled=True, draft_fix_threshold=None):
+                 draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
@@ -37,6 +37,9 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # FIX gets its own gate (golden diag: FIX is net-positive only at conf>=0.9 while EXTEND works lower);
         # None -> same as draft_threshold (the old single-knob behavior)
         self.draft_fix_threshold = draft_threshold if draft_fix_threshold is None else draft_fix_threshold
+        # committed-slot input mode for the drafter: None = hard (route H); 'conf' = DMax confidence-weighted
+        # p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed H/M interpolation. (v2-ckpt modes.)
+        self.draft_committed_mix = draft_committed_mix
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -63,6 +66,14 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             self.draft_cache.reset()
         self.draft_commits = 0
         self._blk_recs = []                            # NOT _diag_blk: slot keys must stay unique across prompts
+
+    def _mix_kwargs(self, committed_mask):
+        """Drafter kwargs for the committed-slot input mode ([blk] bool -> commit_mix_mask/alpha), {} if off."""
+        if self.draft_committed_mix is None or not bool(committed_mask.any()):
+            return {}
+        a = (None if str(self.draft_committed_mix).lower() in ("conf", "confidence")
+             else float(self.draft_committed_mix))
+        return {"commit_mix_mask": committed_mask.unsqueeze(0), "commit_mix_alpha": a}
 
     @torch.no_grad()
     def forward_uniform(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask,
@@ -116,7 +127,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         pmask[..., M:] = True                                                           # canvas (bidirectional)
         d = self.draft(input_ids=draft_ids, heavy_logits=block_logits, h_sel_denoise=h_sel, h_last_denoise=h_last,
                        h_sel_prefix=None, past_key_values=self.draft_cache,
-                       attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau)
+                       attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau,
+                       **self._mix_kwargs(committed_before))
         dlogits, dconf = d["logits"], d["conf"]
         if dconf is None:
             return output, Breakflag, embeddings
@@ -182,7 +194,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             pmask[..., :settled] = True; pmask[..., M:] = True
             d = self.draft(input_ids=x.data[:, cur:be].clone(), heavy_logits=block_logits, h_sel_denoise=h_sel,
                            h_last_denoise=h_last, h_sel_prefix=None, past_key_values=self.draft_cache,
-                           attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau)
+                           attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau,
+                           **self._mix_kwargs(cb))
             if d["conf"] is not None:
                 darg = d["logits"][0].argmax(-1); dc = d["conf"][0]
                 idx = cb.nonzero(as_tuple=True)[0]
@@ -239,8 +252,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
 
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
-                 draft_fix_threshold=None, early_stop=True, maximum_unroll=1, expected_tpf=15,
-                 backend='sglang', **kw):
+                 draft_fix_threshold=None, draft_committed_mix=None, early_stop=True, maximum_unroll=1,
+                 expected_tpf=15, backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -254,6 +267,6 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
-            draft_fix_threshold=draft_fix_threshold)
+            draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration
