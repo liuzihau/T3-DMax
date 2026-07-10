@@ -69,10 +69,11 @@ def main():
     p.add_argument("--draft_top_k", type=int, default=1, help="soft-embed top-k for drafter commits.")
     p.add_argument("--draft_committed_soft", action="store_true",
                    help="show heavy-committed slots to the draft as MASK+soft-embed (re-predictable) not hard tokens.")
-    p.add_argument("--draft_committed_mix", type=float, default=None,
-                   help="route H/M interpolation: committed slots' draft input embed = a*E(token)+(1-a)*E(MASK). "
-                        "1.0 == hard (route H), 0.0 == draft_committed_soft (route M); try 0.5. Overrides neither "
-                        "flag mechanically -- do not combine with --draft_committed_soft.")
+    p.add_argument("--draft_committed_mix", type=str, default=None,
+                   help="route H/M mix of committed slots' draft input embed. 'conf' = the DMax re-feed "
+                        "mechanism: p*E(token)+(1-p)*E(MASK) renormalized, p = heavy's CURRENT prob of the "
+                        "committed token (self-calibrating un-anchoring). A float = fixed interpolation "
+                        "(1.0 == route H hard, 0.0 == route M). Do not combine with --draft_committed_soft.")
     p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
     p.add_argument("--loose_exit", action="store_true",
                    help="pre-0709 DBet loop semantics: exit at no-mask, commits never revised by the heavy. "

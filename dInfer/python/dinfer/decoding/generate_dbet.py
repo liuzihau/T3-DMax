@@ -329,12 +329,13 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             draft_ids[0, _cb] = MASK_ID                              # single advanced-index assign (in-place, safe)
         signals["input_ids"] = draft_ids
         signals["prefix_idx"], signals["canvas_idx"] = prefix_idx, canvas_idx
-        # route H/M interpolation: committed slots' input embed = alpha*E(token) + (1-alpha)*E(MASK)
-        # (ids stay HARD; the blend happens inside the drafter's conditioning. alpha=0 == draft_committed_soft)
+        # route H/M mix: committed slots' input embed. "conf" (alpha=None) = the DMax re-feed mechanism:
+        # p*E(token) + (1-p)*E(MASK) renormalized, p = heavy's CURRENT prob of the committed token; a float =
+        # fixed interpolation (1 == route H, 0 == route M). ids stay HARD; blend happens in the conditioning.
         _mix_kw = {}
         if draft_committed_mix is not None and bool(committed_before.any()):
-            _mix_kw = {"commit_mix_mask": committed_before.unsqueeze(0),
-                       "commit_mix_alpha": float(draft_committed_mix)}
+            _a = None if str(draft_committed_mix).lower() in ("conf", "confidence") else float(draft_committed_mix)
+            _mix_kw = {"commit_mix_mask": committed_before.unsqueeze(0), "commit_mix_alpha": _a}
         _t = _now(device)
         d = model.draft_forward(signals, attention_mask=None, tau=tau, **_mix_kw)
         stats.draft_time += _now(device) - _t

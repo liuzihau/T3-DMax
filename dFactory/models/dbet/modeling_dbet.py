@@ -260,15 +260,28 @@ class HeavyModelConditioning(nn.Module):
         tau: float,
         denoise_mask: Optional[torch.Tensor] = None,
         commit_mix_mask: Optional[torch.Tensor] = None,
-        commit_mix_alpha: float = 0.5,
+        commit_mix_alpha: Optional[float] = None,
     ) -> torch.Tensor:
         e = frozen_embed(input_ids)                                   # [B,C,D]
         if commit_mix_mask is not None and bool(commit_mix_mask.any()):
-            # route H/M interpolation at committed slots: alpha*E(token) + (1-alpha)*E(MASK)
-            # (alpha=1 == route H hard embed; alpha=0 == route M's E(MASK); post_norm rescales downstream)
-            mask_e = frozen_embed(torch.tensor([self.mask_token_id], device=e.device))[0]
+            # Route H/M mix at committed slots. Default (alpha=None) = the DMax re-feed mechanism itself:
+            # p*E(token) + (1-p)*E(MASK), L2-renormalized, with p = the heavy's CURRENT softmax prob of the
+            # committed token — a commit the heavy still believes in stays near-hard; one it is drifting away
+            # from dissolves toward E(MASK). A float alpha = fixed interpolation (1 == route H, 0 == route M).
+            sel = commit_mix_mask
+            mask_e = frozen_embed(torch.tensor([self.mask_token_id], device=e.device))[0].float()
+            tok_e = e[sel].float()                                    # [n,D]
+            if commit_mix_alpha is None:
+                probs = torch.softmax(heavy_logits[sel].float(), dim=-1)                    # [n,V]
+                p = probs.gather(-1, input_ids[sel].unsqueeze(-1))                          # [n,1] conf of the commit
+            else:
+                p = torch.full((int(sel.sum()), 1), float(commit_mix_alpha),
+                               dtype=torch.float32, device=e.device)
+            s = p * tok_e + (1.0 - p) * mask_e
+            tgt = p * tok_e.norm(dim=-1, keepdim=True) + (1.0 - p) * mask_e.norm()          # DMax renorm target
+            s = s * (tgt / (s.norm(dim=-1, keepdim=True) + 1e-6))
             e = e.clone()
-            e[commit_mix_mask] = commit_mix_alpha * e[commit_mix_mask] + (1.0 - commit_mix_alpha) * mask_e
+            e[sel] = s.to(e.dtype)
         if self.input_proj is not None:
             e = self.input_proj(e)                                    # [B,C,d]
         s = self.soft_embed(heavy_logits, frozen_embed.weight, tau)   # [B,C,d]  (MASK #4 gates this branch)
@@ -529,7 +542,7 @@ class DbetDraftStack(nn.Module):
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
         commit_mix_mask: Optional[torch.Tensor] = None,
-        commit_mix_alpha: float = 0.5,
+        commit_mix_alpha: Optional[float] = None,
     ) -> dict:
         cfg = self.config
         tau = tau if tau is not None else cfg.soft_embed_temp
@@ -716,7 +729,7 @@ class DbetForDraftDecoding(LLaDA2MoePreTrainedModel):
         denoise_mask: Optional[torch.Tensor] = None,
         tau: Optional[float] = None,
         commit_mix_mask: Optional[torch.Tensor] = None,
-        commit_mix_alpha: float = 0.5,
+        commit_mix_alpha: Optional[float] = None,
     ) -> dict:
         """Slice the heavy signals into prefix/canvas and run `DbetDraftStack.forward`. Assumes a contiguous
         [prefix ; canvas] layout per sequence (the common single-block case); for ragged layouts the caller
