@@ -50,7 +50,9 @@ def summarize(jsonl_path):
     tok = mean("gen_tokens")
     wall = mean("wall_time")
     tps = tok / wall if wall and wall == wall and wall > 0 else float("nan")
-    return {"n": n, "heavy/ex": heavy, "draft/ex": draft, "dcommit/ex": dcommit,
+    # tokens per drafter call -- the walk-quality decision number (v1 baseline ~1.3)
+    tpc = dcommit / draft if draft and draft == draft and draft > 0 else float("nan")
+    return {"n": n, "heavy/ex": heavy, "draft/ex": draft, "dcommit/ex": dcommit, "tok/call": tpc,
             "tok/ex": tok, "wall/ex": wall, "tok/s": tps}
 
 
@@ -62,7 +64,7 @@ def main():
 
     files = sorted(glob.glob(os.path.join(args.dir, "*.jsonl")))
     out_path = args.out or os.path.join(args.dir, "summary.tsv")
-    cols = ["config", "n", "accuracy", "heavy/ex", "draft/ex", "dcommit/ex", "tok/ex", "wall/ex", "tok/s"]
+    cols = ["config", "n", "accuracy", "heavy/ex", "draft/ex", "dcommit/ex", "tok/call", "tok/ex", "wall/ex", "tok/s"]
     lines = ["\t".join(cols)]
     for f in files:
         s = summarize(f)
@@ -72,8 +74,8 @@ def main():
         acc = grade(f)
         name = os.path.splitext(os.path.basename(f))[0]
         lines.append("\t".join([name, str(s["n"]), f"{acc:.2f}%", f"{s['heavy/ex']:.1f}",
-                                f"{s['draft/ex']:.1f}", f"{s['dcommit/ex']:.1f}", f"{s['tok/ex']:.0f}",
-                                f"{s['wall/ex']:.2f}", f"{s['tok/s']:.1f}"]))
+                                f"{s['draft/ex']:.1f}", f"{s['dcommit/ex']:.1f}", f"{s['tok/call']:.2f}",
+                                f"{s['tok/ex']:.0f}", f"{s['wall/ex']:.2f}", f"{s['tok/s']:.1f}"]))
         print(lines[-1])
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
