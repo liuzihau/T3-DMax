@@ -87,6 +87,8 @@ def main():
     p.add_argument("--draft_fix_threshold", type=float, default=None,
                    help="separate conf gate for FIX (override committed slots); default = --draft_threshold. "
                         "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
+    p.add_argument("--no_markov", action="store_true",
+                   help="ABLATION: drop a loaded markov head (semi-AR walk off).")
     p.add_argument("--draft_committed_mix", type=str, default=None,
                    help="committed-slot input mode for the drafter (applies to the real decode AND --diag): "
                         "'conf' = DMax confidence-weighted p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed "
@@ -114,6 +116,9 @@ def main():
         if not args.drafter_path:
             raise SystemExit("--drafter_path is required unless --no_draft")
         draft = load_drafter_standalone(args.drafter_path, args.heavy_path, device=str(device))
+        if args.no_markov and getattr(draft, "markov_head", None) is not None:
+            draft.markov_head = None
+            print("[sglang-dbet-cached] --no_markov: markov head DROPPED (ablation; no semi-AR walk)")
         if args.compile_draft:
             draft = torch.compile(draft)
     else:

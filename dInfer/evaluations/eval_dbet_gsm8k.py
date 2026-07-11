@@ -75,6 +75,10 @@ def main():
                         "committed token (self-calibrating un-anchoring). A float = fixed interpolation "
                         "(1.0 == route H hard, 0.0 == route M). Do not combine with --draft_committed_soft.")
     p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
+    p.add_argument("--no_markov", action="store_true",
+                   help="ABLATION: drop a loaded markov head (semi-AR walk off) -- isolates the head's "
+                        "inference contribution from the extra training steps. Default: head auto-activates "
+                        "when present in the checkpoint.")
     p.add_argument("--loose_exit", action="store_true",
                    help="pre-0709 DBet loop semantics: exit at no-mask, commits never revised by the heavy. "
                         "Default (off) = DMax-faithful: committed re-decode + post-fill verification rounds, "
@@ -90,6 +94,9 @@ def main():
     tok_path = os.path.abspath(args.tokenizer_path or args.heavy_path)
     tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     model = load_dbet_model(args.drafter_path, args.heavy_path, args.device)
+    if args.no_markov and getattr(model.draft, "markov_head", None) is not None:
+        model.draft.markov_head = None
+        print("[gsm8k-dbet] --no_markov: markov head DROPPED (ablation; vectorized extend, no semi-AR walk)")
     print(f"[gsm8k-dbet] block={args.block_length} gen={args.gen_length} "
           f"heavy_thr={args.heavy_threshold} draft_thr={args.draft_threshold} max_draft_iters={args.max_draft_iters}")
 
