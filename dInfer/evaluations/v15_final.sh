@@ -1,8 +1,8 @@
 #!/bin/bash
 # FINAL full-set confirmation of the v1.5 Pareto candidates (report_v15sweep_0711, n=200):
 #   dt0.6_mixhard 91.5%@1.28s and dt0.5_mixconf 91.0%@1.34s vs dmax_h0.5 90.5%@1.49s.
-# 6 eager runs @ n=1319 (~3h): in-session dmax control, 4 candidate cells, 1 no-markov twin of the
-# leader (walk attribution). Faithful loop, draft_refine off, fix 0.9, k2.
+# 10 eager runs @ n=1319 (~5h): in-session dmax control, 4 candidate cells x k{2,3} (both v1 full-set
+# winners were k3 -- the v15 sweep only tested k2), 1 no-markov twin. Faithful, refine off, fix 0.9.
 #
 #   [DR=<v15 hf_ckpt>] bash evaluations/v15_final.sh
 
@@ -29,17 +29,18 @@ run() {
 }
 
 BASE=(python evaluations/eval_dbet_gsm8k.py --heavy_path "$HEAVY_EAGER" --drafter_path "$DR" \
-      --gen_length "$GEN" --block_length 32 --heavy_threshold "$H" \
-      --draft_fix_threshold 0.9 --draft_top_k 2)
+      --gen_length "$GEN" --block_length 32 --heavy_threshold "$H" --draft_fix_threshold 0.9)
 
 run "dmax_h${H}"            python evaluations/eval_dbet_gsm8k.py --heavy_path "$HEAVY_EAGER" \
     --drafter_path "$DR" --gen_length "$GEN" --block_length 32 --heavy_threshold "$H" --heavy_only
 
-run "v15_dt0.6_mixhard"     "${BASE[@]}" --draft_threshold 0.6
-run "v15_dt0.5_mixconf"     "${BASE[@]}" --draft_threshold 0.5 --draft_committed_mix conf
-run "v15_dt0.6_mixconf"     "${BASE[@]}" --draft_threshold 0.6 --draft_committed_mix conf
-run "v15_dt0.5_mixhard"     "${BASE[@]}" --draft_threshold 0.5   # the 87.5% outlier: real or n=200 noise?
-run "v15_dt0.6_mixhard_nomarkov" "${BASE[@]}" --draft_threshold 0.6 --no_markov
+for k in 2 3; do
+  run "v15_dt0.6_mixhard_k${k}" "${BASE[@]}" --draft_threshold 0.6 --draft_top_k "$k"
+  run "v15_dt0.5_mixconf_k${k}" "${BASE[@]}" --draft_threshold 0.5 --draft_committed_mix conf --draft_top_k "$k"
+  run "v15_dt0.6_mixconf_k${k}" "${BASE[@]}" --draft_threshold 0.6 --draft_committed_mix conf --draft_top_k "$k"
+  run "v15_dt0.5_mixhard_k${k}" "${BASE[@]}" --draft_threshold 0.5 --draft_top_k "$k"  # 87.5% outlier check
+done
+run "v15_dt0.6_mixhard_k2_nomarkov" "${BASE[@]}" --draft_threshold 0.6 --draft_top_k 2 --no_markov
 
 python evaluations/summarize_baseline.py --dir "$OUT"
 echo "=== [$(date +%H:%M:%S)] v15_final done -> $OUT/summary.tsv ==="
