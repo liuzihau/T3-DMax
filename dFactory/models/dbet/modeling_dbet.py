@@ -264,19 +264,22 @@ class HeavyModelConditioning(nn.Module):
     ) -> torch.Tensor:
         e = frozen_embed(input_ids)                                   # [B,C,D]
         if commit_mix_mask is not None and bool(commit_mix_mask.any()):
-            # Route H/M mix at committed slots. Default (alpha=None) = the DMax re-feed mechanism itself:
-            # p*E(token) + (1-p)*E(MASK), L2-renormalized, with p = the heavy's CURRENT softmax prob of the
-            # committed token — a commit the heavy still believes in stays near-hard; one it is drifting away
-            # from dissolves toward E(MASK). A float alpha = fixed interpolation (1 == route H, 0 == route M).
+            # Committed-slot input mix. alpha=None ('conf') = the DMax re-feed mechanism itself:
+            # p*E(argmax) + (1-p)*E(MASK), L2-renormalized, with p/argmax from the heavy's CURRENT logits —
+            # matches decode_uniform's own soft re-feed: where the heavy still backs the commit this is
+            # near-hard E(commit); where it drifted, the drafter sees the NEW candidate softly instead of the
+            # stale hard token. A float alpha = fixed interpolation of the SLOT'S OWN token with E(MASK)
+            # (1 == hard/route H, 0 == full MASK/route M).
             sel = commit_mix_mask
             mask_e = frozen_embed(torch.tensor([self.mask_token_id], device=e.device))[0].float()
-            tok_e = e[sel].float()                                    # [n,D]
             if commit_mix_alpha is None:
                 probs = torch.softmax(heavy_logits[sel].float(), dim=-1)                    # [n,V]
-                p = probs.gather(-1, input_ids[sel].unsqueeze(-1))                          # [n,1] conf of the commit
+                p, arg = probs.max(dim=-1, keepdim=True)                                    # [n,1] current top-1
+                tok_e = frozen_embed(arg.squeeze(-1)).float()                               # [n,D] E(argmax)
             else:
                 p = torch.full((int(sel.sum()), 1), float(commit_mix_alpha),
                                dtype=torch.float32, device=e.device)
+                tok_e = e[sel].float()                                                      # [n,D] E(slot token)
             s = p * tok_e + (1.0 - p) * mask_e
             tgt = p * tok_e.norm(dim=-1, keepdim=True) + (1.0 - p) * mask_e.norm()          # DMax renorm target
             s = s * (tgt / (s.norm(dim=-1, keepdim=True) + 1e-6))

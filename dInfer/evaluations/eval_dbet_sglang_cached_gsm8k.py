@@ -91,14 +91,17 @@ def main():
                    help="ABLATION: drop a loaded markov head (semi-AR walk off).")
     p.add_argument("--draft_refine", action="store_true",
                    help="also run the drafter during the REFINE/CONVERGE rounds (block fully committed, heavy "
-                        "still verifying) — FIX-only there; targets the ~40-fwd verification floor. The eager "
-                        "path always does this; default off here (the original skip).")
+                        "still verifying) — FIX-only there; targets the ~40-fwd verification floor. Same flag "
+                        "exists on the eager driver (default off in BOTH since 0711).")
     p.add_argument("--draft_committed_mix", type=str, default=None,
                    help="committed-slot input mode for the drafter (applies to the real decode AND --diag): "
                         "'conf' = DMax confidence-weighted p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed "
                         "H/M interpolation (1.0 hard, 0.0 MASK); default None = hard (route H, v1-comparable).")
     p.add_argument("--draft_top_k", type=int, default=2)
-    p.add_argument("--draft_tau", type=float, default=1.0)
+    p.add_argument("--draft_tau", type=float, default=1.0,
+                   help="temperature of the soft embed feeding drafter COMMITS to the next heavy forward. "
+                        "(Since 0711 the drafter's own input conditioning uses the train-matched 0.8, "
+                        "matching the eager path; before, this flag did double duty at 1.0.)")
     p.add_argument("--no_draft_fix", action="store_true")
     p.add_argument("--diag", action="store_true", help="FIX-quality DRY-RUN diagnostic: heavy decodes as pure DMax "
                    "(draft never commits); dry-run the draft each heavy run and compare to the NEXT heavy run's argmax; "

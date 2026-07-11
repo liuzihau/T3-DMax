@@ -132,7 +132,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         pmask[..., M:] = True                                                           # canvas (bidirectional)
         d = self.draft(input_ids=draft_ids, heavy_logits=block_logits, h_sel_denoise=h_sel, h_last_denoise=h_last,
                        h_sel_prefix=None, past_key_values=self.draft_cache,
-                       attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau,
+                       attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=None,  # None -> train-matched soft_embed_temp (0.8); draft_tau = re-feed only,
                        **self._mix_kwargs(committed_before))
         dlogits, dconf = d["logits"], d["conf"]
         if dconf is None:
@@ -217,7 +217,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             pmask[..., :settled] = True; pmask[..., M:] = True
             d = self.draft(input_ids=x.data[:, cur:be].clone(), heavy_logits=block_logits, h_sel_denoise=h_sel,
                            h_last_denoise=h_last, h_sel_prefix=None, past_key_values=self.draft_cache,
-                           attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=self.draft_tau,
+                           attention_mask=pmask, position_ids=pos, denoise_mask=None, tau=None,  # None -> train-matched soft_embed_temp (0.8); draft_tau = re-feed only,
                            **self._mix_kwargs(cb))
             if d["conf"] is not None:
                 dlog0 = d["logits"][0]

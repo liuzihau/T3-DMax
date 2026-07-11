@@ -65,7 +65,10 @@ def main():
     p.add_argument("--heavy_only", action="store_true", help="pure-DMax baseline (no drafter) via the same harness.")
     p.add_argument("--heavy_tau", type=float, default=1.0, help="soft-embed temperature for heavy commits.")
     p.add_argument("--heavy_top_k", type=int, default=1, help="soft-embed top-k for heavy commits.")
-    p.add_argument("--draft_tau", type=float, default=1.0, help="soft-embed temperature for drafter commits.")
+    p.add_argument("--draft_tau", type=float, default=1.0,
+                   help="temperature of the soft embed that feeds drafter COMMITS to the NEXT heavy forward "
+                        "(<1 sharper, >1 wider). The drafter's own input conditioning stays at the "
+                        "train-matched config value (0.8).")
     p.add_argument("--draft_top_k", type=int, default=1, help="soft-embed top-k for drafter commits.")
     p.add_argument("--draft_committed_soft", action="store_true",
                    help="show heavy-committed slots to the draft as MASK+soft-embed (re-predictable) not hard tokens.")
@@ -75,6 +78,10 @@ def main():
                         "committed token (self-calibrating un-anchoring). A float = fixed interpolation "
                         "(1.0 == route H hard, 0.0 == route M). Do not combine with --draft_committed_soft.")
     p.add_argument("--no_draft_fix", action="store_true", help="disable the drafter OVERRIDING a committed token (fix).")
+    p.add_argument("--draft_refine", action="store_true",
+                   help="keep the drafter in the REFINE/CONVERGE rounds (block fully committed, heavy still "
+                        "verifying) -- FIX-only there. Default off = heavy-only refine. NOTE: before 0711 the "
+                        "eager path implicitly always had this ON; runs up to report_v1full_0710 include it.")
     p.add_argument("--no_markov", action="store_true",
                    help="ABLATION: drop a loaded markov head (semi-AR walk off) -- isolates the head's "
                         "inference contribution from the extra training steps. Default: head auto-activates "
@@ -122,7 +129,8 @@ def main():
                 draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
                 draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
-                use_cache=args.use_cache, dmax_faithful=not args.loose_exit)
+                use_cache=args.use_cache, dmax_faithful=not args.loose_exit,
+                draft_refine=args.draft_refine)
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits
