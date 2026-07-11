@@ -27,7 +27,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
     `draft_cache` = the drafter's cross-block prefix KV cache (grown per settled block)."""
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
-                 draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None):
+                 draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
@@ -40,6 +40,11 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # committed-slot input mode for the drafter: None = hard (route H); 'conf' = DMax confidence-weighted
         # p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed H/M interpolation. (v2-ckpt modes.)
         self.draft_committed_mix = draft_committed_mix
+        # draft_refine: also run the drafter during the REFINE/CONVERGE rounds (block fully committed, heavy
+        # still verifying until all-conf>=0.9/stable) — FIX-only there; a pre-empted heavy flip can shorten
+        # convergence (the ~40-fwd verification floor). Default False = the original skip (the eager path has
+        # always run the drafter in these rounds; this aligns the stacks when on). Costs +1 draft call/round.
+        self.draft_refine = draft_refine
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -114,8 +119,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # 3) DRAFT step (canvas = current block, prefix = cross-block draft cache)
         block_x = x.data[0, cur:be]
         mask_pos = (block_x == MASK_ID)
-        if not bool(mask_pos.any()):                  # heavy already committed the whole block -> no slot to EXTEND;
-            return output, Breakflag, embeddings      # skip the draft forward (would only FIX, not worth ~2.5ms)
+        if not bool(mask_pos.any()) and not self.draft_refine:   # block fully committed -> nothing to EXTEND;
+            return output, Breakflag, embeddings      # skip the draft forward (draft_refine=True keeps it for FIX)
         committed_before = active[0] & (~mask_pos)
         draft_ids = x.data[:, cur:be].clone()
         settled = self.draft_cache.settled
@@ -277,8 +282,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
 
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
-                 draft_fix_threshold=None, draft_committed_mix=None, early_stop=True, maximum_unroll=1,
-                 expected_tpf=15, backend='sglang', **kw):
+                 draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False, early_stop=True,
+                 maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -292,6 +297,7 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
         self.diff_iteration = DbetBlockDiffusionIteration(
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
-            draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix)
+            draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix,
+            draft_refine=draft_refine)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration

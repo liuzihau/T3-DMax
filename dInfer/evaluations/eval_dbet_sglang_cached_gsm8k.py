@@ -89,6 +89,10 @@ def main():
                         "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
     p.add_argument("--no_markov", action="store_true",
                    help="ABLATION: drop a loaded markov head (semi-AR walk off).")
+    p.add_argument("--draft_refine", action="store_true",
+                   help="also run the drafter during the REFINE/CONVERGE rounds (block fully committed, heavy "
+                        "still verifying) — FIX-only there; targets the ~40-fwd verification floor. The eager "
+                        "path always does this; default off here (the original skip).")
     p.add_argument("--draft_committed_mix", type=str, default=None,
                    help="committed-slot input mode for the drafter (applies to the real decode AND --diag): "
                         "'conf' = DMax confidence-weighted p*E(tok)+(1-p)*E(MASK) renormalized; a float = fixed "
@@ -138,6 +142,7 @@ def main():
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
         draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
+        draft_refine=args.draft_refine,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
     if args.diag:
         dllm.diff_iteration.diag_on = True
