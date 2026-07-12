@@ -92,6 +92,11 @@ def main():
                         "matching decode_block_heavy and the sglang/dinfer decode_uniform.")
     p.add_argument("--use_cache", action="store_true",
                    help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
+    p.add_argument("--accept_diag", default=None,
+                   help="write per-draft-event acceptance records to this jsonl (position-wise profiler): "
+                        "each drafter EXTEND chain is compared against a DUMMY heavy forward on the pre-draft "
+                        "state (one-step acceptance) and, at block convergence, against the settled block "
+                        "(on-policy golden). ~+1 heavy fwd per draft call. Plot: plot_accept_profile.py")
     p.add_argument("--no_early_stop", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--gt_jsonl_path", default=None)
@@ -111,6 +116,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
     print(f"[gsm8k-dbet] decoding {len(rows)} examples -> {args.out_path}")
 
+    ad_fh = open(args.accept_diag, "w", encoding="utf-8") if args.accept_diag else None
     t0 = time.time()
     tot_h, tot_d, tot_hc, tot_dc = 0, 0, 0, 0
     tot_wall, tot_htime, tot_dtime, tot_tok = 0.0, 0.0, 0.0, 0
@@ -119,6 +125,7 @@ def main():
             messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
             prompt_ids = tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=True, return_tensors="pt").to(args.device)
+            ad_events = [] if ad_fh else None
             response_ids, stats = generate_dbet(
                 model, prompt_ids,
                 gen_length=args.gen_length, block_length=args.block_length,
@@ -130,7 +137,12 @@ def main():
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
                 draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
                 use_cache=args.use_cache, dmax_faithful=not args.loose_exit,
-                draft_refine=args.draft_refine)
+                draft_refine=args.draft_refine, accept_diag=ad_events)
+            if ad_fh is not None:
+                for ev in ad_events:
+                    ev["ex"] = i
+                    ad_fh.write(json.dumps(ev) + "\n")
+                ad_fh.flush()
             text = tokenizer.decode(response_ids, skip_special_tokens=True)
             tot_h += stats.heavy_forwards; tot_d += stats.draft_forwards
             tot_hc += stats.heavy_commits; tot_dc += stats.draft_commits

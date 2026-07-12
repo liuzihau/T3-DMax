@@ -262,7 +262,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                       draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
-                      dmax_faithful=True, draft_committed_mix=None, draft_refine=False):
+                      dmax_faithful=True, draft_committed_mix=None, draft_refine=False, accept_diag=None):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -289,6 +289,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
     prefix_idx = torch.zeros(1, be, dtype=torch.bool, device=device); prefix_idx[0, :bs] = True
     canvas_idx = torch.zeros(1, be, dtype=torch.bool, device=device); canvas_idx[0, bs:be] = True
 
+    _ad_events = []                                                    # accept_diag: this block's draft events
     it = 0
     while it < max_iters:
         if not dmax_faithful and not bool((x[0:1, bs:be] == MASK_ID).any()):
@@ -344,6 +345,12 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             continue                                                  # (draft_refine=True keeps the drafter in, FIX-only)
 
         # ================= DRAFT forward (helper, between heavy passes) =================
+        # accept_diag: snapshot the PRE-DRAFT next-heavy input (heavy commits soft-embedded, masks = E(MASK))
+        # so a dummy heavy forward can produce the counterfactual "what the heavy would have said" at the
+        # slots the drafter is about to commit (one-step acceptance, on-policy).
+        if accept_diag is not None:
+            _ad_pre_embeds = block_embeds.clone()
+            _ad_reveal = int((x[0, bs:be] != MASK_ID).sum())
         block_x = x[0, bs:be]                                         # state entering the draft step
         mask_pos = (block_x == MASK_ID)                              # still-masked slots (EXTEND targets)
         committed_before = active[0] & (~mask_pos)                   # committed slots (FIX candidates)
@@ -404,6 +411,19 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             x[0, bs + sel] = darg[sel]
             block_embeds[0, sel] = _soft_embed(dlog_eff[sel], embed, MASK_ID, draft_tau, draft_top_k)
             stats.draft_commits += int(sel.numel())
+            if accept_diag is not None and sel.numel() > 0:
+                # dummy heavy forward on the pre-draft state -> counterfactual next-pass argmax at the chain
+                # slots (NOT counted in stats: diagnostic-only forward)
+                _ad_out = model.heavy_forward(
+                    inputs_embeds=torch.cat([prefix_embeds, _ad_pre_embeds], dim=1),
+                    attention_mask=attn, output_hidden_states=False)
+                _ad_dummy = _ad_out.logits[0, bs:be].argmax(-1)
+                _ad_events.append({
+                    "bs": bs, "it": it, "reveal": _ad_reveal, "slots": sel.tolist(),
+                    "conf": [round(float(v), 4) for v in dc[sel]],
+                    "draft_top3": dlog_eff[sel].topk(3, dim=-1).indices.tolist(),
+                    "heavy_next": _ad_dummy[sel].tolist(),
+                })
         # ---- FIX: override a committed slot only if conf-head >= its OWN threshold AND the draft disagrees ----
         if draft_fix and bool(committed_before.any()):
             fix = committed_before & (dc >= draft_fix_threshold) & (darg != block_x)
@@ -413,6 +433,12 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                 block_embeds[0, floc] = _soft_embed(dlog_eff[floc], embed, MASK_ID, draft_tau, draft_top_k)
                 stats.draft_fixes += int(floc.numel())
         it += 1
+
+    if accept_diag is not None and _ad_events:
+        golden = x[0, bs:be]                                          # the block as CONVERGED (on-policy golden)
+        for ev in _ad_events:
+            ev["golden"] = [int(golden[si]) for si in ev["slots"]]
+        accept_diag.extend(_ad_events)
 
     # safety: never leave a [MASK] in the output
     still = (x[0:1, bs:be] == MASK_ID)
@@ -629,7 +655,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                   use_cache=False, progress_desc=None, dmax_faithful=True, draft_committed_mix=None,
-                  draft_refine=False):
+                  draft_refine=False, accept_diag=None):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -682,7 +708,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   draft_tau=draft_tau, draft_top_k=draft_top_k,
                                   draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
                                   draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful,
-                                  draft_committed_mix=draft_committed_mix, draft_refine=draft_refine)
+                                  draft_committed_mix=draft_committed_mix, draft_refine=draft_refine,
+                                  accept_diag=accept_diag)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)
