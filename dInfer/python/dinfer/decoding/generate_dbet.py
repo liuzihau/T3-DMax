@@ -262,7 +262,8 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       max_iters, max_draft_iters, tau, stats, use_draft=True,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                       draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
-                      dmax_faithful=True, draft_committed_mix=None, draft_refine=False, accept_diag=None):
+                      dmax_faithful=True, draft_committed_mix=None, draft_refine=False, accept_diag=None,
+                      force_first=True):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -396,8 +397,9 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
         if mloc.numel() > 0:
             ok = dc[mloc] >= draft_threshold
             keep = ~(torch.cumsum((~ok).long(), 0) > 0)             # prefix up to first below-threshold
-            keep[0] = True
-            sel = mloc[keep]
+            if force_first:
+                keep[0] = True     # legacy progress rule; the accept profiler measured forced tokens at 36%
+            sel = mloc[keep]       # acceptance (conf head predicted it) -- the heavy has its own progress rule
             if mh is not None:
                 # semi-AR walk (DSpark): bias each slot with the token JUST CHOSEN at its left, in order.
                 # The conf gate (sel) is unchanged — the conf head never sees the bias; only tokens change.
@@ -655,7 +657,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                   use_cache=False, progress_desc=None, dmax_faithful=True, draft_committed_mix=None,
-                  draft_refine=False, accept_diag=None):
+                  draft_refine=False, accept_diag=None, force_first=True):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -709,7 +711,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
                                   draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful,
                                   draft_committed_mix=draft_committed_mix, draft_refine=draft_refine,
-                                  accept_diag=accept_diag)
+                                  accept_diag=accept_diag, force_first=force_first)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)

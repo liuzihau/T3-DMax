@@ -27,7 +27,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
     `draft_cache` = the drafter's cross-block prefix KV cache (grown per settled block)."""
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
-                 draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False):
+                 draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False,
+                 force_first=True):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
@@ -45,6 +46,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # convergence (the ~40-fwd verification floor). Default False = the original skip (the eager path has
         # always run the drafter in these rounds; this aligns the stacks when on). Costs +1 draft call/round.
         self.draft_refine = draft_refine
+        self.force_first = force_first                 # EXTEND progress rule (legacy); False = gate-only commits
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -153,7 +155,9 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         mloc = mask_pos.nonzero(as_tuple=True)[0]
         if mloc.numel() > 0:
             ok = dc[mloc] >= self.draft_threshold
-            keep = ~(torch.cumsum((~ok).long(), 0) > 0); keep[0] = True
+            keep = ~(torch.cumsum((~ok).long(), 0) > 0)
+            if self.force_first:
+                keep[0] = True
             sel = mloc[keep]
             if mh is not None:                                       # semi-AR walk: chain the just-chosen token
                 prev = x.data[0, cur + int(sel[0]) - 1]
@@ -282,8 +286,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
 
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
-                 draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False, early_stop=True,
-                 maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
+                 draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False, force_first=True,
+                 early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -298,6 +302,6 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
             draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix,
-            draft_refine=draft_refine)
+            draft_refine=draft_refine, force_first=force_first)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration

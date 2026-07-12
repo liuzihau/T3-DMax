@@ -91,6 +91,8 @@ def main():
                         "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
     p.add_argument("--no_markov", action="store_true",
                    help="ABLATION: drop a loaded markov head (semi-AR walk off).")
+    p.add_argument("--no_force_first", action="store_true",
+                   help="drop the EXTEND progress rule (gate-only commits; heavy has its own progress rule).")
     p.add_argument("--draft_refine", action="store_true",
                    help="also run the drafter during the REFINE/CONVERGE rounds (block fully committed, heavy "
                         "still verifying) — FIX-only there; targets the ~40-fwd verification floor. Same flag "
@@ -147,7 +149,7 @@ def main():
         draft_threshold=args.draft_threshold, draft_tau=args.draft_tau, draft_top_k=args.draft_top_k,
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
         draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
-        draft_refine=args.draft_refine,
+        draft_refine=args.draft_refine, force_first=not args.no_force_first,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
     if args.diag:
         dllm.diff_iteration.diag_on = True

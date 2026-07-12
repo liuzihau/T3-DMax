@@ -96,6 +96,10 @@ def main():
                         "matching decode_block_heavy and the sglang/dinfer decode_uniform.")
     p.add_argument("--use_cache", action="store_true",
                    help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
+    p.add_argument("--no_force_first", action="store_true",
+                   help="drop the EXTEND progress rule (keep[0]=True): the drafter commits ONLY above-gate "
+                        "tokens; a below-gate first slot commits nothing and the heavy handles it (it has its "
+                        "own progress rule). Profiler: forced tokens accept at 0.36 (14%% of chains at dt0.5).")
     p.add_argument("--accept_diag", default=None,
                    help="write per-draft-event acceptance records to this jsonl (position-wise profiler): "
                         "each drafter EXTEND chain is compared against a DUMMY heavy forward on the pre-draft "
@@ -141,7 +145,8 @@ def main():
                 draft_committed_soft=args.draft_committed_soft, draft_fix=not args.no_draft_fix,
                 draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
                 use_cache=args.use_cache, dmax_faithful=not args.loose_exit,
-                draft_refine=args.draft_refine, accept_diag=ad_events)
+                draft_refine=args.draft_refine, accept_diag=ad_events,
+                force_first=not args.no_force_first)
             if ad_fh is not None:
                 for ev in ad_events:
                     ev["ex"] = i
