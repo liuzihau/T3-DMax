@@ -411,7 +411,10 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                     prev = dlog_eff[s].argmax(-1)
                 darg = dlog_eff.argmax(-1)
             x[0, bs + sel] = darg[sel]
-            block_embeds[0, sel] = _soft_embed(dlog_eff[sel], embed, MASK_ID, draft_tau, draft_top_k)
+            # re-feed from the UNBIASED distribution: the markov bias is a token-SELECTION aid, not evidence.
+            # Feeding the biased (bigram-sharpened) dist to the heavy makes WRONG chains more convincing and
+            # suppresses self-repair (train/infer mismatch: training never re-feeds drafter distributions).
+            block_embeds[0, sel] = _soft_embed(dlogits[0][sel], embed, MASK_ID, draft_tau, draft_top_k)
             stats.draft_commits += int(sel.numel())
             if accept_diag is not None and sel.numel() > 0:
                 # dummy heavy forward on the pre-draft state -> counterfactual next-pass argmax at the chain
@@ -432,7 +435,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x[0, bs + floc] = darg[floc]
-                block_embeds[0, floc] = _soft_embed(dlog_eff[floc], embed, MASK_ID, draft_tau, draft_top_k)
+                block_embeds[0, floc] = _soft_embed(dlogits[0][floc], embed, MASK_ID, draft_tau, draft_top_k)
                 stats.draft_fixes += int(floc.numel())
         it += 1
 
