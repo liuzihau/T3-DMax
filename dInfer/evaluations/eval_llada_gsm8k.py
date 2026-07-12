@@ -38,6 +38,8 @@ for _p in (_DFACTORY, os.path.join(_DFACTORY, "VeOmni")):
 
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
+from eval_tasks import load_task, grader_for  # noqa: E402
+
 GSM8K_USER_TEMPLATE = "Question: {question}\nLet's think step by step\nAnswer:"
 
 
@@ -89,6 +91,8 @@ def main():
                         "own code (authentic reference, ~6x slower/forward)")
     p.add_argument("--tokenizer_path", default=None)
     p.add_argument("--out_path", required=True)
+    p.add_argument("--task", choices=["gsm8k", "math500", "algebra", "asdiv"], default="gsm8k",
+                   help="benchmark; prompts verbatim from the lm-eval task yamls (see eval_tasks.py).")
     p.add_argument("--gen_length", type=int, default=512)
     p.add_argument("--block_length", type=int, default=32)
     p.add_argument("--steps", type=int, required=True, help="denoise steps per block (official default 32; e.g. 16/9/6)")
@@ -118,7 +122,7 @@ def main():
         return orig_forward(*a, **k)
     model.forward = counting_forward
 
-    rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
+    rows = load_task(args.task, limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or ".", exist_ok=True)
     print(f"[gsm8k-llada-official] {len(rows)} ex impl={args.model_impl} gen={args.gen_length} "
           f"block={args.block_length} steps={args.steps} thr={args.threshold} T={args.temperature} "
@@ -127,7 +131,7 @@ def main():
     t0 = time.time(); tot_tok = 0; tot_wall = 0.0; tot_fwd = 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
         for i, row in enumerate(rows):
-            msgs = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
+            msgs = [{"role": "user", "content": row["prompt"]}]
             pid = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
                                           return_tensors="pt").to(args.device)
             P = pid.shape[1]
@@ -150,7 +154,8 @@ def main():
             text = tok.decode(seq, skip_special_tokens=True)
             ntok = int(seq.shape[0])
             tot_tok += ntok; tot_wall += wall; tot_fwd += nfe
-            fh.write(json.dumps({"answer": text, "question": row["question"], "forwards": int(nfe),
+            fh.write(json.dumps({"answer": text, "question": row["question"], "task": args.task,
+                                 "forwards": int(nfe),
                                  "gen_tokens": ntok, "wall_time": round(wall, 4)},
                                 ensure_ascii=False) + "\n")
             fh.flush()
@@ -161,7 +166,7 @@ def main():
     n = max(len(rows), 1); dt = time.time() - t0
     print(f"[gsm8k-llada-official] done {dt:.0f}s. tok/s={tot_tok/max(tot_wall,1e-6):.1f} "
           f"fwd/ex={tot_fwd/n:.1f} tok/ex={tot_tok/n:.1f} wall/ex={tot_wall/n:.2f}s")
-    print(f"[gsm8k-llada-official] grade: python {os.path.join(_HERE, 'val_gsm8k.py')} --pred-path {args.out_path}")
+    print(f"[gsm8k-llada-official] grade: python {os.path.join(_HERE, grader_for(args.task))} --pred-path {args.out_path}")
 
 
 if __name__ == "__main__":

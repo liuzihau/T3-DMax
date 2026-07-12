@@ -15,10 +15,17 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+_GRADERS = {"gsm8k": "val_gsm8k.py", "math500": "val_math.py", "algebra": "val_algebra.py",
+            "asdiv": "val_asdiv.py"}
+
+
 def grade(jsonl_path):
-    """Run val_gsm8k.py and parse 'Accuracy: xx.xxxx%'."""
+    """Run the task's grader (from the rows' 'task' field; default gsm8k) and parse 'Accuracy: xx.xx%'."""
     try:
-        out = subprocess.run([sys.executable, os.path.join(_HERE, "val_gsm8k.py"),
+        with open(jsonl_path, "r", encoding="utf-8") as fh:
+            first = json.loads(fh.readline())
+        grader = _GRADERS.get(first.get("task", "gsm8k"), "val_gsm8k.py")
+        out = subprocess.run([sys.executable, os.path.join(_HERE, grader),
                               "--pred-path", jsonl_path],
                              capture_output=True, text=True, timeout=600).stdout
         m = re.search(r"Accuracy:\s*([\d.]+)%", out)

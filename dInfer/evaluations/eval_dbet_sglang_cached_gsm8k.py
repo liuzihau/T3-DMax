@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "python")))
 sys.path.insert(0, _HERE)
 from dinfer.decoding.generate_dbet import load_drafter_standalone                       # noqa: E402
 from dinfer.decoding.generate_dbet_sglang_cached import DbetBlockDiffusionLLM           # noqa: E402
-from eval_dbet_gsm8k import load_gsm8k_test, GSM8K_USER_TEMPLATE                         # noqa: E402
+from eval_tasks import load_task, grader_for                                             # noqa: E402
 from transformers import AutoTokenizer, AutoConfig                                      # noqa: E402
 
 MASK_ID, EOS_ID = 156895, 156892
@@ -76,6 +76,8 @@ def main():
     p.add_argument("--drafter_path", default=None, help="required unless --no_draft (heavy-only baseline)")
     p.add_argument("--tokenizer_path", default=None)
     p.add_argument("--out_path", required=True)
+    p.add_argument("--task", choices=["gsm8k", "math500", "algebra", "asdiv"], default="gsm8k",
+                   help="benchmark; prompts verbatim from the lm-eval task yamls (see eval_tasks.py).")
     p.add_argument("--gen_length", type=int, default=512)
     p.add_argument("--block_length", type=int, default=32)
     p.add_argument("--heavy_threshold", type=float, default=0.9)
@@ -151,7 +153,7 @@ def main():
         dllm.diff_iteration.diag_on = True
 
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or args.heavy_path), trust_remote_code=True)
-    rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
+    rows = load_task(args.task, limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)) or ".", exist_ok=True)
     dec_tag = f"fixed_s{args.steps}" if args.decoder == "fixed" else f"h{args.heavy_threshold}"
     print(f"[sglang-dbet-cached] {len(rows)} ex gen={args.gen_length} block={args.block_length} "
@@ -172,7 +174,7 @@ def main():
     t0 = time.time(); tot_tok = 0; tot_wall = 0.0; tot_fwd = 0; tot_dc = 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
         for i, row in enumerate(rows):
-            msgs = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
+            msgs = [{"role": "user", "content": row["prompt"]}]
             pid = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
                                           return_tensors="pt").to(device)
             dllm.diff_iteration.reset()                                   # fresh cross-block draft cache per example
@@ -189,7 +191,8 @@ def main():
             text = tok.decode(ans, skip_special_tokens=True)
             ntok = int(ans.shape[0])
             tot_tok += ntok; tot_wall += wall; tot_fwd += nfe; tot_dc += dc
-            fh.write(json.dumps({"answer": text, "question": row["question"], "forwards": int(nfe),
+            fh.write(json.dumps({"answer": text, "question": row["question"], "task": args.task,
+                                 "forwards": int(nfe),
                                  "draft_commits": int(dc), "gen_tokens": ntok,
                                  "wall_time": round(wall, 4)}, ensure_ascii=False) + "\n")
             fh.flush()
@@ -200,7 +203,7 @@ def main():
     n = max(len(rows), 1); dt = time.time() - t0
     print(f"[sglang-dbet-cached] done {dt:.0f}s. tok/s={tot_tok/max(tot_wall,1e-6):.1f} fwd/ex={tot_fwd/n:.1f} "
           f"draft_commits/ex={tot_dc/n:.1f}  (heavy-only baseline ~927 tok/s; draft_commits=0 => injection NOT hit)")
-    print(f"[sglang-dbet-cached] grade: python {os.path.join(_HERE,'val_gsm8k.py')} --pred-path {args.out_path}"
+    print(f"[sglang-dbet-cached] grade: python {os.path.join(_HERE, grader_for(args.task))} --pred-path {args.out_path}"
           + (f" --limit {args.limit}" if args.limit else ""))
 
     if args.diag:

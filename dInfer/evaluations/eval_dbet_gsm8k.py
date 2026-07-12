@@ -26,6 +26,7 @@ if _DINFER_PYTHON not in sys.path:
 from transformers import AutoTokenizer  # noqa: E402
 
 from dinfer.decoding.generate_dbet import generate_dbet, load_dbet_model  # noqa: E402
+from eval_tasks import load_task, grader_for  # noqa: E402
 
 # verbatim from DMax's gsm8k-llada-mini.yaml doc_to_text (matches eval_t3d_gsm8k.py)
 GSM8K_USER_TEMPLATE = "Question: {question}\nLet's think step by step\nAnswer:"
@@ -54,6 +55,9 @@ def main():
     p.add_argument("--heavy_path", required=True, help="DMax-Math-16B-moe-merge checkpoint (frozen heavy).")
     p.add_argument("--tokenizer_path", default=None, help="default: heavy_path.")
     p.add_argument("--out_path", required=True)
+    p.add_argument("--task", choices=["gsm8k", "math500", "algebra", "asdiv"], default="gsm8k",
+                   help="benchmark; prompts verbatim from the lm-eval task yamls (see eval_tasks.py). "
+                        "math500/algebra want --gen_length 1024.")
     p.add_argument("--gen_length", type=int, default=256)
     p.add_argument("--block_length", type=int, default=32, help="MUST match training (32).")
     p.add_argument("--heavy_threshold", type=float, default=0.9, help="heavy decode_uniform commit confidence.")
@@ -112,7 +116,7 @@ def main():
     print(f"[gsm8k-dbet] block={args.block_length} gen={args.gen_length} "
           f"heavy_thr={args.heavy_threshold} draft_thr={args.draft_threshold} max_draft_iters={args.max_draft_iters}")
 
-    rows = load_gsm8k_test(limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
+    rows = load_task(args.task, limit=args.limit, gt_jsonl_path=args.gt_jsonl_path)
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
     print(f"[gsm8k-dbet] decoding {len(rows)} examples -> {args.out_path}")
 
@@ -122,7 +126,7 @@ def main():
     tot_wall, tot_htime, tot_dtime, tot_tok = 0.0, 0.0, 0.0, 0
     with open(args.out_path, "w", encoding="utf-8") as fh:
         for i, row in enumerate(rows):
-            messages = [{"role": "user", "content": GSM8K_USER_TEMPLATE.format(question=row["question"])}]
+            messages = [{"role": "user", "content": row["prompt"]}]
             prompt_ids = tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=True, return_tensors="pt").to(args.device)
             ad_events = [] if ad_fh else None
@@ -149,7 +153,7 @@ def main():
             tot_wall += stats.wall_time; tot_htime += stats.heavy_time; tot_dtime += stats.draft_time
             tot_tok += int(response_ids.shape[0])
             fh.write(json.dumps({
-                "answer": text, "question": row["question"],
+                "answer": text, "question": row["question"], "task": args.task,
                 "heavy_forwards": stats.heavy_forwards, "draft_forwards": stats.draft_forwards,
                 "heavy_commits": stats.heavy_commits, "draft_commits": stats.draft_commits,
                 "draft_fixes": stats.draft_fixes,
@@ -170,7 +174,7 @@ def main():
     print(f"[gsm8k-dbet] mean decode wall/ex={tot_wall/n:.2f}s (heavy {tot_htime/n:.2f}s + draft {tot_dtime/n:.2f}s) "
           f"| throughput={tot_tok / max(tot_wall, 1e-6):.1f} tok/s "
           f"| avg {1e3*tot_htime/max(tot_h,1):.0f}ms/heavy-fwd {1e3*tot_dtime/max(tot_d,1):.0f}ms/draft-fwd")
-    grader = os.path.join(_HERE, "val_gsm8k.py")
+    grader = os.path.join(_HERE, grader_for(args.task))
     print(f"[gsm8k-dbet] grade: python {grader} --pred-path {args.out_path}"
           + (f" --limit {args.limit}" if args.limit else ""))
 
