@@ -159,7 +159,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             if self.force_first:
                 keep[0] = True
             sel = mloc[keep]
-            if mh is not None:                                       # semi-AR walk: chain the just-chosen token
+            if mh is not None and sel.numel() > 0:                   # semi-AR walk (sel EMPTY under no_force_first)
                 prev = x.data[0, cur + int(sel[0]) - 1]
                 state = None
                 for s in sel.tolist():

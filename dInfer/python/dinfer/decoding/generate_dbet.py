@@ -400,7 +400,8 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             if force_first:
                 keep[0] = True     # legacy progress rule; the accept profiler measured forced tokens at 36%
             sel = mloc[keep]       # acceptance (conf head predicted it) -- the heavy has its own progress rule
-            if mh is not None:
+            # --no_force_first can yield an EMPTY sel (all masked slots below the gate) -> nothing to commit
+            if mh is not None and sel.numel() > 0:
                 # semi-AR walk (DSpark): bias each slot with the token JUST CHOSEN at its left, in order.
                 # The conf gate (sel) is unchanged — the conf head never sees the bias; only tokens change.
                 prev = x[0, bs + int(sel[0]) - 1]
