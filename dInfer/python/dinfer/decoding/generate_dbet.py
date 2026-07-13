@@ -263,7 +263,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                       draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                       dmax_faithful=True, draft_committed_mix=None, draft_refine=False, accept_diag=None,
-                      force_first=True):
+                      force_first=True, draft_refine_embed=False):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -440,6 +440,15 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                 x[0, bs + floc] = darg[floc]
                 block_embeds[0, floc] = _soft_embed(dlog_eff[floc], embed, MASK_ID, draft_tau, draft_top_k)
                 stats.draft_fixes += int(floc.numel())
+        # ---- REFINE-EMBED: in verify rounds, overlay the drafter's DISTRIBUTION at ALL committed slots ----
+        # The drafter is trained (L1) toward the verifier p' = the heavy's NEXT-step belief; overlaying it on
+        # the heavy's self-re-feed injects a one-step-ahead belief estimate into the confidence ramp that
+        # drives the ~2.9 verify rounds/block (the floor). Risks: echo-chamber conf inflation (guard:
+        # accuracy) / changed_any retriggering (guard: heavy/ex). Slots the drafter disagrees on below the
+        # FIX gate get its doubt injected softly instead of a hard flip.
+        if draft_refine_embed and not bool(mask_pos.any()) and bool(committed_before.any()):
+            ri = committed_before.nonzero(as_tuple=True)[0]
+            block_embeds[0, ri] = _soft_embed(dlog_eff[ri], embed, MASK_ID, draft_tau, draft_top_k)
         it += 1
 
     if accept_diag is not None and _ad_events:
@@ -663,7 +672,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                   use_cache=False, progress_desc=None, dmax_faithful=True, draft_committed_mix=None,
-                  draft_refine=False, accept_diag=None, force_first=True):
+                  draft_refine=False, accept_diag=None, force_first=True, draft_refine_embed=False):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -717,7 +726,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   draft_committed_soft=draft_committed_soft, draft_fix=draft_fix,
                                   draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful,
                                   draft_committed_mix=draft_committed_mix, draft_refine=draft_refine,
-                                  accept_diag=accept_diag, force_first=force_first)
+                                  accept_diag=accept_diag, force_first=force_first,
+                                  draft_refine_embed=draft_refine_embed)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)

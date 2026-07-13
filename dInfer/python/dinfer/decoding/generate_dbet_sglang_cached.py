@@ -28,7 +28,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
                  draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False,
-                 force_first=True):
+                 force_first=True, draft_refine_embed=False):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
@@ -47,6 +47,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         # always run the drafter in these rounds; this aligns the stacks when on). Costs +1 draft call/round.
         self.draft_refine = draft_refine
         self.force_first = force_first                 # EXTEND progress rule (legacy); False = gate-only commits
+        self.draft_refine_embed = draft_refine_embed   # verify rounds: overlay drafter dist at ALL committed slots
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -178,6 +179,10 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             if floc.numel() > 0:
                 x.data[0, cur + floc] = darg[floc]
                 embeddings[0, floc] = _soft_embed(dlog_eff[floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
+        # REFINE-EMBED: verify rounds -> overlay the drafter's distribution at ALL committed slots (see eager)
+        if self.draft_refine_embed and not bool(mask_pos.any()) and bool(committed_before.any()):
+            ri = committed_before.nonzero(as_tuple=True)[0]
+            embeddings[0, ri] = _soft_embed(dlog_eff[ri], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
         return output, Breakflag, embeddings
 
     def _diag_dry_step(self, output, Breakflag, embeddings, block_loc, block_length, x, active_index):
@@ -288,7 +293,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
                  draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False, force_first=True,
-                 early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang', **kw):
+                 draft_refine_embed=False, early_stop=True, maximum_unroll=1, expected_tpf=15,
+                 backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -303,6 +309,6 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
             draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix,
-            draft_refine=draft_refine, force_first=force_first)
+            draft_refine=draft_refine, force_first=force_first, draft_refine_embed=draft_refine_embed)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration

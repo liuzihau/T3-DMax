@@ -96,6 +96,10 @@ def main():
                         "matching decode_block_heavy and the sglang/dinfer decode_uniform.")
     p.add_argument("--use_cache", action="store_true",
                    help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
+    p.add_argument("--draft_refine_embed", action="store_true",
+                   help="with --draft_refine: in verify rounds, overlay the drafter's full DISTRIBUTION (soft "
+                        "embed) at ALL committed slots, not just fixes -- injects the drafter's p'-trained "
+                        "one-step-ahead belief into the confidence ramp (the ~2.9-round/block floor).")
     p.add_argument("--no_force_first", action="store_true",
                    help="drop the EXTEND progress rule (keep[0]=True): the drafter commits ONLY above-gate "
                         "tokens; a below-gate first slot commits nothing and the heavy handles it (it has its "
@@ -124,6 +128,8 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
     print(f"[gsm8k-dbet] decoding {len(rows)} examples -> {args.out_path}")
 
+    if args.draft_refine_embed and not args.draft_refine:
+        raise SystemExit("--draft_refine_embed requires --draft_refine (the drafter must run in verify rounds)")
     ad_fh = open(args.accept_diag, "w", encoding="utf-8") if args.accept_diag else None
     t0 = time.time()
     tot_h, tot_d, tot_hc, tot_dc = 0, 0, 0, 0
@@ -146,7 +152,7 @@ def main():
                 draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
                 use_cache=args.use_cache, dmax_faithful=not args.loose_exit,
                 draft_refine=args.draft_refine, accept_diag=ad_events,
-                force_first=not args.no_force_first)
+                force_first=not args.no_force_first, draft_refine_embed=args.draft_refine_embed)
             if ad_fh is not None:
                 for ev in ad_events:
                     ev["ex"] = i
