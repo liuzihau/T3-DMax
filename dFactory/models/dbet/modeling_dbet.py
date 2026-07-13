@@ -537,6 +537,25 @@ class DbetMarkovHead(nn.Module):
         new_state = gate * state + (1.0 - gate) * torch.tanh(cand_raw)
         return self.markov_w2(torch.tanh(out_raw)), new_state
 
+    def soft_step_bias(self, prev_ids: torch.Tensor, prev_probs: torch.Tensor,
+                       hb: Optional[torch.Tensor] = None, state: Optional[torch.Tensor] = None):
+        """One chain step with a SOFT prev: prev_ids [m], prev_probs [m] (raw top-k probs -- an uncertain
+        prev attenuates the bias since sum(p)<1). For the vanilla head this is EXACT marginalization over the
+        prev belief (bias is linear in the prev embedding: W2(sum p_i W1[t_i]) = E[W2 W1[t]]); gated/rnn use
+        the expected embedding as an approximation. No retraining needed (linearity)."""
+        e = (self.markov_w1(prev_ids.long()) * prev_probs.to(self.markov_w1.weight.dtype).unsqueeze(-1)).sum(dim=-2)
+        if self.head_type == "vanilla":
+            return self.markov_w2(e), None
+        if self.head_type == "gated":
+            g = torch.sigmoid(self.gate_proj(torch.cat([hb, e], dim=-1)))
+            return self.markov_w2(g * e), None
+        if state is None:
+            state = torch.zeros_like(e)
+        gate_raw, cand_raw, out_raw = self.joint_proj(torch.cat([state, e, hb], dim=-1)).chunk(3, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        new_state = gate * state + (1.0 - gate) * torch.tanh(cand_raw)
+        return self.markov_w2(torch.tanh(out_raw)), new_state
+
     def block_bias(self, prev_ids: torch.Tensor, hb: Optional[torch.Tensor], block_size: int) -> torch.Tensor:
         """Teacher-forced bias over a full sequence [B,L] -> [B,L,V]. vanilla/gated: ONE parallel op (the prev
         tokens are known upfront — teacher forcing); rnn: head-only unroll over block positions, state reset

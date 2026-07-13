@@ -28,7 +28,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
 
     def __init__(self, draft, heavy_model, draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True,
                  draft_enabled=True, draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False,
-                 force_first=True, draft_refine_embed=False):
+                 force_first=True, draft_refine_embed=False, markov_soft_prev=False):
         super().__init__()
         self.draft = draft
         self.heavy_model = heavy_model                 # runner.model.model (LLaDA2Model with the buffer tap)
@@ -48,6 +48,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
         self.draft_refine = draft_refine
         self.force_first = force_first                 # EXTEND progress rule (legacy); False = gate-only commits
         self.draft_refine_embed = draft_refine_embed   # verify rounds: overlay drafter dist at ALL committed slots
+        self.markov_soft_prev = markov_soft_prev       # walk conditions on top-k belief instead of hard argmax
         self.draft_tau = draft_tau
         self.draft_top_k = draft_top_k
         self.draft_fix = draft_fix
@@ -162,11 +163,21 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             sel = mloc[keep]
             if mh is not None and sel.numel() > 0:                   # semi-AR walk (sel EMPTY under no_force_first)
                 prev = x.data[0, cur + int(sel[0]) - 1]
+                soft_prev = None
                 state = None
                 for s in sel.tolist():
-                    bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
+                    if soft_prev is not None:
+                        bias_s, state = mh.soft_step_bias(soft_prev[0], soft_prev[1],
+                                                          hb0[s] if hb0 is not None else None, state)
+                    else:
+                        bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
                     dlog_eff[s] = dlog_eff[s] + bias_s.to(dlog_eff.dtype)
-                    prev = dlog_eff[s].argmax(-1)
+                    if self.markov_soft_prev:
+                        pr = torch.softmax(dlog_eff[s].float(), dim=-1)
+                        tp, ti = pr.topk(self.draft_top_k)
+                        soft_prev = (ti, tp)
+                    else:
+                        prev = dlog_eff[s].argmax(-1)
                 darg = dlog_eff.argmax(-1)
             x.data[0, cur + sel] = darg[sel]
             # biased re-feed = the drafter's trained estimate of p' (see the eager site for the full note)
@@ -293,8 +304,8 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
     def __init__(self, model, decoder, iterator_factory, cache_factory, draft, sel_layers, *,
                  draft_threshold=0.9, draft_tau=1.0, draft_top_k=2, draft_fix=True, draft_enabled=True,
                  draft_fix_threshold=None, draft_committed_mix=None, draft_refine=False, force_first=True,
-                 draft_refine_embed=False, early_stop=True, maximum_unroll=1, expected_tpf=15,
-                 backend='sglang', **kw):
+                 draft_refine_embed=False, markov_soft_prev=False, early_stop=True, maximum_unroll=1,
+                 expected_tpf=15, backend='sglang', **kw):
         super().__init__(model, decoder, iterator_factory, cache_factory, early_stop=early_stop,
                          maximum_unroll=maximum_unroll, expected_tpf=expected_tpf, backend=backend, **kw)
         # turn on the graph-safe buffer tap on the inner LLaDA2Model (runner.model = LLaDA2SGLangLM; .model = LLaDA2Model)
@@ -309,6 +320,7 @@ class DbetBlockDiffusionLLM(BlockDiffusionLLM):
             draft, heavy_model, draft_threshold=draft_threshold, draft_tau=draft_tau,
             draft_top_k=draft_top_k, draft_fix=draft_fix, draft_enabled=draft_enabled,
             draft_fix_threshold=draft_fix_threshold, draft_committed_mix=draft_committed_mix,
-            draft_refine=draft_refine, force_first=force_first, draft_refine_embed=draft_refine_embed)
+            draft_refine=draft_refine, force_first=force_first, draft_refine_embed=draft_refine_embed,
+            markov_soft_prev=markov_soft_prev)
         # rebuild the runner around the DBet iteration (BlockDiffusionRunner holds a ref to diff_iteration)
         self.block_runner.diff_iteration = self.diff_iteration

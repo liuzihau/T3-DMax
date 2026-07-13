@@ -263,7 +263,7 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
                       heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                       draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                       dmax_faithful=True, draft_committed_mix=None, draft_refine=False, accept_diag=None,
-                      force_first=True, draft_refine_embed=False):
+                      force_first=True, draft_refine_embed=False, markov_soft_prev=False):
     """Decode one block, DMax-faithful. The loop = DMax exactly (heavy forward -> decode_uniform commit ->
     soft-embed re-feed -> DMax exit rule); a HEAVY forward is always first, last, and the SOLE arbiter of "done".
     The draft is inserted only BETWEEN heavy forwards as a helper: after a heavy pass that isn't done, one draft
@@ -404,12 +404,25 @@ def decode_block_dbet(model, x, bs, be, attn, heavy_threshold, draft_threshold,
             if mh is not None and sel.numel() > 0:
                 # semi-AR walk (DSpark): bias each slot with the token JUST CHOSEN at its left, in order.
                 # The conf gate (sel) is unchanged — the conf head never sees the bias; only tokens change.
+                # markov_soft_prev: chain-internal prevs become the top-k BELIEF (p-weighted, raw probs ->
+                # uncertainty attenuates) instead of a hard argmax; exact for the linear vanilla head.
+                # Step 0's prev = the real committed neighbor (certain) -> always hard.
                 prev = x[0, bs + int(sel[0]) - 1]
+                soft_prev = None                                     # (ids [k], probs [k]) once inside the chain
                 state = None
                 for s in sel.tolist():
-                    bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
+                    if soft_prev is not None:
+                        bias_s, state = mh.soft_step_bias(soft_prev[0], soft_prev[1],
+                                                          hb0[s] if hb0 is not None else None, state)
+                    else:
+                        bias_s, state = mh.step_bias(prev, hb0[s] if hb0 is not None else None, state)
                     dlog_eff[s] = dlog_eff[s] + bias_s.to(dlog_eff.dtype)
-                    prev = dlog_eff[s].argmax(-1)
+                    if markov_soft_prev:
+                        pr = torch.softmax(dlog_eff[s].float(), dim=-1)
+                        tp, ti = pr.topk(draft_top_k)
+                        soft_prev = (ti, tp)                         # raw probs: sum<1 attenuates
+                    else:
+                        prev = dlog_eff[s].argmax(-1)
                 darg = dlog_eff.argmax(-1)
             x[0, bs + sel] = darg[sel]
             # re-feed the BIASED distribution: the L1 loss aligns softmax(biased logits) to the verifier p',
@@ -672,7 +685,8 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                   heavy_tau=1.0, heavy_top_k=1, draft_tau=1.0, draft_top_k=1,
                   draft_committed_soft=False, draft_fix=True, draft_fix_threshold=None,
                   use_cache=False, progress_desc=None, dmax_faithful=True, draft_committed_mix=None,
-                  draft_refine=False, accept_diag=None, force_first=True, draft_refine_embed=False):
+                  draft_refine=False, accept_diag=None, force_first=True, draft_refine_embed=False,
+                  markov_soft_prev=False):
     """Grid-aligned multi-block DBet generation. Returns (response_ids [n], DbetGenerateStats); response_ids
     excludes the prompt and is cut at the first EOS.
     heavy_threshold: decode_uniform commit confidence for the HEAVY (DMax default 0.9 here for high precision).
@@ -727,7 +741,7 @@ def generate_dbet(model, prompt_ids, gen_length, block_length,
                                   draft_fix_threshold=draft_fix_threshold, dmax_faithful=dmax_faithful,
                                   draft_committed_mix=draft_committed_mix, draft_refine=draft_refine,
                                   accept_diag=accept_diag, force_first=force_first,
-                                  draft_refine_embed=draft_refine_embed)
+                                  draft_refine_embed=draft_refine_embed, markov_soft_prev=markov_soft_prev)
             else:                                             # heavy-only = faithful DMax mirror (not decode_block_dbet)
                 decode_block_heavy(model, x, bs, be, attn, heavy_threshold, max_iter_per_block, stats,
                                    heavy_tau=heavy_tau, heavy_top_k=heavy_top_k)

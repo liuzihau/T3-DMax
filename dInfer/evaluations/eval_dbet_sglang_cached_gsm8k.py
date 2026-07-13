@@ -91,6 +91,8 @@ def main():
                         "Golden diag says FIX is only net-positive at >=0.9 while EXTEND can run lower.")
     p.add_argument("--no_markov", action="store_true",
                    help="ABLATION: drop a loaded markov head (semi-AR walk off).")
+    p.add_argument("--markov_soft_prev", action="store_true",
+                   help="markov walk conditions on the soft top-k prev belief instead of the hard argmax.")
     p.add_argument("--draft_refine_embed", action="store_true",
                    help="with --draft_refine: verify rounds overlay the drafter's distribution at ALL "
                         "committed slots (one-step-ahead belief into the confidence ramp).")
@@ -153,7 +155,7 @@ def main():
         draft_fix=not args.no_draft_fix, draft_enabled=not args.no_draft,
         draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
         draft_refine=args.draft_refine, force_first=not args.no_force_first,
-        draft_refine_embed=args.draft_refine_embed,
+        draft_refine_embed=args.draft_refine_embed, markov_soft_prev=args.markov_soft_prev,
         early_stop=True, maximum_unroll=4, expected_tpf=4, backend="sglang")
     if args.diag:
         dllm.diff_iteration.diag_on = True

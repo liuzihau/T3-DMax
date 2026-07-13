@@ -96,6 +96,10 @@ def main():
                         "matching decode_block_heavy and the sglang/dinfer decode_uniform.")
     p.add_argument("--use_cache", action="store_true",
                    help="prefix-KV cache (DMax-aligned): forward only the block each iter; must be iso-output vs no-cache.")
+    p.add_argument("--markov_soft_prev", action="store_true",
+                   help="markov walk conditions on the SOFT prev (top draft_top_k belief, raw-prob weighted -> "
+                        "uncertainty attenuates) instead of the hard argmax; exact marginalization for the "
+                        "vanilla head, no retraining needed. Chain step 0 stays hard (real neighbor).")
     p.add_argument("--draft_refine_embed", action="store_true",
                    help="with --draft_refine: in verify rounds, overlay the drafter's full DISTRIBUTION (soft "
                         "embed) at ALL committed slots, not just fixes -- injects the drafter's p'-trained "
@@ -152,7 +156,8 @@ def main():
                 draft_fix_threshold=args.draft_fix_threshold, draft_committed_mix=args.draft_committed_mix,
                 use_cache=args.use_cache, dmax_faithful=not args.loose_exit,
                 draft_refine=args.draft_refine, accept_diag=ad_events,
-                force_first=not args.no_force_first, draft_refine_embed=args.draft_refine_embed)
+                force_first=not args.no_force_first, draft_refine_embed=args.draft_refine_embed,
+                markov_soft_prev=args.markov_soft_prev)
             if ad_fh is not None:
                 for ev in ad_events:
                     ev["ex"] = i
