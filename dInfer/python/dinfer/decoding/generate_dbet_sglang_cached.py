@@ -168,8 +168,8 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
                     prev = dlog_eff[s].argmax(-1)
                 darg = dlog_eff.argmax(-1)
             x.data[0, cur + sel] = darg[sel]
-            # unbiased re-feed: the markov bias selects tokens; the heavy's evidence stays honest (see eager)
-            embeddings[0, sel] = _soft_embed(dlogits[0][sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
+            # biased re-feed = the drafter's trained estimate of p' (see the eager site for the full note)
+            embeddings[0, sel] = _soft_embed(dlog_eff[sel], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
             self.draft_commits += int(sel.numel())
         # FIX: override a committed slot iff conf-head >= its OWN threshold AND the draft disagrees
         if self.draft_fix and bool(committed_before.any()):
@@ -177,7 +177,7 @@ class DbetBlockDiffusionIteration(BlockDiffusionIteration):
             floc = fix.nonzero(as_tuple=True)[0]
             if floc.numel() > 0:
                 x.data[0, cur + floc] = darg[floc]
-                embeddings[0, floc] = _soft_embed(dlogits[0][floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
+                embeddings[0, floc] = _soft_embed(dlog_eff[floc], self.embed, MASK_ID, self.draft_tau, self.draft_top_k)
         return output, Breakflag, embeddings
 
     def _diag_dry_step(self, output, Breakflag, embeddings, block_loc, block_length, x, active_index):
