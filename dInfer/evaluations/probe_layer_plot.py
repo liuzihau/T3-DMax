@@ -1,16 +1,22 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# Plot the layer-readout probe (probe_layer_readout.py). Produces the go/no-go figures:
-#   1. recall_vs_setsize.png   -- THE decision plot: per layer, masked nucleus-recall vs mean |S| (F1).
-#   2. layer_recall_curves.png -- recall@K vs layer (masked), one panel per forward. "which layer locks in".
-#   3. setsize_vs_layer.png    -- mean |S| + cap-saturation vs layer (masked, per forward).
-#   4. heatmap_recall.png      -- layer x position recall@K (masked), one panel per forward.
-#   5. position_bars_abs.png   -- x=position, revealed vs masked bars, one panel per K_ABS (chosen layer, F1).
-#   6. position_bars_pct.png   -- same for K_PCT.
-#   7. conditional_markov.png  -- conditional (prefix-all-correct) recall@K vs position vs unconditional.
+# Plot the layer-readout probe (probe_layer_readout.py) -- POSITION-RESOLVED throughout. DMax commits
+# left-to-right, so recall is a strong function of position-in-block; NOTHING here averages positions away
+# except the two explicitly-labelled per-layer summaries. Recall@K (accuracy) and |S| (sharpness) are kept
+# separate -- the nucleus(0.5) number conflates them (late layers are overconfident-but-wrong, early layers
+# are flat). Everything below is FORWARD 1 (block all-masked, the hard case) unless a figure says otherwise.
 #
-# Run:  python probe_layer_plot.py --npz runs/probe_readout.npz [--layer L] [--recallK 10]
+# Figures:
+#   1. headline_f1.png        -- layer x position heatmaps, F1: recall@K | nucleus-recall | mean |S|.
+#   2. heatmap_recallK_byfwd  -- layer x position recall@K, one panel per forward (the F1->F2->F3 progression).
+#   3. recall_vs_position     -- F1: x=position, y=recall@K, one line per layer (how far into the block recall reaches).
+#   4. decision_recallK       -- F1: per selected position, recall@K vs K (log), one line per layer. THE decision:
+#                                at an early position, is there a mid-layer where recall~1 at small K?
+#   5. position_bars_abs/pct  -- best layer, F1: recall by position, masked vs revealed bars.
+#   6. conditional_markov     -- prefix-all-correct recall@K vs position (does a correct left context help?).
+#
+# Run:  python probe_layer_plot.py --npz runs/probe_readout.npz [--recallK 10]
 
 import argparse
 import json
@@ -25,116 +31,118 @@ MASKED, REVEALED = 0, 1
 
 
 def _safe(a, b):
-    return np.divide(a, b, out=np.zeros_like(a, dtype=np.float64), where=b > 0)
+    return np.divide(a, b, out=np.full_like(a, np.nan, dtype=np.float64), where=b > 0)
+
+
+def _layer_subset(NL, k=6):
+    if NL <= k:
+        return list(range(NL))
+    s = sorted(set(int(round(x)) for x in np.linspace(0, NL - 1, k)))
+    return s
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
-    ap.add_argument("--out_dir", default=None, help="default: <npz dir>/plots")
-    ap.add_argument("--layer", type=int, default=None, help="layer for the per-position bar plots; default=best")
-    ap.add_argument("--recallK", type=int, default=10, help="K for the heatmap panel")
+    ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--recallK", type=int, default=10, help="K for recall@K heatmaps/lines")
+    ap.add_argument("--positions", default="0,1,2,4,8,16", help="positions for the decision facets")
     args = ap.parse_args()
 
     d = np.load(args.npz)
     meta = json.load(open(os.path.splitext(args.npz)[0] + "_meta.json"))
     K_ABS, K_PCT, K_COND = meta["K_ABS"], meta["K_PCT"], meta["K_COND"]
     NL, F, Pn = d["count"].shape[:3]
+    ki = K_ABS.index(args.recallK) if args.recallK in K_ABS else 2
     out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(args.npz)), "plots")
     os.makedirs(out_dir, exist_ok=True)
-    print(f"[plot] layers={NL} forwards={F} positions={Pn} agree={meta.get('agree'):.3f} -> {out_dir}")
+    print(f"[plot] layers={NL} forwards={F} positions={Pn} agree={meta.get('agree'):.3f} "
+          f"recallK={K_ABS[ki]} -> {out_dir}")
 
-    count = d["count"]                     # [NL,F,P,2]
-    cnt_m = count[..., MASKED]             # [NL,F,P]
-    # per-layer masked counts summed over positions (for layer-level curves)
-    cnt_m_L = cnt_m.sum(axis=2)            # [NL,F]
+    count = d["count"]                                  # [NL,F,P,2]
 
-    def masked_recall_abs(ki):             # [NL,F,P]
-        return _safe(d["hit_abs"][ki, ..., MASKED], cnt_m)
+    def rec(hit_ki, f, state=MASKED):                  # recall@K map [NL,P] for forward f
+        return _safe(d["hit_abs"][hit_ki, :, f, :, state], count[:, f, :, state])
 
-    def masked_recall_abs_L(ki):           # [NL,F] recall over all masked positions
-        return _safe(d["hit_abs"][ki, ..., MASKED].sum(axis=2), cnt_m_L)
+    def nuc(f, state=MASKED):
+        return _safe(d["hit_nuc"][:, f, :, state], count[:, f, :, state])
 
-    nuc_recall = _safe(d["hit_nuc"][..., MASKED], cnt_m)           # [NL,F]?  -> [NL,F,P]
-    nuc_recall_L = _safe(d["hit_nuc"][..., MASKED].sum(axis=2), cnt_m_L)   # [NL,F]
-    size_mean_L = _safe(d["size_sum"][..., MASKED].sum(axis=2), cnt_m_L)   # [NL,F]
-    sat_rate_L = _safe(d["sat_sum"][..., MASKED].sum(axis=2), cnt_m_L)     # [NL,F]
+    def size(f, state=MASKED):
+        return _safe(d["size_sum"][:, f, :, state], count[:, f, :, state])
 
-    best_layer = args.layer if args.layer is not None else int(np.argmax(nuc_recall_L[:, 0]))
-    layers = np.arange(NL)
+    def _hm(ax, M, title, vmin, vmax, cmap, cbar_label):
+        cm = plt.get_cmap(cmap).copy(); cm.set_bad("lightgray")     # gray = no masked data at that (layer,pos)
+        im = ax.imshow(M, aspect="auto", origin="lower", vmin=vmin, vmax=vmax, cmap=cm)
+        ax.set_title(title); ax.set_xlabel("position in block"); ax.set_ylabel("layer")
+        plt.colorbar(im, ax=ax, shrink=0.85, label=cbar_label)
+        return im
 
-    # ---- 1. recall vs set-size (THE decision plot), F1 ----
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sc = ax.scatter(size_mean_L[:, 0], nuc_recall_L[:, 0], c=layers, cmap="viridis", s=60)
-    for L in range(NL):
-        ax.annotate(str(L), (size_mean_L[L, 0], nuc_recall_L[L, 0]), fontsize=7,
-                    xytext=(3, 3), textcoords="offset points")
-    ax.axhline(0.99, ls="--", c="r", lw=1, label="recall 0.99")
-    ax.axvline(30, ls="--", c="gray", lw=1, label="|S|=30")
-    ax.set_xlabel("mean |S| = |nucleus(0.5) ∩ top-200|  (masked, F1)")
-    ax.set_ylabel("gold-in-S recall  (masked, F1)")
-    ax.set_title("Prune validity: nucleus recall vs candidate-set size, per layer\n"
-                 "GO if a layer sits top-left (high recall, small |S|)")
-    plt.colorbar(sc, label="layer"); ax.legend(); fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "recall_vs_setsize.png"), dpi=130); plt.close(fig)
+    # best layer = the one with highest masked recall@K averaged over the EARLY positions (0..3), F1
+    early = slice(0, min(4, Pn))
+    early_rec = np.nanmean(rec(ki, 0)[:, early], axis=1)
+    best_layer = int(np.nanargmax(np.where(np.isnan(early_rec), -1, early_rec)))
 
-    # ---- 2. recall@K vs layer, one panel per forward ----
-    fig, axes = plt.subplots(1, F, figsize=(5 * F, 4), sharey=True, squeeze=False)
+    # ---- 1. headline F1: recall@K | nucleus-recall | mean|S|, all layer x position ----
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.6))
+    _hm(ax[0], rec(ki, 0), f"masked recall@{K_ABS[ki]}  (F1)", 0, 1, "magma", "recall")
+    _hm(ax[1], nuc(0), "masked nucleus(0.5)∩200 recall  (F1)", 0, 1, "magma", "recall")
+    _hm(ax[2], size(0), "mean |S| = nucleus∩200 size  (F1)", 0, meta["nucleus_cap"], "viridis", "|S|")
+    fig.suptitle("HEADLINE (Forward 1): accuracy (left/mid) vs sharpness (right), by layer × position")
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir, "headline_f1.png"), dpi=130); plt.close(fig)
+
+    # ---- 2. recall@K heatmap per forward ----
+    fig, ax = plt.subplots(1, F, figsize=(5.2 * F, 4.4), squeeze=False)
     for f in range(F):
-        ax = axes[0][f]
-        for ki, K in enumerate(K_ABS):
-            ax.plot(layers, masked_recall_abs_L(ki)[:, f], marker="o", ms=3, label=f"@{K}")
-        ax.plot(layers, nuc_recall_L[:, f], marker="s", ms=3, ls="--", c="k", label="nucleus∩200")
-        ax.set_title(f"Forward {f+1}"); ax.set_xlabel("layer"); ax.grid(alpha=0.3)
-        if f == 0:
-            ax.set_ylabel("masked recall")
-    axes[0][-1].legend(fontsize=7, ncol=2)
-    fig.suptitle("Gold-token recall vs layer (masked positions)"); fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "layer_recall_curves.png"), dpi=130); plt.close(fig)
+        _hm(ax[0][f], rec(ki, f), f"F{f+1}  masked recall@{K_ABS[ki]}", 0, 1, "magma", "recall")
+    fig.suptitle(f"Masked recall@{K_ABS[ki]} across forwards (F1=all-masked → F3=most revealed)")
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir, "heatmap_recallK_byfwd.png"), dpi=130); plt.close(fig)
 
-    # ---- 3. set size + saturation vs layer ----
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    for f in range(F):
-        ax.plot(layers, size_mean_L[:, f], marker="o", ms=3, label=f"|S| F{f+1}")
-    ax.set_xlabel("layer"); ax.set_ylabel("mean |S| (masked)"); ax.grid(alpha=0.3)
-    ax2 = ax.twinx()
-    for f in range(F):
-        ax2.plot(layers, sat_rate_L[:, f], marker="x", ms=3, ls=":", label=f"sat F{f+1}")
-    ax2.set_ylabel("cap-saturation rate"); ax2.set_ylim(0, 1)
-    ax.legend(loc="upper right", fontsize=7); ax2.legend(loc="lower right", fontsize=7)
-    ax.set_title("Candidate-set size & 200-cap saturation vs layer"); fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "setsize_vs_layer.png"), dpi=130); plt.close(fig)
+    # ---- 3. recall@K vs position, one line per layer (F1) ----
+    fig, axp = plt.subplots(figsize=(9, 5))
+    r = rec(ki, 0)                                     # [NL,P]
+    subs = _layer_subset(NL)
+    cmap = plt.get_cmap("viridis")
+    for L in subs:
+        axp.plot(np.arange(Pn), r[L], marker="o", ms=3, color=cmap(L / max(NL - 1, 1)), label=f"L{L}")
+    axp.set_xlabel("position in block"); axp.set_ylabel(f"masked recall@{K_ABS[ki]}"); axp.set_ylim(0, 1)
+    axp.grid(alpha=0.3); axp.legend(fontsize=7, ncol=2, title="layer")
+    axp.set_title(f"How far into the block does the answer reach? (recall@{K_ABS[ki]}, F1)\n"
+                  "DMax commits left→right, so expect a left-high, right-low decay")
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir, "recall_vs_position.png"), dpi=130); plt.close(fig)
 
-    # ---- 4. heatmap: layer x position recall@K (masked), per forward ----
-    ki = K_ABS.index(args.recallK) if args.recallK in K_ABS else 2
-    fig, axes = plt.subplots(1, F, figsize=(4.2 * F, 4.2), squeeze=False)
-    r = masked_recall_abs(ki)              # [NL,F,P]
-    for f in range(F):
-        ax = axes[0][f]
-        im = ax.imshow(r[:, f, :], aspect="auto", origin="lower", vmin=0, vmax=1, cmap="magma")
-        ax.set_title(f"F{f+1}  recall@{K_ABS[ki]}"); ax.set_xlabel("position");
-        if f == 0:
-            ax.set_ylabel("layer")
-    fig.colorbar(im, ax=axes[0].tolist(), shrink=0.8)
-    fig.suptitle(f"Masked recall@{K_ABS[ki]}: layer × position");
-    fig.savefig(os.path.join(out_dir, "heatmap_recall.png"), dpi=130); plt.close(fig)
+    # ---- 4. THE decision: recall@K vs K (log), per selected position, line per layer (F1) ----
+    pos_list = [int(p) for p in args.positions.split(",") if int(p) < Pn]
+    ncol = 3; nrow = int(np.ceil(len(pos_list) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 3.6 * nrow), squeeze=False)
+    for pi, p in enumerate(pos_list):
+        ax = axes[pi // ncol][pi % ncol]
+        for L in subs:
+            ys = [_safe(d["hit_abs"][k, L, 0, p, MASKED], count[L, 0, p, MASKED]) for k in range(len(K_ABS))]
+            ax.plot(K_ABS, ys, marker="o", ms=3, color=cmap(L / max(NL - 1, 1)), label=f"L{L}")
+        ax.set_xscale("log"); ax.set_xticks(K_ABS); ax.set_xticklabels(K_ABS)
+        ax.axhline(0.99, ls="--", c="r", lw=0.8)
+        n0 = count[best_layer, 0, p, MASKED]
+        ax.set_title(f"position {p}  (n={int(n0)} masked@F1)")
+        ax.set_xlabel("candidate-set size K (top-K)"); ax.set_ylim(0, 1.02); ax.grid(alpha=0.3, which="both")
+        if pi == 0:
+            ax.set_ylabel("masked recall@K"); ax.legend(fontsize=6, ncol=2, title="layer")
+    for j in range(len(pos_list), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle("DECISION: at each position, how big must top-K be to capture gold? (F1)\n"
+                 "GO if an EARLY position has a mid-layer curve reaching ~1 at small K")
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir, "decision_recallK.png"), dpi=130); plt.close(fig)
 
-    # ---- 5 & 6. per-position bars, revealed vs masked, one panel per K (chosen layer, F1) ----
+    # ---- 5. per-position bars, revealed vs masked (best layer, F1) ----
     def bar_grid(hit, Ks, klabels, fname, title):
-        ncol = 3
-        nrow = int(np.ceil(len(Ks) / ncol))
-        fig, axes = plt.subplots(nrow, ncol, figsize=(4.5 * ncol, 3 * nrow), squeeze=False)
-        xpos = np.arange(Pn)
-        cm = count[best_layer, 0, :, MASKED]
-        cr = count[best_layer, 0, :, REVEALED]
-        for ki2, lab in enumerate(klabels):
-            ax = axes[ki2 // ncol][ki2 % ncol]
-            rm = _safe(hit[ki2, best_layer, 0, :, MASKED], cm)
-            rr = _safe(hit[ki2, best_layer, 0, :, REVEALED], cr)
-            ax.bar(xpos - 0.2, rm, width=0.4, label="masked")
-            ax.bar(xpos + 0.2, rr, width=0.4, label="revealed")
+        ncol = 3; nrow = int(np.ceil(len(Ks) / ncol))
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3 * nrow), squeeze=False)
+        xpos = np.arange(Pn); cm = count[best_layer, 0, :, MASKED]; cr = count[best_layer, 0, :, REVEALED]
+        for k2, lab in enumerate(klabels):
+            ax = axes[k2 // ncol][k2 % ncol]
+            ax.bar(xpos - 0.2, np.nan_to_num(_safe(hit[k2, best_layer, 0, :, MASKED], cm)), 0.4, label="masked")
+            ax.bar(xpos + 0.2, np.nan_to_num(_safe(hit[k2, best_layer, 0, :, REVEALED], cr)), 0.4, label="revealed")
             ax.set_title(lab); ax.set_ylim(0, 1); ax.set_xlabel("position")
-            if ki2 == 0:
+            if k2 == 0:
                 ax.legend(fontsize=7)
         for j in range(len(Ks), nrow * ncol):
             axes[j // ncol][j % ncol].axis("off")
@@ -142,28 +150,24 @@ def main():
         fig.savefig(os.path.join(out_dir, fname), dpi=130); plt.close(fig)
 
     bar_grid(d["hit_abs"], K_ABS, [f"recall@{K}" for K in K_ABS],
-             "position_bars_abs.png", "Recall by position: revealed vs masked")
+             "position_bars_abs.png", "Recall by position: revealed (ceiling) vs masked (real test)")
     bar_grid(d["hit_pct"], K_PCT, [f"top-{q*100:g}%" for q in K_PCT],
              "position_bars_pct.png", "Percentile-recall by position: revealed vs masked")
 
-    # ---- 7. conditional (Markov) path: prefix-all-correct recall vs unconditional (chosen layer, F1) ----
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    xpos = np.arange(Pn)
-    cc = d["cond_count"][best_layer, 0, :]
-    for ki2, K in enumerate(K_COND):
-        cond = _safe(d["cond_hit"][ki2, best_layer, 0, :], cc)
-        ax.plot(xpos, cond, marker="o", ms=3, label=f"cond@{K}")
-    # unconditional masked recall@1 for contrast
-    uncond1 = _safe(d["hit_abs"][0, best_layer, 0, :, MASKED], count[best_layer, 0, :, MASKED])
-    ax.plot(xpos, uncond1, ls="--", c="gray", label="uncond@1 (masked)")
+    # ---- 6. conditional (Markov) path: prefix-all-correct recall@K vs position (best layer, F1) ----
+    fig, ax = plt.subplots(figsize=(9, 4.6))
+    xpos = np.arange(Pn); cc = d["cond_count"][best_layer, 0, :]
+    for k2, K in enumerate(K_COND):
+        ax.plot(xpos, _safe(d["cond_hit"][k2, best_layer, 0, :], cc), marker="o", ms=3, label=f"cond@{K}")
+    ax.plot(xpos, _safe(d["hit_abs"][0, best_layer, 0, :, MASKED], count[best_layer, 0, :, MASKED]),
+            ls="--", c="gray", label="uncond@1 (masked)")
     ax.set_xlabel("position i"); ax.set_ylabel("recall"); ax.set_ylim(0, 1); ax.grid(alpha=0.3)
     ax.set_title(f"Conditional path: recall@K at i | positions 0..i-1 all gold-top-1  (layer {best_layer}, F1)")
     ax.legend(fontsize=7, ncol=3); fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "conditional_markov.png"), dpi=130); plt.close(fig)
 
-    print(f"[plot] best layer (by F1 nucleus recall) = {best_layer} "
-          f"(recall={nuc_recall_L[best_layer,0]:.3f}, mean|S|={size_mean_L[best_layer,0]:.1f})")
-    print(f"[plot] wrote 7 figures to {out_dir}")
+    print(f"[plot] best early-position layer (recall@{K_ABS[ki]}, pos0-3, F1) = {best_layer}")
+    print(f"[plot] wrote figures to {out_dir}")
 
 
 if __name__ == "__main__":
