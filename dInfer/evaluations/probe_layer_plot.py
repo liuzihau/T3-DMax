@@ -46,7 +46,10 @@ def main():
     ap.add_argument("--npz", required=True)
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--recallK", type=int, default=10, help="K for recall@K heatmaps/lines")
-    ap.add_argument("--positions", default="0,1,2,4,8,16", help="positions for the decision facets")
+    ap.add_argument("--positions", default="0,1,2,4,8,16", help="positions = decision_recallK facets")
+    ap.add_argument("--layers", default="0,8,12,14,16,18,20",
+                    help="layers shown as LINES in recall_vs_position & decision_recallK (the candidate "
+                         "insertion depths). Out-of-range entries are dropped; empty -> auto ~6.")
     args = ap.parse_args()
 
     d = np.load(args.npz)
@@ -100,14 +103,17 @@ def main():
     # ---- 3. recall@K vs position, one line per layer (F1) ----
     fig, axp = plt.subplots(figsize=(9, 5))
     r = rec(ki, 0)                                     # [NL,P]
-    subs = _layer_subset(NL)
+    subs = [int(x) for x in args.layers.split(",") if x.strip() != "" and 0 <= int(x) < NL] \
+        if args.layers.strip() else _layer_subset(NL)
+    if not subs:
+        subs = _layer_subset(NL)
     cmap = plt.get_cmap("viridis")
     for L in subs:
         axp.plot(np.arange(Pn), r[L], marker="o", ms=3, color=cmap(L / max(NL - 1, 1)), label=f"L{L}")
     axp.set_xlabel("position in block"); axp.set_ylabel(f"masked recall@{K_ABS[ki]}"); axp.set_ylim(0, 1)
     axp.grid(alpha=0.3); axp.legend(fontsize=7, ncol=2, title="layer")
-    axp.set_title(f"How far into the block does the answer reach? (recall@{K_ABS[ki]}, F1)\n"
-                  "DMax commits left→right, so expect a left-high, right-low decay")
+    axp.set_title(f"recall@{K_ABS[ki]} vs position (F1). NOTE: F1 = block all-masked + bidirectional attn,\n"
+                  "so positions are ~symmetric → FLAT is expected here; the left→right decay appears at F2/F3")
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "recall_vs_position.png"), dpi=130); plt.close(fig)
 
     # ---- 4. THE decision: recall@K vs K (log), per selected position, line per layer (F1) ----
@@ -133,26 +139,29 @@ def main():
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "decision_recallK.png"), dpi=130); plt.close(fig)
 
     # ---- 5. per-position bars, revealed vs masked (best layer, F1) ----
-    def bar_grid(hit, Ks, klabels, fname, title):
+    def bar_grid(hit, Ks, klabels, fbase, title, f):
+        # F1 has NO revealed positions (block all-masked) -> orange bars appear only at F2/F3, where the
+        # left prefix is committed. Revealed = ceiling/sanity (input IS the token); masked = the real test.
         ncol = 3; nrow = int(np.ceil(len(Ks) / ncol))
         fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3 * nrow), squeeze=False)
-        xpos = np.arange(Pn); cm = count[best_layer, 0, :, MASKED]; cr = count[best_layer, 0, :, REVEALED]
+        xpos = np.arange(Pn); cm = count[best_layer, f, :, MASKED]; cr = count[best_layer, f, :, REVEALED]
         for k2, lab in enumerate(klabels):
             ax = axes[k2 // ncol][k2 % ncol]
-            ax.bar(xpos - 0.2, np.nan_to_num(_safe(hit[k2, best_layer, 0, :, MASKED], cm)), 0.4, label="masked")
-            ax.bar(xpos + 0.2, np.nan_to_num(_safe(hit[k2, best_layer, 0, :, REVEALED], cr)), 0.4, label="revealed")
+            ax.bar(xpos - 0.2, np.nan_to_num(_safe(hit[k2, best_layer, f, :, MASKED], cm)), 0.4, label="masked")
+            ax.bar(xpos + 0.2, np.nan_to_num(_safe(hit[k2, best_layer, f, :, REVEALED], cr)), 0.4, label="revealed")
             ax.set_title(lab); ax.set_ylim(0, 1); ax.set_xlabel("position")
             if k2 == 0:
                 ax.legend(fontsize=7)
         for j in range(len(Ks), nrow * ncol):
             axes[j // ncol][j % ncol].axis("off")
-        fig.suptitle(f"{title}  (layer {best_layer}, F1)"); fig.tight_layout()
-        fig.savefig(os.path.join(out_dir, fname), dpi=130); plt.close(fig)
+        fig.suptitle(f"{title}  (layer {best_layer}, F{f+1})"); fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, f"{fbase}_f{f+1}.png"), dpi=130); plt.close(fig)
 
-    bar_grid(d["hit_abs"], K_ABS, [f"recall@{K}" for K in K_ABS],
-             "position_bars_abs.png", "Recall by position: revealed (ceiling) vs masked (real test)")
-    bar_grid(d["hit_pct"], K_PCT, [f"top-{q*100:g}%" for q in K_PCT],
-             "position_bars_pct.png", "Percentile-recall by position: revealed vs masked")
+    for f in range(F):                                  # one grid per forward -> revealed bars show at F2/F3
+        bar_grid(d["hit_abs"], K_ABS, [f"recall@{K}" for K in K_ABS],
+                 "position_bars_abs", "Recall by position: revealed (ceiling) vs masked (real test)", f)
+        bar_grid(d["hit_pct"], K_PCT, [f"top-{q*100:g}%" for q in K_PCT],
+                 "position_bars_pct", "Percentile-recall by position: revealed vs masked", f)
 
     # ---- 6. conditional (Markov) path: prefix-all-correct recall@K vs position (best layer, F1) ----
     fig, ax = plt.subplots(figsize=(9, 4.6))

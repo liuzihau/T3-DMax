@@ -5,7 +5,7 @@
 #
 # Question: at each transformer layer, does a cheap logit-lens readout already contain the token the model
 # will finally commit, inside a SMALL candidate set? If some mid-layer does, an intermediate LM-head +
-# top-p/top-200 prune + Markov-bias head is worth building; if only the last layer does, it is not.
+# top-p/top-500 prune + Markov-bias head is worth building; if only the last layer does, it is not.
 #
 # Method (matches the design agreed in chat):
 #   * Golden pass  -- run the faithful DMax heavy-only block decode at a CONSERVATIVE threshold (default 0.7)
@@ -14,7 +14,7 @@
 #                     forwards of each block, apply the FINAL lm_head (after the final RMSNorm = standard
 #                     logit lens; NO training) to EVERY layer's hidden state at every block position, and
 #                     score the gold token: rank, recall@K, percentile-recall, and membership in the
-#                     nucleus(0.5) intersect top-200 set. Each position is tagged revealed / masked.
+#                     nucleus(0.5) intersect top-500 set. Each position is tagged revealed / masked.
 #   * Split every statistic by (layer, forward in {1,2,3}, position 0..blk-1, revealed/masked).
 #   * Conditional (Markov) path: at position i, restrict to cases where positions 0..i-1 were all gold-top-1,
 #     then recall@{1,5,10,50,100} at i -- does error compound left-to-right?
@@ -57,12 +57,12 @@ from dinfer.decoding.generate_dbet import _soft_embed, MASK_ID, EOS_ID, PAD_ID  
 from eval_tasks import load_task  # noqa: E402
 
 # recall cut-offs (rank is 0-indexed; recall@K hit == gold_rank < K)
-K_ABS = [1, 5, 10, 50, 100, 200]
+K_ABS = [1, 5, 10, 50, 100, 200, 500]
 K_PCT = [0.0001, 0.001, 0.01, 0.05, 0.10, 0.25, 0.50]   # fractions of vocab
 K_COND = [1, 5, 10, 50, 100]
 N_FWD = 3                                                # probe the first 3 forwards of each block
 NUC_P = 0.5                                              # nucleus mass
-NUC_CAP = 200                                            # nucleus cap
+NUC_CAP = 500                                            # nucleus cap (candidate-set ceiling)
 
 
 def load_fused(model_path, device):
@@ -94,9 +94,9 @@ class Acc:
         self.count = z(NL, F, P, 2)
         self.hit_abs = z(len(K_ABS), NL, F, P, 2)
         self.hit_pct = z(len(K_PCT), NL, F, P, 2)
-        self.hit_nuc = z(NL, F, P, 2)      # gold in nucleus(0.5) cap-200 set
+        self.hit_nuc = z(NL, F, P, 2)      # gold in nucleus(0.5) cap-500 set
         self.size_sum = z(NL, F, P, 2)     # sum of |S|
-        self.sat_sum = z(NL, F, P, 2)      # count where nucleus saturated the cap (mass<0.5 within 200)
+        self.sat_sum = z(NL, F, P, 2)      # count where nucleus saturated the cap (mass<0.5 within cap)
         self.rank_sum = z(NL, F, P, 2)     # sum of gold rank (for mean-rank sanity)
         self.cond_count = z(NL, F, P)      # cases where positions 0..i-1 were all gold-top-1
         self.cond_hit = z(len(K_COND), NL, F, P)
@@ -152,7 +152,7 @@ def decode_and_maybe_probe(model, embed, lm_head, final_norm, prompt_ids, gen_le
             block_logits = out.logits[:, bs:be]
 
             if want_hs:
-                _probe_forward(out.hidden_states, bs, be, lm_head, final_norm, V,
+                _probe_forward(out.hidden_states, block_logits, bs, be, lm_head, final_norm, V,
                                gold_blk, valid_blk, mask_before, it, acc)
 
             # ---- DMax decode_uniform commit + committed re-decode + breakflag (== decode_block_heavy) ----
@@ -189,9 +189,17 @@ def decode_and_maybe_probe(model, embed, lm_head, final_norm, prompt_ids, gen_le
     return x[0].clone(), eos_cut
 
 
+_NORM_CHECKED = False   # one-time convention self-check flag
+
+
 @torch.no_grad()
-def _probe_forward(hidden_states, bs, be, lm_head, final_norm, V, gold_blk, valid_blk, mask_before, f, acc):
-    """Score every layer's logit-lens readout for one forward against the gold block. Accumulates into acc."""
+def _probe_forward(hidden_states, logits_final, bs, be, lm_head, final_norm, V,
+                   gold_blk, valid_blk, mask_before, f, acc):
+    """Score every layer's logit-lens readout for one forward against the gold block. Accumulates into acc.
+    logits_final = the model's REAL block logits (out.logits[:,bs:be]) -- used verbatim for the top layer so
+    the last-layer readout is guaranteed identical to the model (no dependence on the hidden_states norm
+    convention). Intermediate layers use the standard logit lens: lm_head(final_norm(h))."""
+    global _NORM_CHECKED
     NL = len(hidden_states)
     if not acc.ready:
         acc.alloc(NL, N_FWD, be - bs)
@@ -206,16 +214,28 @@ def _probe_forward(hidden_states, bs, be, lm_head, final_norm, V, gold_blk, vali
     gold_v = gold[vpos]
     correct1_full = torch.zeros(be - bs, dtype=torch.bool, device=gold.device)   # top-1 correct, ALL positions
 
+    if not _NORM_CHECKED:                                        # print which hidden_states convention is in use
+        hl = hidden_states[-1][0, bs:be, :]
+        d_norm = (lm_head(final_norm(hl)).float() - logits_final[0]).abs().max().item()
+        d_raw = (lm_head(hl).float() - logits_final[0]).abs().max().item()
+        print(f"[probe] hidden_states[-1] convention: |lm_head(norm(h)) - logits|={d_norm:.4f}  "
+              f"|lm_head(h) - logits|={d_raw:.4f}  -> last entry is "
+              f"{'PRE-norm (needs norm)' if d_norm < d_raw else 'POST-norm (already normed)'}. "
+              f"Top-layer readout uses out.logits directly regardless.")
+        _NORM_CHECKED = True
+
     for L in range(NL):
-        h = hidden_states[L][0, bs:be, :]                       # [blk, D]
-        h_n = h if L == NL - 1 else final_norm(h)               # last hidden_state is already post-norm
-        logits = lm_head(h_n).float()                           # [blk, V]
+        if L == NL - 1:
+            logits = logits_final[0].float()                   # model's REAL logits -- unambiguous top layer
+        else:
+            h = hidden_states[L][0, bs:be, :]                  # [blk, D] intermediate: standard logit lens
+            logits = lm_head(final_norm(h)).float()            # [blk, V]
         lv = logits[vpos]                                       # [nv, V] valid positions only
         gl = lv.gather(1, gold_v[:, None])                      # [nv,1] gold logit
         rank = (lv > gl).sum(1)                                 # [nv] 0-indexed rank of gold
         top1 = lv.argmax(1)
         correct1_full[vpos] = (top1 == gold_v)                  # for the conditional path (this layer/forward)
-        # nucleus(0.5) cap-200 set
+        # nucleus(0.5) cap-500 set
         topp = torch.softmax(lv, dim=1).topk(min(NUC_CAP, V), dim=1).values   # [nv, cap] desc
         cum = topp.cumsum(1)
         reach = cum >= NUC_P
@@ -327,8 +347,20 @@ def main():
                 K_ABS=K_ABS, K_PCT=K_PCT, K_COND=K_COND, N_FWD=N_FWD, nucleus_p=NUC_P, nucleus_cap=NUC_CAP,
                 agree=float(acc.agree[0] / max(acc.agree[1], 1)))
     acc.save(args.out_path, meta)
+    # last-layer sanity: this readout == the model's own logits, so recall here is the model's true recall.
+    if acc.ready:
+        li = acc.NL - 1
+        k1, k10 = K_ABS.index(1), K_ABS.index(10)
+        def _r(ki, pslice):
+            h = acc.hit_abs[ki, li, 0, pslice, MASKED].sum()
+            c = acc.count[li, 0, pslice, MASKED].sum()
+            return h / max(c, 1)
+        print(f"[probe] LAST-LAYER F1 masked recall (== model's real recall): "
+              f"pos0 @1={_r(k1, slice(0,1)):.3f} @10={_r(k10, slice(0,1)):.3f} | "
+              f"all-pos @1={_r(k1, slice(None)):.3f} @10={_r(k10, slice(None)):.3f}  "
+              f"(if pos0@1 is low with self-gold, the model genuinely can't call it at F1)")
     print(f"[probe] done {time.time()-t0:.0f}s -> {args.out_path} (+ _meta.json). "
-          f"final agreement(0.5 vs 0.7)={meta['agree']:.3f}")
+          f"final agreement(exp vs gold)={meta['agree']:.3f}")
     print(f"[probe] plot: python {os.path.join(_HERE, 'probe_layer_plot.py')} --npz {args.out_path}")
 
 
