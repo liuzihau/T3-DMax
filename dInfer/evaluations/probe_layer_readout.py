@@ -63,6 +63,7 @@ K_COND = [1, 5, 10, 50, 100]
 N_FWD = 3                                                # probe the first 3 forwards of each block
 NUC_P = 0.5                                              # nucleus mass
 NUC_CAP = 500                                            # nucleus cap (candidate-set ceiling)
+MASKED, REVEALED = 0, 1                                  # position-state index (matches probe_layer_plot.py)
 
 
 def load_fused(model_path, device):
