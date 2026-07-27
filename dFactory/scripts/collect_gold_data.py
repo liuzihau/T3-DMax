@@ -33,15 +33,17 @@
 #    "gen_length", "block_length", "gold_threshold", "model", "seed"}
 #   full sequence = prompt_ids + gold_ids ;  gold_ids = response tokens up to (not incl.) the gold EOS cut.
 #
+# Lives in dFactory (data generation); reuses dInfer's byte-for-byte DMax decode. Run from dFactory/scripts.
 # Runbook (GPU box, merged DMax checkpoint; the dataset may need `huggingface-cli login`):
+#   cd dFactory/scripts
 #   # 0) cheap validation of field extraction WITHOUT loading the model:
 #   python collect_gold_data.py --dry_run --start 0 --end 3
 #   # 1) first trial (5k):
 #   python collect_gold_data.py --model_path ../../DMax-Math-16B-moe-merge \
-#       --out_dir runs/gold_nemotron_math --start 0 --end 5000 --gen_length 512
+#       --out_dir ../darc_gold/nemotron_math --start 0 --end 5000 --gen_length 512
 #   # 2) later extend to 50k (first 5k untouched):
 #   python collect_gold_data.py --model_path ../../DMax-Math-16B-moe-merge \
-#       --out_dir runs/gold_nemotron_math --start 5000 --end 50000 --gen_length 512
+#       --out_dir ../darc_gold/nemotron_math --start 5000 --end 50000 --gen_length 512
 #   # multi-GPU for a range (run one per GPU):
 #   CUDA_VISIBLE_DEVICES=0 python collect_gold_data.py ... --start 0 --end 50000 --num_shards 4 --shard_id 0
 #   CUDA_VISIBLE_DEVICES=1 python collect_gold_data.py ... --start 0 --end 50000 --num_shards 4 --shard_id 1  ...
@@ -55,11 +57,14 @@ import time
 import numpy as np
 import torch
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# Data generation lives in dFactory but the gold decode lives in dInfer -- add dInfer/evaluations to the path
+# so we reuse the probe's byte-for-byte DMax decode + fused-MoE loader (keeps gold identical to the probe).
+_HERE = os.path.dirname(os.path.abspath(__file__))                        # dFactory/scripts
+_T3_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))               # T3-DMax
+_DINFER_EVAL = os.path.join(_T3_ROOT, "dInfer", "evaluations")
+if _DINFER_EVAL not in sys.path:
+    sys.path.insert(0, _DINFER_EVAL)
 
-# Reuse the probe's byte-for-byte DMax decode + fused-MoE loader (keeps gold identical to the probe).
 from probe_layer_readout import load_fused, decode_and_maybe_probe  # noqa: E402
 
 DATASET = "nvidia/Nemotron-Post-Training-Dataset-v2"
