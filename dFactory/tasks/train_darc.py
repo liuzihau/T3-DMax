@@ -133,7 +133,10 @@ def main():
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--max_steps", type=int, default=4000)
+    p.add_argument("--max_steps", type=int, default=4000, help="ignored if --epochs > 0")
+    p.add_argument("--epochs", type=float, default=0.0, help="if >0, run this many passes over the data")
+    p.add_argument("--resume", action="store_true", help="resume from the latest head_step*.pt in out_dir")
+    p.add_argument("--keep_last", type=int, default=3, help="keep only the last N step checkpoints (+best)")
     p.add_argument("--val_frac", type=float, default=0.05)
     p.add_argument("--eval_every", type=int, default=200)
     p.add_argument("--eval_batches", type=int, default=30)
@@ -192,12 +195,47 @@ def main():
 
     tf = lambda rec: process_darc_gold_example(rec, max_seq_len=args.max_seq_len, block_size=args.block_length,
                                                mode="reveal_prior")
+    if args.epochs > 0:                                                # count instances (no model) -> max_steps
+        n_inst = sum(len(tf(r)) for r in train_records)
+        steps_per_epoch = max(1, math.ceil(n_inst / args.micro_bsz))
+        args.max_steps = int(args.epochs * steps_per_epoch)
+        print(f"[train] {n_inst} train instances -> {steps_per_epoch} steps/epoch -> max_steps={args.max_steps}")
+
+    import glob as _glob
+    def _ckpts():
+        return sorted(_glob.glob(os.path.join(args.out_dir, "head_step*.pt")),
+                      key=lambda p: int(p.split("head_step")[-1].split(".pt")[0]))
+
+    best_acc = -1.0
+
+    def save_ckpt(step, tag=None):
+        name = f"head_{tag}.pt" if tag else f"head_step{step}.pt"
+        path = os.path.join(args.out_dir, name)
+        torch.save({"step": step, "config": vars(cfg), "state_dict": head.state_dict(),
+                    "opt": opt.state_dict(), "best_acc": best_acc}, path)
+        if tag is None and args.keep_last > 0:                        # prune old step checkpoints
+            for old in _ckpts()[:-args.keep_last]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        return path
+
     log_path = os.path.join(args.out_dir, "train_log.jsonl")
     logf = open(log_path, "a")
 
     step = 0
+    if args.resume and _ckpts():
+        ck = torch.load(_ckpts()[-1], map_location=device)
+        head.load_state_dict(ck["state_dict"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        step = int(ck["step"]); best_acc = float(ck.get("best_acc", -1.0))
+        print(f"[train] resumed from {_ckpts()[-1]} at step {step} (best_acc={best_acc:.3f})")
+
     t0 = time.time()
     running = {"loss1": 0.0, "acc1": 0.0, "k": 0}
+    nonfinite = 0
     epoch = 0
     while step < args.max_steps:
         stream = instance_stream(train_records, tf, shuffle=True, seed=args.seed + epoch)
@@ -210,7 +248,11 @@ def main():
                                       lm_head, rotary_emb, dt, device)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
-            opt.step(); opt.zero_grad(set_to_none=True)
+            if torch.isfinite(gn):                                    # bf16 grad-spike guard (skip the step)
+                opt.step()
+            else:
+                nonfinite += 1
+            opt.zero_grad(set_to_none=True)
             step += 1
             running["loss1"] += m["loss1"]; running["acc1"] += m["acc1"]; running["k"] += 1
 
@@ -227,23 +269,26 @@ def main():
             if args.eval_every and step % args.eval_every == 0:
                 ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
                               rotary_emb, dt, device, args.micro_bsz, args.eval_batches)
-                print(f"[{step}] VAL loss={ev['val_loss']:.4f} acc1={ev['val_acc1']:.3f} "
-                      f"(baseline probe ~0.23 uncond, ~0.76 clean-prefix ceiling)")
-                logf.write(json.dumps({"step": step, "split": "val", **ev}) + "\n"); logf.flush()
+                star = ""
+                if ev["val_acc1"] > best_acc:
+                    best_acc = ev["val_acc1"]; save_ckpt(step, tag="best"); star = " *best*"
+                print(f"[{step}] VAL loss={ev['val_loss']:.4f} acc1={ev['val_acc1']:.3f}{star} "
+                      f"(base ~0.35, ceiling ~0.76)  skips={nonfinite}")
+                logf.write(json.dumps({"step": step, "split": "val", "best_acc": best_acc, **ev}) + "\n"); logf.flush()
 
             if args.save_every and step % args.save_every == 0:
-                ckpt = os.path.join(args.out_dir, f"head_step{step}.pt")
-                torch.save({"step": step, "config": vars(cfg), "state_dict": head.state_dict()}, ckpt)
-                print(f"[{step}] saved {ckpt}")
+                print(f"[{step}] saved {save_ckpt(step)}")
         epoch += 1
 
     # final eval + save
     ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
                   rotary_emb, dt, device, args.micro_bsz, args.eval_batches)
-    torch.save({"step": step, "config": vars(cfg), "state_dict": head.state_dict()},
-               os.path.join(args.out_dir, "head_final.pt"))
-    logf.write(json.dumps({"step": step, "split": "val_final", **ev}) + "\n"); logf.close()
-    print(f"[done] {step} steps in {(time.time()-t0)/60:.1f}m  final VAL acc1={ev['val_acc1']:.3f}")
+    if ev["val_acc1"] > best_acc:
+        best_acc = ev["val_acc1"]; save_ckpt(step, tag="best")
+    save_ckpt(step, tag="final")
+    logf.write(json.dumps({"step": step, "split": "val_final", "best_acc": best_acc, **ev}) + "\n"); logf.close()
+    print(f"[done] {step} steps in {(time.time()-t0)/60:.1f}m  final VAL acc1={ev['val_acc1']:.3f} "
+          f"best={best_acc:.3f}  nonfinite_skips={nonfinite}")
 
 
 if __name__ == "__main__":
