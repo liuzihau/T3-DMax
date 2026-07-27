@@ -105,5 +105,9 @@ dInfer/
 - [ ] Base-model integration: import LLaDA2Moe pieces, cos/sin from LLaDA2MoeRotaryEmbedding, tap via
       `heavy_forward(output_hidden_states=True)`, resolve `tap_layer` vs the probe.
 - [ ] Loss-2 (fuse -> L19+ replay) + block-parallel produce optimization.
-- [ ] Two-phase training (`tasks/train_darc.py` + `darc_train_core.py`).
-- [ ] First trial: one-forward all-masked, measure accuracy lift vs added latency.
+- [x] Integration smoke (`scripts/smoke_darc_integration.py`): tap-18 verified; reveal-prior reproduces the
+      probe (avg 0.44, p0=0.95→p30=0.15) vs all-masked 0.12; head runs on real bf16, backbone frozen.
+- [x] Single-GPU first-trial trainer (`tasks/train_darc.py`): frozen backbone + Loss-1 head, reveal-prior
+      data, deterministic rank-based train/val split, val acc1 vs probe baselines, head checkpoints.
+- [ ] First-trial run on 10k gold; watch val acc1 climb from ~0.23 (uncond) toward ~0.76 (clean-prefix).
+- [ ] Loss-2 (fuse->L19+) + block-parallel perf + (later) multi-GPU FSDP via the DBet harness.

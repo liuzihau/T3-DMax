@@ -201,14 +201,18 @@ class DarcHead(nn.Module):
 
         if not ar_list:
             loss = h.sum() * 0.0
-            metrics = {"loss1": 0.0, "n_sup": 0}
+            metrics = {"loss1": 0.0, "n_sup": 0, "acc1": 0.0}
         else:
             AR = torch.cat(ar_list, dim=1)                                   # [B,nq,D]
             logits = self.readout(AR, final_norm, lm_head)                   # [B,nq,V]
             gold = labels[:, pos_list]                                       # [B,nq]
             V = logits.shape[-1]
             loss = F.cross_entropy(logits.reshape(-1, V), gold.reshape(-1), ignore_index=-100)
-            metrics = {"loss1": float(loss.detach()), "n_sup": int((gold != -100).sum())}
+            with torch.no_grad():
+                valid = gold != -100
+                pred = logits.argmax(-1)
+                acc1 = float((pred[valid] == gold[valid]).float().mean()) if bool(valid.any()) else 0.0
+            metrics = {"loss1": float(loss.detach()), "n_sup": int((gold != -100).sum()), "acc1": acc1}
         if return_soft_embeds:
             return loss, metrics, torch.stack(s_list, dim=1)     # [B,n,D], detached
         return loss, metrics
