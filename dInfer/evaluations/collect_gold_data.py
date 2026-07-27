@@ -63,8 +63,8 @@ if _HERE not in sys.path:
 from probe_layer_readout import load_fused, decode_and_maybe_probe  # noqa: E402
 
 DATASET = "nvidia/Nemotron-Post-Training-Dataset-v2"
-CONFIG = "SFT"
-SPLIT = "math"
+CONFIG = "default"   # the repo currently exposes only the 'default' config
+SPLIT = "math"       # may be a real HF split OR a 'category' value inside a base split (auto-handled)
 # candidate field layouts to auto-detect (Nemotron uses a chat-style list; we fall back to plain strings)
 _MSG_FIELDS = ["messages", "input", "conversations", "conversation", "prompt"]
 _STR_FIELDS = ["question", "problem", "prompt", "input", "query", "text"]
@@ -108,6 +108,35 @@ def extract_question(row, prompt_field=None, prompt_role="user"):
                      f"Pass --prompt_field explicitly.")
 
 
+def resolve_dataset(dataset, config, split, base_split=None, category_field=None):
+    """Load the target rows, robust to the two possible layouts:
+       (A) 'math' is a real HF split under the config -> load it directly;
+       (B) 'math' is a value of a 'category'-like column inside one base split -> load base + filter.
+    Returns (ds, meta). Auto-falls-back config -> 'default'/first if the requested one is absent."""
+    from datasets import load_dataset, get_dataset_config_names, get_dataset_split_names
+    configs = get_dataset_config_names(dataset)
+    cfg = config if config in configs else ("default" if "default" in configs else configs[0])
+    if cfg != config:
+        print(f"[collect] config {config!r} not in {configs}; using {cfg!r}")
+    splits = get_dataset_split_names(dataset, cfg)
+    print(f"[collect] config={cfg!r} available splits={splits}")
+    if split in splits:                                            # layout (A)
+        ds = load_dataset(dataset, cfg, split=split)
+        return ds, dict(config=cfg, split=split, filtered=False)
+    base = base_split or ("train" if "train" in splits else splits[0])   # layout (B)
+    print(f"[collect] {split!r} is not a split; loading base split {base!r} then filtering by category=={split!r}")
+    ds = load_dataset(dataset, cfg, split=base)
+    cols = list(ds.features.keys())
+    catf = category_field or next(
+        (c for c in ("category", "categories", "domain", "subset", "source", "task", "split") if c in cols), None)
+    if catf is None:
+        raise ValueError(f"No category-like column found to filter by (columns={cols}); "
+                         f"pass --category_field, or set --split to a real split from {splits}")
+    ds = ds.filter(lambda r: r[catf] == split)
+    print(f"[collect] filtered {catf}=={split!r} -> {len(ds)} rows")
+    return ds, dict(config=cfg, split=base, filtered=True, category_field=catf)
+
+
 def load_done_ranks(path):
     """Ranks already present in a shard's JSONL (for --resume). Tolerates a truncated last line."""
     done = set()
@@ -135,6 +164,8 @@ def main():
     p.add_argument("--split", default=SPLIT)
     p.add_argument("--prompt_field", default=None, help="override auto-detect of the question field")
     p.add_argument("--prompt_role", default="user")
+    p.add_argument("--base_split", default=None, help="(layout B) base split to load before category-filtering")
+    p.add_argument("--category_field", default=None, help="(layout B) column to match against --split")
     # sampling / sharding
     p.add_argument("--seed", type=int, default=1234, help="fixes the GLOBAL rank->row permutation")
     p.add_argument("--start", type=int, default=0, help="first rank (inclusive)")
@@ -156,11 +187,15 @@ def main():
     assert 0 <= args.shard_id < args.num_shards, "shard_id must be in [0, num_shards)"
     assert args.start < args.end, "need start < end"
 
-    from datasets import load_dataset  # imported here so --help works without `datasets`
     print(f"[collect] loading {args.dataset} [{args.config}/{args.split}] ...")
-    ds = load_dataset(args.dataset, args.config, split=args.split)
+    ds, dsmeta = resolve_dataset(args.dataset, args.config, args.split, args.base_split, args.category_field)
     N = len(ds)
-    print(f"[collect] {N} rows; features: {list(ds.features.keys())}")
+    print(f"[collect] {N} rows; features: {list(ds.features.keys())}  ({dsmeta})")
+    if args.dry_run:                                              # show raw structure of the first row
+        row0 = ds[0]
+        print("[dry_run] first-row keys + truncated values:")
+        for kk, vv in row0.items():
+            print(f"    {kk}: {str(vv)[:160]!r}")
 
     # global, seed-fixed permutation: rank -> dataset index (immutable for a given --seed)
     perm = np.random.default_rng(args.seed).permutation(N)
