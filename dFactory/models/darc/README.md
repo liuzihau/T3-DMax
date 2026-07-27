@@ -88,7 +88,7 @@ dFactory/
     modeling_darc.py         #   head: attn + MLP + fuse, soft-embed, parallel + step forward   [stub]
   scripts/collect_gold_data.py   # self-gold data collection (mirrors build_*_dataset.py)
   tasks/                     # [todo] train_darc.py + darc_train_core.py (mirror train_dbet.py)
-  tasks/dataset/             # [todo] data_transform_darc.py — shards -> block-structured targets
+  tasks/dataset/data_transform_darc.py   # gold shards -> {input_ids,noisy,labels,attn}  [done]
   configs/sft/               # [todo] darc_*.yaml trial configs
 dInfer/
   evaluations/probe_layer_readout.py   # the prune-validity probe (analysis; stays here)
@@ -98,6 +98,8 @@ dInfer/
 ## Status
 - [x] Prune-validity probe → go signal (clean-prefix recovery 0.23→0.76).
 - [x] Data-collection pipeline (seeded, shardable, extensible), now in dFactory/scripts.
+- [x] Dataset transform (`tasks/dataset/data_transform_darc.py`) — gold shards -> training tensors
+      (all-masked first-trial mode + ltr_reveal/random for later; borrows DMax masking; self-tested).
 - [ ] DARC head module (`modeling_darc.py` + `configuration_darc.py`).
-- [ ] Two-phase training (`tasks/train_darc.py`) + dataset loader (`tasks/dataset/`).
+- [ ] Two-phase training (`tasks/train_darc.py` + `darc_train_core.py`).
 - [ ] First trial: one-forward all-masked, measure accuracy lift vs added latency.
