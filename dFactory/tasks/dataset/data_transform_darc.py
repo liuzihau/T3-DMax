@@ -46,60 +46,71 @@ def process_darc_gold_example(
     mask_token_id=MASK_ID,
     pad_token_id=PAD_ID,
     eos_token_id=EOS_ID,
-    mode="all_masked",                 # 'all_masked' (first trial) | 'ltr_reveal' | 'random'
+    mode="reveal_prior",               # 'reveal_prior' (first trial) | 'all_masked' | 'ltr_reveal' | 'random'
     noise_range=(1.0, 1.0),            # used by ltr_reveal/random; (1,1) == all masked
     append_eos=True,                   # add one EOS target so the head learns to stop (gold_ids exclude it)
     progress_state=None,
     sigma_gate=0.0,
     source_name=None,                  # accepted (dataset.py passes it); unused
 ):
-    """One collected record -> [ {input_ids, noisy_input_ids, attention_mask, labels, prompt_len} ].
-    Returns a 1-element list to match the DMax MappingDataset flat-map convention."""
+    """One collected record -> LIST of training instances {input_ids, noisy_input_ids, attention_mask,
+    labels, prompt_len, active_bs} (list matches the DMax MappingDataset flat-map convention).
+
+    'reveal_prior' (VALIDATED first-trial setup, see dFactory/scripts/smoke_darc_integration.py): emit ONE
+    instance per generated block b -- reveal [0,bs) as committed gold (hard tokens), mask [bs, L) (block b +
+    everything after), loss on block b only. This matches the model's inference-time forward-1 (prior blocks
+    committed, current block masked); masking the WHOLE generated region instead collapses the tap signal
+    (recall avg 0.44 -> 0.12) and must not be used for training. The other modes emit ONE instance
+    (all-masked / left-to-right reveal / random) and are for reference/ablation only."""
     prompt_ids = list(example["prompt_ids"])
     gold_ids = list(example["gold_ids"])
     P = int(example.get("prompt_len", len(prompt_ids)))
 
     seq = prompt_ids + gold_ids + ([eos_token_id] if append_eos else [])
-    gen_end = len(seq)                                     # exclusive end of the real (prompt+gold+eos) region
+    gen_end = min(len(seq), max_seq_len)                   # exclusive end of the real (prompt+gold+eos) region
     seq = seq[:max_seq_len]                                # truncate over-long
     if len(seq) < max_seq_len:                             # pad to fixed max_seq_len (DMax padding="max_length")
         seq = seq + [pad_token_id] * (max_seq_len - len(seq))
     input_ids = torch.tensor(seq, dtype=torch.long)
-
     P = min(P, max_seq_len)
-    gen_end = min(gen_end, max_seq_len)
     pos = torch.arange(max_seq_len)
-    maskable_mask = (pos >= P) & (pos < gen_end)           # the generated region only (never prompt or pad)
+    attention_mask = (pos < gen_end).long()                # 1 = real (prompt+gold+eos), 0 = padding
+    B = block_size
 
+    def _inst(noisy, labels, active_bs=-1):
+        return {"input_ids": input_ids, "noisy_input_ids": noisy, "attention_mask": attention_mask,
+                "labels": labels, "prompt_len": torch.tensor(P, dtype=torch.long),
+                "active_bs": torch.tensor(active_bs, dtype=torch.long)}
+
+    if mode == "reveal_prior":
+        out = []
+        first = ((P + B - 1) // B) * B                     # first full-block boundary at/after the prompt
+        for bs in range(first, gen_end, B):                # one instance per generated block
+            be = min(bs + B, gen_end)
+            noisy = input_ids.clone()
+            noisy[bs:] = mask_token_id                     # reveal [0,bs) committed gold; mask block b + future
+            labels = torch.full_like(input_ids, -100)
+            labels[bs:be] = input_ids[bs:be]               # loss on block b (head skips the rel-pos-0 seed)
+            out.append(_inst(noisy, labels, active_bs=bs))
+        return out
+
+    # ---- single-instance reference/ablation modes ----
+    maskable = (pos >= P) & (pos < gen_end)                # generated region only (never prompt or pad)
     if mode == "all_masked":
-        noisy_input_ids = torch.where(maskable_mask, torch.full_like(input_ids, mask_token_id), input_ids)
+        noisy = torch.where(maskable, torch.full_like(input_ids, mask_token_id), input_ids)
     elif mode == "ltr_reveal":
         from data_transform_dbet import block_left_to_right_reveal
-        noisy_input_ids = block_left_to_right_reveal(
-            input_ids.clone(), noise_range, maskable_mask, mask_token_id, block_size,
-            progress_state=progress_state, sigma_gate=sigma_gate)
+        noisy = block_left_to_right_reveal(input_ids.clone(), noise_range, maskable, mask_token_id, B,
+                                           progress_state=progress_state, sigma_gate=sigma_gate)
     elif mode == "random":
         from data_transform import sft_noise_transition
-        noisy_input_ids = sft_noise_transition(
-            input_ids.clone(), noise_range, maskable_mask, mask_token_id,
-            progress_state=progress_state, sigma_gate=sigma_gate)
+        noisy = sft_noise_transition(input_ids.clone(), noise_range, maskable, mask_token_id,
+                                     progress_state=progress_state, sigma_gate=sigma_gate)
     else:
         raise ValueError(f"unknown mode {mode!r}")
-
-    # LLaDA masked-token objective (== DMax): loss only where the noisy stream is MASK.
-    loss_positions = noisy_input_ids == mask_token_id
     labels = input_ids.clone()
-    labels[~loss_positions] = -100
-
-    attention_mask = (pos < gen_end).long()                # 1 = real (prompt+gold+eos), 0 = padding
-
-    return [{
-        "input_ids": input_ids,
-        "noisy_input_ids": noisy_input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "prompt_len": torch.tensor(P, dtype=torch.long),
-    }]
+    labels[noisy != mask_token_id] = -100                  # LLaDA masked-token objective (loss only at MASK)
+    return [_inst(noisy, labels)]
 
 
 # --------------------------------------------------------------------------------------------------------
@@ -142,30 +153,34 @@ def build_hf_dataset_from_shards(path_or_glob, out_dir=None, keep=("prompt_ids",
 if __name__ == "__main__":
     torch.manual_seed(0)
     L, BLK = 64, 16
-    # fake record: prompt of 20 tokens, gold response of 25 tokens
-    rec = {"prompt_ids": list(range(100, 120)), "gold_ids": list(range(200, 225)), "prompt_len": 20}
-    P, G = 20, 25
 
+    # --- reveal_prior (first-trial default): prompt 8, gold 40 -> blocks at bs=16,32,48 ---
+    rec = {"prompt_ids": list(range(100, 108)), "gold_ids": list(range(200, 240)), "prompt_len": 8}
+    P, gen_end = 8, 8 + 40 + 1                              # +1 appended EOS
+    insts = process_darc_gold_example(rec, max_seq_len=L, block_size=BLK, mode="reveal_prior")
+    bss = [int(x["active_bs"]) for x in insts]
+    assert bss == [16, 32, 48], bss                        # one instance per generated block
+    for inst in insts:
+        ii, ni, lab, bs = inst["input_ids"], inst["noisy_input_ids"], inst["labels"], int(inst["active_bs"])
+        be = min(bs + BLK, gen_end)
+        assert (ni[:bs] == ii[:bs]).all(), "reveal_prior: [0,bs) must be committed gold (revealed)"
+        assert (ni[bs:] == MASK_ID).all(), "reveal_prior: block b + future must be masked"
+        assert (lab[:bs] == -100).all() and (lab[be:] == -100).all()
+        assert (lab[bs:be] == ii[bs:be]).all(), "loss targets == gold on block b"
+    n_sup = sum(int((x["labels"] != -100).sum()) for x in insts)
+    print(f"[reveal_prior] OK  {len(insts)} block-instances bs={bss}  total_supervised={n_sup}")
+
+    # --- all_masked (reference): whole generated region masked, single instance ---
     out = process_darc_gold_example(rec, max_seq_len=L, block_size=BLK, mode="all_masked")[0]
-    ii, ni, am, lab = out["input_ids"], out["noisy_input_ids"], out["attention_mask"], out["labels"]
-    gen_end = P + G + 1                                     # +1 appended EOS
-    assert ii.shape == ni.shape == am.shape == lab.shape == (L,)
-    # prompt: clean, no loss
-    assert (ni[:P] == ii[:P]).all() and (lab[:P] == -100).all()
-    # generated region (incl EOS): all masked in noisy, labels == gold
-    assert (ni[P:gen_end] == MASK_ID).all(), "all_masked must mask the whole generated region"
-    assert (lab[P:gen_end] == ii[P:gen_end]).all() and (ii[gen_end - 1] == EOS_ID)
-    # padding: clean, no loss, attention 0
-    assert (ii[gen_end:] == PAD_ID).all() and (lab[gen_end:] == -100).all()
-    assert (am[:gen_end] == 1).all() and (am[gen_end:] == 0).all()
-    n_sup = int((lab != -100).sum())
-    print(f"[all_masked] OK  supervised={n_sup} (== gen incl EOS = {G+1})  seq={L} blk={BLK}")
-    assert n_sup == G + 1
+    ni, lab = out["noisy_input_ids"], out["labels"]
+    assert (ni[P:gen_end] == MASK_ID).all() and (lab[P:gen_end] == out["input_ids"][P:gen_end]).all()
+    assert (lab[:P] == -100).all() and (lab[gen_end:] == -100).all()
+    print(f"[all_masked] OK  supervised={int((lab != -100).sum())} (reference mode)")
 
-    # ltr_reveal: reveals a left prefix per block, masks the rest -> fewer supervised than all_masked
+    # --- ltr_reveal (reference): reveals a left prefix per block -> strict subset ---
     out2 = process_darc_gold_example(rec, max_seq_len=L, block_size=BLK, mode="ltr_reveal",
                                      noise_range=(0.5, 0.5))[0]
-    n_sup2 = int((out2["labels"] != -100).sum())
-    assert 0 < n_sup2 < n_sup, f"ltr_reveal should supervise a strict subset (got {n_sup2} vs {n_sup})"
-    print(f"[ltr_reveal σ=0.5] OK  supervised={n_sup2} (< {n_sup})")
+    n2 = int((out2["labels"] != -100).sum())
+    assert 0 < n2 < int((lab != -100).sum())
+    print(f"[ltr_reveal σ=0.5] OK  supervised={n2}")
     print("data_transform_darc self-test PASSED")
