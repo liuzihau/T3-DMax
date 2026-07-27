@@ -34,7 +34,6 @@ from dinfer.decoding.generate_dbet import MASK_ID, EOS_ID            # noqa: E40
 from eval_tasks import load_task                                     # noqa: E402
 from configuration_darc import DarcConfig                            # noqa: E402
 from modeling_darc import DarcHead                                   # noqa: E402
-from data_transform_darc import process_darc_gold_example            # noqa: E402
 
 
 @torch.no_grad()
@@ -62,6 +61,8 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(os.path.abspath(args.tokenizer_path or mp), trust_remote_code=True)
     model = load_fused(mp, device)
+    for p in model.parameters():                                  # FREEZE the backbone (only the head trains)
+        p.requires_grad_(False)
     embed = model.get_input_embeddings()
     lm_head = model.get_output_embeddings()
     final_norm = model.model.norm
@@ -82,53 +83,58 @@ def main():
     head = DarcHead(cfg).to(device=device, dtype=dt)
     head.train()
 
+    B = args.block_length
+
+    def tap_forward(noisy, L, pos_ids, attn):
+        out = model(input_ids=noisy, attention_mask=attn, position_ids=pos_ids,
+                    use_cache=False, output_hidden_states=True, return_dict=True)
+        return out.hidden_states, out.logits
+
+    def recall_at_block(top1, gold, bs, be, ts=(0, 1, 4, 8, 16)):
+        return {t: float((top1[bs + t] == gold[bs + t])) for t in ts if bs + t < be}
+
     rows = load_task(args.task, limit=args.limit)
     for ridx, row in enumerate(rows):
         pid = tok.apply_chat_template([{"role": "user", "content": row["prompt"]}],
                                       add_generation_prompt=True, tokenize=True, return_tensors="pt").to(device)
         P = pid.shape[1]
         gx, ge = get_gold(model, embed, lm_head, final_norm, pid, args.gen_length, args.block_length, V, device)
-        gold_ids = gx[P:ge].tolist()
-        if len(gold_ids) < 4:
-            print(f"[smoke] ex{ridx}: empty gold, skip"); continue
-
-        # transform -> training tensors (all-masked forward-1)
-        B = args.block_length
-        L = ((int(ge) // B) + 1) * B                                # block-aligned length covering the gold
-        rec = {"prompt_ids": pid[0].tolist(), "gold_ids": gold_ids, "prompt_len": P}
-        ex = process_darc_gold_example(rec, max_seq_len=L, block_size=B, mode="all_masked")[0]
-        input_ids = ex["input_ids"].to(device)[None]               # [1,L] clean
-        noisy = ex["noisy_input_ids"].to(device)[None]             # [1,L] generated masked
-        labels = ex["labels"].to(device)[None]                     # [1,L]
+        # active block = first block boundary >= P with a FULL generated block (be <= gold eos)
+        bs = ((P + B - 1) // B) * B
+        be = bs + B
+        if be > int(ge):
+            print(f"[smoke] ex{ridx}: gold too short for a full generated block (P={P} ge={int(ge)}), skip")
+            continue
+        L = ((int(ge) // B) + 1) * B
+        gold = gx[:L].clone().to(device)                          # clean gold tokens [L]
         pos_ids = torch.arange(L, device=device)[None]
         attn = build_block_causal_mask(L, B, dtype=dt, device=device)
 
-        # --- masked forward-1 through the frozen heavy ---
-        out = model(input_ids=noisy, attention_mask=attn, position_ids=pos_ids,
-                    use_cache=False, output_hidden_states=True, return_dict=True)
-        hs = out.hidden_states
-        assert len(hs) == NL + 1, (len(hs), NL)
-        # (A) last entry is post-norm: lm_head(hs[-1]) ~= out.logits
-        dA = (lm_head(hs[-1]).float() - out.logits.float()).abs().max().item()
-        # (B) layer-18 logit-lens recall@1 by block position, on masked generated slots
-        h = hs[tap_index]                                          # [1,L,D] raw output of layer tap_layer
-        lens = lm_head(final_norm(h)).float()                      # standard logit lens
-        top1 = lens.argmax(-1)[0]                                  # [L]
-        gen = (noisy[0] == MASK_ID) & (labels[0] != -100)
-        rel = torch.arange(L, device=device) % B
-        r_by = {t: [] for t in (0, 1, 4, 8, 16)}
-        for t in r_by:
-            m = gen & (rel == t)
-            if m.any():
-                r_by[t] = (top1[m] == labels[0][m]).float().mean().item()
-        if ridx == 0:
-            print(f"[smoke] (A) |lm_head(hs[-1]) - logits|max = {dA:.4f}  (small => hs[-1] is post-norm)")
-        print(f"[smoke] ex{ridx} tap recall@1 by block-pos: " +
-              " ".join(f"p{t}={r_by[t]:.2f}" for t in (0, 1, 4, 8, 16) if r_by[t] != []))
+        # --- contrast the two setups on the SAME active block ---
+        # (1) ALL-MASKED (the wrong setup): mask the whole generated region
+        noisy_all = gold.clone(); noisy_all[P:] = MASK_ID
+        hs_all, logits_all = tap_forward(noisy_all[None], L, pos_ids, attn)
+        top1_all = lm_head(final_norm(hs_all[tap_index])).float().argmax(-1)[0]
+        # (2) REVEAL-PRIOR (matches inference): reveal [0,bs) as gold, mask [bs,L)
+        noisy_rp = gold.clone(); noisy_rp[bs:] = MASK_ID
+        hs_rp, _ = tap_forward(noisy_rp[None], L, pos_ids, attn)
+        h = hs_rp[tap_index]                                      # [1,L,D]
+        top1_rp = lm_head(final_norm(h)).float().argmax(-1)[0]
 
-        # --- (C) DARC head on the REAL bf16 hidden ---
-        cos, sin = rotary_emb(h, pos_ids)                         # [1,L,rot], base convention
-        loss, m = head.forward_train(h, noisy, labels, cos, sin, embed, final_norm, lm_head)
+        if ridx == 0:
+            dA = (lm_head(hs_all[-1]).float() - logits_all.float()).abs().max().item()
+            print(f"[smoke] (A) |lm_head(hs[-1]) - logits|max = {dA:.4f}  (small => hs[-1] is post-norm)")
+        r_all = recall_at_block(top1_all, gold, bs, be)
+        r_rp = recall_at_block(top1_rp, gold, bs, be)
+        fmt = lambda d: " ".join(f"p{t}={d[t]:.2f}" for t in sorted(d))
+        print(f"[smoke] ex{ridx} block[{bs},{be}) recall@1  ALL-MASKED: {fmt(r_all)}")
+        print(f"[smoke] ex{ridx} block[{bs},{be}) recall@1  REVEAL-PRIOR: {fmt(r_rp)}   <- should be ~0.9 at p0")
+
+        # --- (C) DARC head on the REAL bf16 hidden (reveal-prior), loss on the active block only ---
+        labels = torch.full((L,), -100, dtype=torch.long, device=device)
+        labels[bs:be] = gold[bs:be]                               # head skips the block seed (rel-pos 0) itself
+        cos, sin = rotary_emb(h, pos_ids)
+        loss, m = head.forward_train(h, noisy_rp[None], labels[None], cos, sin, embed, final_norm, lm_head)
         loss.backward()
         g_head = head.attention.q_proj.weight.grad
         print(f"[smoke] ex{ridx} HEAD loss={float(loss.detach()):.4f} n_sup={m['n_sup']} "
@@ -137,8 +143,7 @@ def main():
         head.zero_grad(set_to_none=True)
         assert torch.isfinite(loss), "head loss must be finite on real bf16 hidden"
 
-    print("[smoke] DARC integration smoke PASSED "
-          "(tap index verified, layer-18 signal reproduced, head trains on real bf16 hidden)")
+    print("[smoke] done — check that REVEAL-PRIOR p0 ~0.9 (reproduces the probe) and ALL-MASKED is low.")
 
 
 if __name__ == "__main__":
