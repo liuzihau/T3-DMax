@@ -175,26 +175,29 @@ class DarcHead(nn.Module):
         MASK = int(getattr(self.config, "mask_token_id", 156895))  # revealed vs masked from the noisy stream
         revealed = noisy_input_ids != MASK                   # True = a real/committed token (hard embed)
 
-        s = torch.zeros(Bsz, n, D, dtype=h.dtype, device=dev)
+        # committed soft-embeds as a LIST (index == position), stacked per step -> a FRESH kv tensor each time,
+        # so kv_proj's saved-for-backward input is never invalidated by a later in-place write.
+        s_list = []                                          # each [B,D], detached
         ar_list, pos_list = [], []
         for i in range(n):
             bs = (i // B) * B
             cos_i, sin_i = cos[:, i:i + 1], sin[:, i:i + 1]
             if bool(revealed[:, i].all()):                   # (B=1 training assumed; .all() is exact then)
-                s[:, i] = frozen_embed(noisy_input_ids[:, i]).detach()
+                s_list.append(frozen_embed(noisy_input_ids[:, i]).detach())
                 continue
             if i == bs:                                       # masked SEED: direct logit-lens on h_i, no loss
                 with torch.no_grad():
                     logit = self.readout(h[:, i:i + 1], final_norm, lm_head)
-                    s[:, i] = self.soft_embed_topk(logit, embed_weight).squeeze(1).detach()
+                    s_list.append(self.soft_embed_topk(logit, embed_weight).squeeze(1).detach())
                 continue
-            # masked NON-SEED: grad through the head; context (s[:, bs:i]) is detached (non-grad tensor)
-            ar = self._ar_block(h[:, i:i + 1], s[:, bs:i], cos_i, sin_i, cos[:, bs:i], sin[:, bs:i])  # [B,1,D]
+            # masked NON-SEED: grad through the head; the in-block context is a detached, freshly-stacked tensor
+            kv = torch.stack(s_list[bs:i], dim=1)            # [B, i-bs, D]
+            ar = self._ar_block(h[:, i:i + 1], kv, cos_i, sin_i, cos[:, bs:i], sin[:, bs:i])  # [B,1,D]
             ar_list.append(ar)
             pos_list.append(i)
             with torch.no_grad():
                 logit = self.readout(ar, final_norm, lm_head)
-                s[:, i] = self.soft_embed_topk(logit, embed_weight).squeeze(1).detach()
+                s_list.append(self.soft_embed_topk(logit, embed_weight).squeeze(1).detach())
 
         if not ar_list:
             loss = h.sum() * 0.0
@@ -206,7 +209,9 @@ class DarcHead(nn.Module):
             V = logits.shape[-1]
             loss = F.cross_entropy(logits.reshape(-1, V), gold.reshape(-1), ignore_index=-100)
             metrics = {"loss1": float(loss.detach()), "n_sup": int((gold != -100).sum())}
-        return (loss, metrics, s.detach()) if return_soft_embeds else (loss, metrics)
+        if return_soft_embeds:
+            return loss, metrics, torch.stack(s_list, dim=1)     # [B,n,D], detached
+        return loss, metrics
 
 
 # ============================================================================================================
@@ -239,7 +244,7 @@ if __name__ == "__main__":
 
     loss, m, s = head.forward_train(h, noisy, labels, cos, sin, frozen_embed, final_norm, lm_head,
                                     return_soft_embeds=True)
-    print(f"loss={float(loss):.4f}  metrics={m}")
+    print(f"loss={float(loss.detach()):.4f}  metrics={m}")
     assert torch.isfinite(loss), "loss must be finite (no NaN from empty attention rows)"
 
     # supervised count == non-seed masked positions (exclude seeds at 0,8,16 and the 4 revealed)
