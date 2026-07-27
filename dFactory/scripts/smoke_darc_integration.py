@@ -84,66 +84,76 @@ def main():
     head.train()
 
     B = args.block_length
+    from collections import defaultdict
 
-    def tap_forward(noisy, L, pos_ids, attn):
+    def tap_top1(noisy, pos_ids, attn):
         out = model(input_ids=noisy, attention_mask=attn, position_ids=pos_ids,
                     use_cache=False, output_hidden_states=True, return_dict=True)
-        return out.hidden_states, out.logits
+        h = out.hidden_states[tap_index]
+        return h, lm_head(final_norm(h)).float().argmax(-1)[0], out                # h[1,L,D], top1[L]
 
-    def recall_at_block(top1, gold, bs, be, ts=(0, 1, 4, 8, 16)):
-        return {t: float((top1[bs + t] == gold[bs + t])) for t in ts if bs + t < be}
-
+    hit_all, cnt_all = defaultdict(float), defaultdict(float)                       # by in-block rel-pos
+    hit_rp, cnt_rp = defaultdict(float), defaultdict(float)
+    did_head = did_A = False
     rows = load_task(args.task, limit=args.limit)
     for ridx, row in enumerate(rows):
         pid = tok.apply_chat_template([{"role": "user", "content": row["prompt"]}],
                                       add_generation_prompt=True, tokenize=True, return_tensors="pt").to(device)
         P = pid.shape[1]
         gx, ge = get_gold(model, embed, lm_head, final_norm, pid, args.gen_length, args.block_length, V, device)
-        # active block = first block boundary >= P with a FULL generated block (be <= gold eos)
-        bs = ((P + B - 1) // B) * B
-        be = bs + B
-        if be > int(ge):
-            print(f"[smoke] ex{ridx}: gold too short for a full generated block (P={P} ge={int(ge)}), skip")
+        ge = int(ge)
+        if ge - P < B:
             continue
-        L = ((int(ge) // B) + 1) * B
-        gold = gx[:L].clone().to(device)                          # clean gold tokens [L]
+        L = gx.shape[0]                                                             # block-aligned decode length
+        gold = gx.to(device)
         pos_ids = torch.arange(L, device=device)[None]
         attn = build_block_causal_mask(L, B, dtype=dt, device=device)
+        rel = (torch.arange(L, device=device) % B)
 
-        # --- contrast the two setups on the SAME active block ---
-        # (1) ALL-MASKED (the wrong setup): mask the whole generated region
+        # (1) ALL-MASKED: one forward, mask the whole generated region; recall over ALL generated positions
         noisy_all = gold.clone(); noisy_all[P:] = MASK_ID
-        hs_all, logits_all = tap_forward(noisy_all[None], L, pos_ids, attn)
-        top1_all = lm_head(final_norm(hs_all[tap_index])).float().argmax(-1)[0]
-        # (2) REVEAL-PRIOR (matches inference): reveal [0,bs) as gold, mask [bs,L)
-        noisy_rp = gold.clone(); noisy_rp[bs:] = MASK_ID
-        hs_rp, _ = tap_forward(noisy_rp[None], L, pos_ids, attn)
-        h = hs_rp[tap_index]                                      # [1,L,D]
-        top1_rp = lm_head(final_norm(h)).float().argmax(-1)[0]
-
-        if ridx == 0:
-            dA = (lm_head(hs_all[-1]).float() - logits_all.float()).abs().max().item()
+        _, top1_all, out_all = tap_top1(noisy_all[None], pos_ids, attn)
+        if not did_A:
+            dA = (lm_head(out_all.hidden_states[-1]).float() - out_all.logits.float()).abs().max().item()
             print(f"[smoke] (A) |lm_head(hs[-1]) - logits|max = {dA:.4f}  (small => hs[-1] is post-norm)")
-        r_all = recall_at_block(top1_all, gold, bs, be)
-        r_rp = recall_at_block(top1_rp, gold, bs, be)
-        fmt = lambda d: " ".join(f"p{t}={d[t]:.2f}" for t in sorted(d))
-        print(f"[smoke] ex{ridx} block[{bs},{be}) recall@1  ALL-MASKED: {fmt(r_all)}")
-        print(f"[smoke] ex{ridx} block[{bs},{be}) recall@1  REVEAL-PRIOR: {fmt(r_rp)}   <- should be ~0.9 at p0")
+            did_A = True
+        for p in range(P, ge):
+            t = int(rel[p]); hit_all[t] += float(top1_all[p] == gold[p]); cnt_all[t] += 1
 
-        # --- (C) DARC head on the REAL bf16 hidden (reveal-prior), loss on the active block only ---
-        labels = torch.full((L,), -100, dtype=torch.long, device=device)
-        labels[bs:be] = gold[bs:be]                               # head skips the block seed (rel-pos 0) itself
-        cos, sin = rotary_emb(h, pos_ids)
-        loss, m = head.forward_train(h, noisy_rp[None], labels[None], cos, sin, embed, final_norm, lm_head)
-        loss.backward()
-        g_head = head.attention.q_proj.weight.grad
-        print(f"[smoke] ex{ridx} HEAD loss={float(loss.detach()):.4f} n_sup={m['n_sup']} "
-              f"grad_ok={g_head is not None and torch.isfinite(g_head).all().item()} "
-              f"backbone_frozen={lm_head.weight.grad is None}")
-        head.zero_grad(set_to_none=True)
-        assert torch.isfinite(loss), "head loss must be finite on real bf16 hidden"
+        # (2) REVEAL-PRIOR (faithful probe reproduction): per generated block, reveal [0,bs), mask [bs,L)
+        first = ((P + B - 1) // B) * B                                             # first full-block boundary >= P
+        for bs in range(first, ge, B):
+            be = min(bs + B, ge)
+            noisy_rp = gold.clone(); noisy_rp[bs:] = MASK_ID
+            h_rp, top1_rp, _ = tap_top1(noisy_rp[None], pos_ids, attn)
+            for p in range(bs, be):
+                t = int(rel[p]); hit_rp[t] += float(top1_rp[p] == gold[p]); cnt_rp[t] += 1
 
-    print("[smoke] done — check that REVEAL-PRIOR p0 ~0.9 (reproduces the probe) and ALL-MASKED is low.")
+            # (C) run the DARC head ONCE on a real reveal-prior block (bf16), loss on that block
+            if not did_head:
+                labels = torch.full((L,), -100, dtype=torch.long, device=device)
+                labels[bs:be] = gold[bs:be]
+                cos, sin = rotary_emb(h_rp, pos_ids)
+                loss, mtr = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
+                                               embed, final_norm, lm_head)
+                loss.backward()
+                g = head.attention.q_proj.weight.grad
+                print(f"[smoke] (C) HEAD loss={float(loss.detach()):.4f} n_sup={mtr['n_sup']} "
+                      f"grad_ok={g is not None and torch.isfinite(g).all().item()} "
+                      f"backbone_frozen={lm_head.weight.grad is None}")
+                head.zero_grad(set_to_none=True)
+                assert torch.isfinite(loss)
+                did_head = True
+
+    def curve(hit, cnt):
+        tot_h = sum(hit.values()); tot_c = sum(cnt.values())
+        ts = [t for t in (0, 1, 2, 4, 8, 12, 16, 24, 30) if cnt.get(t, 0) > 0]
+        s = " ".join(f"p{t}={hit[t]/cnt[t]:.2f}" for t in ts)
+        return f"avg={tot_h/max(tot_c,1):.3f}  {s}"
+
+    print(f"[smoke] recall@1 by in-block pos, ALL-MASKED   (prior NOT committed): {curve(hit_all, cnt_all)}")
+    print(f"[smoke] recall@1 by in-block pos, REVEAL-PRIOR (== probe forward-1): {curve(hit_rp, cnt_rp)}")
+    print("[smoke] EXPECT: REVEAL-PRIOR avg ~probe (~0.4, p0~0.9 decaying); ALL-MASKED clearly lower.")
 
 
 if __name__ == "__main__":
