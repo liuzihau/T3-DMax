@@ -84,8 +84,8 @@ eos_cut, ...}` per line (self-contained). Default output → `dFactory/darc_gold
 dFactory/
   models/darc/               # THIS dir — head module (mirrors models/dbet/)
     README.md                #   project hub (this file)
-    configuration_darc.py    #   [todo] head config
-    modeling_darc.py         #   head: attn + MLP + fuse, soft-embed, parallel + step forward   [stub]
+    configuration_darc.py    #   head config (DarcConfig dataclass)                              [done]
+    modeling_darc.py         #   head: AR attn + MLP + fuse, soft-embed, Loss-1 forward          [done: Loss-1]
   scripts/collect_gold_data.py   # self-gold data collection (mirrors build_*_dataset.py)
   tasks/                     # [todo] train_darc.py + darc_train_core.py (mirror train_dbet.py)
   tasks/dataset/data_transform_darc.py   # gold shards -> {input_ids,noisy,labels,attn}  [done]
@@ -100,6 +100,10 @@ dInfer/
 - [x] Data-collection pipeline (seeded, shardable, extensible), now in dFactory/scripts.
 - [x] Dataset transform (`tasks/dataset/data_transform_darc.py`) — gold shards -> training tensors
       (all-masked first-trial mode + ltr_reveal/random for later; borrows DMax masking; self-tested).
-- [ ] DARC head module (`modeling_darc.py` + `configuration_darc.py`).
+- [x] DARC head module — Loss-1 (`modeling_darc.py` + `configuration_darc.py`): self-conditioned
+      stop-gradient AR, block-strict-causal, frozen seed/hard-embed handling; model-free self-test.
+- [ ] Base-model integration: import LLaDA2Moe pieces, cos/sin from LLaDA2MoeRotaryEmbedding, tap via
+      `heavy_forward(output_hidden_states=True)`, resolve `tap_layer` vs the probe.
+- [ ] Loss-2 (fuse -> L19+ replay) + block-parallel produce optimization.
 - [ ] Two-phase training (`tasks/train_darc.py` + `darc_train_core.py`).
 - [ ] First trial: one-forward all-masked, measure accuracy lift vs added latency.
