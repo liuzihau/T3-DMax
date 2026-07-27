@@ -144,8 +144,11 @@ class DarcHead(nn.Module):
         self.attention = DarcARAttention(config)
         self.post_attention_layernorm = RMSNorm(D, config.rms_norm_eps)
         self.mlp = DarcGatedMLP(D, config.intermediate_size, D, act=config.hidden_act,
-                                pre_norm=False, eps=config.rms_norm_eps)
-        self.fuse = DarcFuse(config)                          # for Loss-2 (unused here)
+                                pre_norm=False, zero_init_out=True, eps=config.rms_norm_eps)
+        # zero-init both block outputs -> at init ar_out == h, so readout == the base tap logit-lens and the
+        # head starts AT the base model's recall and learns only the residual (DBet delta-head philosophy).
+        nn.init.zeros_(self.attention.dense.weight)
+        self.fuse = DarcFuse(config) if getattr(config, "use_fuse", True) else None   # Loss-2 only
 
     # ---- soft-embed: top-k softmax-weighted FROZEN base embedding ----
     def soft_embed_topk(self, logits, embed_weight):

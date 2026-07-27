@@ -167,6 +167,7 @@ def main():
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
                      tap_layer=args.tap_layer, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
+    cfg.use_fuse = False                                               # Loss-1 only -> ~50M trainable head
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
     n_params = sum(p.numel() for p in head.parameters())

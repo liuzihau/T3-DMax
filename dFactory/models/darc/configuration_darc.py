@@ -30,6 +30,7 @@ class DarcConfig:
 
     # --- training / freeze ---
     freeze_backbone: bool = True          # freeze everything but attn+mlp+fuse (+optional LoRA later)
+    use_fuse: bool = True                 # build the Loss-2 fuse (set False for Loss-1-only trials -> ~50M)
     loss1_weight: float = 1.0             # per-position AR readout CE
     loss2_weight: float = 1.0             # fused -> L19+ CE (added later)
     attn_impl: str = "sdpa"
