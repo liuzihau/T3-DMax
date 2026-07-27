@@ -81,7 +81,8 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     N, L = noisy.shape
     B = cfg.block_size
     with torch.no_grad():                                              # frozen backbone
-        attn = build_block_causal_mask(L, B, dtype=dt, device=device)
+        attn = build_block_causal_mask(L, B, dtype=dt, device=device)  # [1,1,L,L]
+        attn = attn.expand(N, *attn.shape[1:])                         # model needs a per-batch (N,1,L,L) mask
         pos = torch.arange(L, device=device)[None].expand(N, L)
         out = model(input_ids=noisy, attention_mask=attn, position_ids=pos,
                     use_cache=False, output_hidden_states=True, return_dict=True)
