@@ -353,24 +353,28 @@ def main():
     log_path = os.path.join(args.out_dir, "train_log.jsonl")
     logf = open(log_path, "a")
 
+    def _load_head(sd):                                             # load only NAME+SHAPE-matching tensors
+        msd = head.state_dict()                                     # (strict=False still errors on shape mismatch)
+        keep = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
+        head.load_state_dict(keep, strict=False)
+        return len(keep), len(msd)
+
     step = 0
     if args.init_from and not args.resume:                          # A/B: shared Loss-1 weights, fresh schedule
-        ck = torch.load(args.init_from, map_location=device)
-        r = head.load_state_dict(ck["state_dict"], strict=False)
-        print(f"[train] init_from {args.init_from}: partial load ({len(r.missing_keys)} fresh, "
-              f"{len(r.unexpected_keys)} dropped); fresh step/opt/schedule")
+        nk, nt = _load_head(torch.load(args.init_from, map_location=device)["state_dict"])
+        print(f"[train] init_from {args.init_from}: loaded {nk}/{nt} tensors (rest fresh: e.g. resized/new fuse); "
+              f"fresh step/opt/schedule")
     if args.resume and _ckpts():
         ck = torch.load(_ckpts()[-1], map_location=device)
-        r = head.load_state_dict(ck["state_dict"], strict=False)   # partial: changed/new modules start fresh
-        if r.missing_keys or r.unexpected_keys:
-            print(f"[train] resume PARTIAL load: {len(r.missing_keys)} missing (start fresh, e.g. fuse), "
-                  f"{len(r.unexpected_keys)} unexpected. Optimizer state skipped.")
-        else:
+        nk, nt = _load_head(ck["state_dict"])
+        if nk == nt:
             try:
                 if "opt" in ck:
                     opt.load_state_dict(ck["opt"])
             except (ValueError, KeyError, RuntimeError) as e:
                 print(f"[train] resume: optimizer state not loaded ({e}); optimizer starts fresh")
+        else:
+            print(f"[train] resume PARTIAL head load ({nk}/{nt}); optimizer starts fresh")
         step = int(ck["step"]); best_acc = float(ck.get("best_acc", -1.0))
         print(f"[train] resumed from {_ckpts()[-1]} at step {step} (best_acc={best_acc:.3f})")
 
