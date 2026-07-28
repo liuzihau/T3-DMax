@@ -145,7 +145,7 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     accs = {c: _new_acc() for c in curves} if want else {}
     agg = {"loss1": 0.0, "acc1": 0.0, "n_sup": 0, "loss2": 0.0, "acc2": 0.0}
     loss1 = 0.0
-    h2 = h.clone() if (do2 or val) else None
+    fvals, fni, fpi = [], [], []                                  # grad-safe scatter of fused values into h2
     spans = []                                                    # (n, full_gen_positions[list], gold_ng)
     for n in range(N):
         bs = int(act[n]); be = bs + B
@@ -156,7 +156,8 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
             if (do2 or val) and gen_pos:
                 fused = head.fuse(soft, h[n:n + 1, bs:be])[0]     # [blk,D]; refine only generated (contiguous)
                 lo, hi = gen_pos[0], gen_pos[-1] + 1
-                h2[n, bs + lo:bs + hi] = fused[lo:hi]
+                fvals.append(fused[lo:hi])                        # [n_gen,D] (grad through the fuse)
+                fni += [n] * (hi - lo); fpi += [bs + p for p in range(lo, hi)]
         loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
         full_pos = [bs + p for p in gen_pos]
@@ -168,6 +169,14 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     loss = loss1_w * loss1
 
     if do2 or val:
+        # GRAD-SAFE: functional index_put keeps h2 in the graph so Loss-2's grad reaches the fuse (an in-place
+        # write into a no-grad clone would silently drop it -> fuse never trains -> with-L19/L20 == no-tap).
+        if fvals:
+            h2 = h.detach().index_put(
+                (torch.tensor(fni, device=device), torch.tensor(fpi, device=device)),
+                torch.cat(fvals, dim=0))
+        else:
+            h2 = h.detach()
         with torch.autocast(device_type="cuda", dtype=dt):
             lv = replay_levels(model, h2, tap_index, attn, pos, (cos, sin))   # {L19:h, L20:h}
         loss2 = 0.0
