@@ -3,7 +3,7 @@
 #
 # DARC first-trial trainer (SINGLE GPU, plain PyTorch). Trains the ~50M DARC head on a FROZEN DMax-16B using
 # the reveal-prior gold data. Reuses the exact components validated by dFactory/scripts/smoke_darc_integration.py
-# (load_fused, tap hidden_states[tap_layer+1], build_block_causal_mask, DarcHead) so training == the smoke.
+# (load_fused, tap hidden_states[tap_hidden_index], build_block_causal_mask, DarcHead) so training == the smoke.
 #
 # Efficiency: with reveal_prior only the ACTIVE block needs the head, so after the (batched) frozen heavy
 # forward we slice h[:, bs:be] and the head runs 32 positions -- prior context already lives in h.
@@ -125,7 +125,8 @@ def main():
     p.add_argument("--gold_glob", required=True, help="JSONL shard glob, e.g. '../darc_gold/.../gold.*.jsonl'")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--block_length", type=int, default=32)
-    p.add_argument("--tap_layer", type=int, default=18)
+    p.add_argument("--tap_hidden_index", type=int, default=18,
+                   help="hidden_states index to tap == probe-plot 'L{i}'; hs[i]=decoder layer (i-1) out")
     p.add_argument("--top_k", type=int, default=5)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--micro_bsz", type=int, default=8)
@@ -162,13 +163,13 @@ def main():
     final_norm = model.model.norm
     rotary_emb = model.model.rotary_emb
     dt = embed.weight.dtype                                            # bf16
-    tap_index = args.tap_layer + 1
+    tap_index = args.tap_hidden_index                                 # direct hidden_states index (plot 'L{i}')
 
     cfg = DarcConfig(hidden_size=model.config.hidden_size, num_attention_heads=model.config.num_attention_heads,
                      num_key_value_heads=model.config.num_key_value_heads, head_dim=model.config.head_dim,
                      intermediate_size=model.config.intermediate_size, vocab_size=model.config.vocab_size,
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
-                     tap_layer=args.tap_layer, top_k=args.top_k)
+                     tap_hidden_index=args.tap_hidden_index, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
     cfg.use_fuse = False                                               # Loss-1 only -> ~50M trainable head
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16

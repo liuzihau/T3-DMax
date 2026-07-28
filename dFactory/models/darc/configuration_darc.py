@@ -22,7 +22,9 @@ class DarcConfig:
     rope_theta: float = 600000.0
 
     # --- DARC specifics ---
-    tap_layer: int = 18                   # graft after this transformer layer (0-indexed); resolved vs the probe
+    tap_hidden_index: int = 18            # hidden_states index to tap == the probe-plot "L{i}" label.
+                                          # hs[i] = output of decoder layer (i-1); hs[0]=embeddings, hs[20]=final.
+                                          # So tap_hidden_index=18 -> decoder layer 17 out (plot "L18").
     block_size: int = 32                  # diffusion block; AR chain resets at each block boundary
     top_k: int = 5                        # soft-embed top-k (start k=5)
     soft_tau: float = 1.0                 # soft-embed temperature

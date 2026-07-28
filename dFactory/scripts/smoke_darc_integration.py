@@ -3,7 +3,8 @@
 #
 # DARC integration SMOKE (real model, 1-2 prompts, NO training harness / NO FSDP). Validates the risky core
 # of the base-model integration before building train_darc.py:
-#   (A) tap index: hidden_states[tap_layer+1] is the raw output of layer `tap_layer`; the last hidden_states
+#   (A) tap index: we tap hidden_states[tap_hidden_index] directly (== plot 'L{i}'; hs[i]=decoder layer i-1 out);
+#       the last hidden_states
 #       entry is POST-final-norm -> check lm_head(hs[-1]) ~= out.logits.
 #   (B) tap signal ANCHOR: the layer-18 logit-lens recall@1 by block-position on the model's own gold should
 #       reproduce the probe (pos0 high ~0.9, decaying) -> confirms we tapped the right hidden with the right mask.
@@ -52,7 +53,8 @@ def main():
     ap.add_argument("--limit", type=int, default=2)
     ap.add_argument("--gen_length", type=int, default=256)
     ap.add_argument("--block_length", type=int, default=32)
-    ap.add_argument("--tap_layer", type=int, default=18)
+    ap.add_argument("--tap_hidden_index", type=int, default=18,
+                    help="hidden_states index to tap == probe-plot 'L{i}'; hs[i]=decoder layer (i-1) out")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -70,15 +72,16 @@ def main():
     V = int(model.config.vocab_size)
     D = int(model.config.hidden_size)
     NL = int(model.config.num_hidden_layers)
-    tap_index = args.tap_layer + 1                                 # output of layer tap_layer
+    tap_index = args.tap_hidden_index                              # direct hidden_states index (plot 'L{i}')
     dt = embed.weight.dtype
-    print(f"[smoke] layers={NL} D={D} V={V} tap_layer={args.tap_layer} -> hidden_states[{tap_index}] dtype={dt}")
+    print(f"[smoke] layers={NL} D={D} V={V} tap hidden_states[{tap_index}] "
+          f"(= decoder layer {tap_index-1} out, plot 'L{tap_index}') dtype={dt}")
 
     cfg = DarcConfig(hidden_size=D, num_attention_heads=model.config.num_attention_heads,
                      num_key_value_heads=model.config.num_key_value_heads, head_dim=model.config.head_dim,
                      intermediate_size=model.config.intermediate_size, vocab_size=V,
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
-                     tap_layer=args.tap_layer)
+                     tap_hidden_index=args.tap_hidden_index)
     setattr(cfg, "mask_token_id", MASK_ID)
     head = DarcHead(cfg).to(device=device, dtype=dt)
     head.train()

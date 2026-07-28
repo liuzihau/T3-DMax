@@ -1,7 +1,8 @@
 # Copyright 2026 University of Sydney
 # Licensed under the Apache License, Version 2.0.
 #
-# DARC head: AR refinement chain grafted after layer `tap_layer` of a frozen DMax (LLaDA2-MoE) model.
+# DARC head: AR refinement chain grafted at hidden_states[tap_hidden_index] of a frozen DMax (LLaDA2-MoE)
+# model (tap_hidden_index == probe-plot 'L{i}'; hs[i] = output of decoder layer i-1).
 # Mirrors dFactory/models/dbet/ (configuration_*.py + modeling_*.py). See ./README.md for the design.
 #
 # This file is SELF-CONTAINED (torch/nn only): the frozen backbone pieces (input embedding, lm_head,

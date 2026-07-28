@@ -103,7 +103,9 @@ dInfer/
 - [x] DARC head module — Loss-1 (`modeling_darc.py` + `configuration_darc.py`): self-conditioned
       stop-gradient AR, block-strict-causal, frozen seed/hard-embed handling; model-free self-test.
 - [ ] Base-model integration: import LLaDA2Moe pieces, cos/sin from LLaDA2MoeRotaryEmbedding, tap via
-      `heavy_forward(output_hidden_states=True)`, resolve `tap_layer` vs the probe.
+      `heavy_forward(output_hidden_states=True)`. TAP = `hidden_states[tap_hidden_index]` (== probe-plot
+      "L{i}"; hs[i] = output of decoder layer i-1). Default `tap_hidden_index=18` (plot "L18" = decoder layer
+      17 out; fwd-1 recall@1 pooled 0.358, pos0 0.85). Plan: later stack taps on hs[18], hs[19], hs[20].
 - [ ] Loss-2 (fuse -> L19+ replay) + block-parallel produce optimization.
 - [x] Integration smoke (`scripts/smoke_darc_integration.py`): tap-18 verified; reveal-prior reproduces the
       probe (avg 0.44, p0=0.95→p30=0.15) vs all-masked 0.12; head runs on real bf16, backbone frozen.
