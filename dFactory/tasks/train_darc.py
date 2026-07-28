@@ -74,71 +74,127 @@ def batched(stream, n):
         yield buf
 
 
-def replay_top(model, h, tap_index, attn, pos, cos_sin, final_norm, lm_head):
-    """Run the FROZEN top layers (model.model.layers[tap_index:]) on hidden h -> norm -> lm_head -> logits.
-    Loss-2 path: layer WEIGHTS are frozen but grad flows through h (into the trainable fuse). At init (zero-init
-    fuse -> h unchanged) this reconstructs the model's real out.logits exactly."""
-    for layer in model.model.layers[tap_index:]:
+from collections import defaultdict
+
+POS_REPORT = (0, 3, 7, 15, 31)                                    # generated-index -> reported pos 1,4,8,16,32
+
+
+def _new_acc():
+    return defaultdict(lambda: [0.0, 0, 0.0])                     # gen_idx -> [hit, count, loss_sum]
+
+
+def _bucket(acc, logits_ng, gold_ng):
+    """logits_ng [n_gen,V], gold_ng [n_gen]: accumulate hit/count/CE by generated-index (= row index)."""
+    v = gold_ng != -100
+    if not bool(v.any()):
+        return
+    ce = F.cross_entropy(logits_ng.float(), gold_ng, reduction="none", ignore_index=-100)   # [n_gen]
+    hit = (logits_ng.argmax(-1) == gold_ng).float()
+    hitc, cec, vc = hit.cpu(), ce.cpu(), v.cpu()
+    for gi in range(gold_ng.shape[0]):
+        if bool(vc[gi]):
+            a = acc[gi]; a[0] += float(hitc[gi]); a[1] += 1; a[2] += float(cec[gi])
+
+
+def _report(acc):
+    return {gi: (acc[gi][0] / acc[gi][1], acc[gi][2] / acc[gi][1]) for gi in POS_REPORT if acc.get(gi, [0, 0])[1]}
+
+
+def _fmt_pos(rep, which=0):                                       # which: 0=acc, 1=loss;  pos 1,4,8,16,32
+    return " ".join(f"{rep[gi][which]:5.2f}" if gi in rep else "    -" for gi in POS_REPORT)
+
+
+def replay_levels(model, h, tap_index, attn, pos, cos_sin):
+    """Run FROZEN top layers on h; return {level: hidden} for level = tap_index+1 .. num_layers (pre-norm).
+    Grad flows through h (into the fuse) if h requires grad; layer weights stay frozen."""
+    hs = {}
+    for k, layer in enumerate(model.model.layers[tap_index:]):
         h = layer(h, attention_mask=attn, position_ids=pos, position_embeddings=cos_sin, use_cache=False)[0]
-    return lm_head(final_norm(h))
+        hs[tap_index + k + 1] = h
+    return hs
+
+
+def replay_top(model, h, tap_index, attn, pos, cos_sin, final_norm, lm_head):   # kept for the smoke's check (D)
+    hs = replay_levels(model, h, tap_index, attn, pos, cos_sin)
+    return lm_head(final_norm(hs[max(hs)]))
 
 
 def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device,
-                    loss1_w=1.0, loss2_w=0.0):
-    """Batched frozen heavy forward on the reveal-prior noisy stream -> tap -> per-instance head on the active
-    block (Loss-1). If loss2_w>0: fuse the block's soft-embed sequence back in, replay the top layers to the
-    model's real output, and add Loss-2 (CE/acc of the FINAL tokens). Returns (loss_tensor, metrics_dict)."""
+                    loss1_w=1.0, loss2_w=0.0, val=False, collect_pos=False):
+    """Heavy forward -> tap -> per-block head (Loss-1) [+ fuse->replay->final (Loss-2)]. Returns
+    (loss, agg, accs). accs maps curve -> position accumulator; curves: train -> tap18(/tap20 if Loss-2);
+    val -> the SIX {base18,base19,base20,tap18,tap19,tap20} (base = base logit-lens, no head; tap = with head:
+    18 = AR readout=Loss-1, 20 = fuse->replay=Loss-2, 19 = fuse->replay-1-layer). Readout only at the generated
+    positions (never [N,L,V]) to stay memory-safe."""
     noisy, labels, act = batch["noisy"], batch["labels"], batch["active_bs"]
     N, L = noisy.shape
     B = cfg.block_size
     do2 = loss2_w > 0 and getattr(head, "fuse", None) is not None
-    with torch.no_grad():                                              # frozen backbone
-        attn = build_block_causal_mask(L, B, dtype=dt, device=device)  # [1,1,L,L]
-        attn = attn.expand(N, *attn.shape[1:])                         # model needs a per-batch (N,1,L,L) mask
+    L18, L19, L20 = tap_index, tap_index + 1, tap_index + 2
+    with torch.no_grad():                                          # frozen backbone
+        attn = build_block_causal_mask(L, B, dtype=dt, device=device).expand(N, 1, L, L)
         pos = torch.arange(L, device=device)[None].expand(N, L)
         out = model(input_ids=noisy, attention_mask=attn, position_ids=pos,
                     use_cache=False, output_hidden_states=True, return_dict=True)
-        h = out.hidden_states[tap_index]                              # [N,L,D]
-        cos, sin = rotary_emb(h, pos)                                 # [N,L,rot]
+        h = out.hidden_states[tap_index]                          # [N,L,D]
+        cos, sin = rotary_emb(h, pos)
 
-    loss1 = 0.0
+    want = collect_pos or val
+    curves = (["base18", "base19", "base20", "tap18", "tap19", "tap20"] if val
+              else (["tap18", "tap20"] if do2 else ["tap18"]))
+    accs = {c: _new_acc() for c in curves} if want else {}
     agg = {"loss1": 0.0, "acc1": 0.0, "n_sup": 0, "loss2": 0.0, "acc2": 0.0}
-    h2 = h.clone() if do2 else None                                  # base hidden; active blocks get fused-refined
-    spans = []
+    loss1 = 0.0
+    h2 = h.clone() if (do2 or val) else None
+    spans = []                                                    # (n, full_gen_positions[list], gold_ng)
     for n in range(N):
         bs = int(act[n]); be = bs + B
         with torch.autocast(device_type="cuda", dtype=dt):
-            l, m, soft = head.forward_train(h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
-                                            cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head,
-                                            return_soft_embeds=True)
-            if do2:
-                h2[n, bs:be] = head.fuse(soft, h[n:n + 1, bs:be])[0]  # fuse soft-embed seq back into residual
+            l, m, gen_logits, gen_pos, soft = head.forward_train(
+                h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
+                cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head, return_gen=True)
+            if (do2 or val) and gen_pos:
+                fused = head.fuse(soft, h[n:n + 1, bs:be])[0]     # [blk,D]; refine only generated (contiguous)
+                lo, hi = gen_pos[0], gen_pos[-1] + 1
+                h2[n, bs + lo:bs + hi] = fused[lo:hi]
         loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
-        spans.append((n, bs, be))
+        full_pos = [bs + p for p in gen_pos]
+        gold_ng = labels[n, full_pos] if full_pos else labels[n, 0:0]
+        spans.append((n, full_pos, gold_ng))
+        if want and gen_logits is not None:
+            _bucket(accs["tap18"], gen_logits[0], gold_ng)        # tap L18 = AR readout (== Loss-1)
     loss1 = loss1 / N
     loss = loss1_w * loss1
 
-    if do2:
+    if do2 or val:
         with torch.autocast(device_type="cuda", dtype=dt):
-            logits2 = replay_top(model, h2, tap_index, attn, pos, (cos, sin), final_norm, lm_head)  # [N,L,V]
-        V = logits2.shape[-1]
+            lv = replay_levels(model, h2, tap_index, attn, pos, (cos, sin))   # {L19:h, L20:h}
         loss2 = 0.0
-        for (n, bs, be) in spans:
-            gl = labels[n, bs:be].clone(); gl[0] = -100             # exclude the seed (rel-pos 0), like Loss-1
-            lg = logits2[n, bs:be]
-            loss2 = loss2 + F.cross_entropy(lg.float(), gl, ignore_index=-100)
+        for (n, full_pos, gold_ng) in spans:
+            if not full_pos:
+                continue
+            with torch.autocast(device_type="cuda", dtype=dt):
+                lg20 = lm_head(final_norm(lv[L20][n, full_pos])).float()      # [n_gen,V] grad
+            loss2 = loss2 + F.cross_entropy(lg20, gold_ng, ignore_index=-100)
             with torch.no_grad():
-                v = gl != -100
-                agg["acc2"] += float((lg.argmax(-1)[v] == gl[v]).float().mean()) if bool(v.any()) else 0.0
-                agg["loss2"] += float(F.cross_entropy(lg.float(), gl, ignore_index=-100).detach())
+                v = gold_ng != -100
+                agg["acc2"] += float((lg20.argmax(-1)[v] == gold_ng[v]).float().mean()) if bool(v.any()) else 0.0
+                agg["loss2"] += float(F.cross_entropy(lg20, gold_ng, ignore_index=-100).detach())
+            if want:
+                _bucket(accs["tap20"], lg20.detach(), gold_ng)
+            if val:
+                _bucket(accs["tap19"], lm_head(final_norm(lv[L19][n, full_pos])).float(), gold_ng)
+                _bucket(accs["base18"], lm_head(final_norm(h[n, full_pos])).float(), gold_ng)
+                _bucket(accs["base19"], lm_head(final_norm(out.hidden_states[L19][n, full_pos])).float(), gold_ng)
+                _bucket(accs["base20"], out.logits[n, full_pos].float(), gold_ng)
         loss2 = loss2 / N
         loss = loss + loss2_w * loss2
         agg["loss2"] /= N; agg["acc2"] /= N
 
     for k in ("loss1", "acc1"):
         agg[k] /= N
-    return loss, agg
+    return loss, agg, accs
 
 
 @torch.no_grad()
@@ -146,18 +202,24 @@ def evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm
              micro_bsz, max_batches, loss2_w=0.0):
     head.eval()
     agg = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0}
+    merged = {}
     nb = 0
     for batch in batched(instance_stream(val_records, tf, shuffle=False, seed=0), micro_bsz):
-        _, m = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
-                               lm_head, rotary_emb, dt, device, loss1_w=1.0, loss2_w=loss2_w)
+        _, m, accs = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
+                                     lm_head, rotary_emb, dt, device, loss1_w=1.0, loss2_w=loss2_w, val=True)
         for k in agg:
             agg[k] += m[k]
+        for c, acc in accs.items():
+            mc = merged.setdefault(c, _new_acc())
+            for gi, (hh, cc, ll) in acc.items():
+                a = mc[gi]; a[0] += hh; a[1] += cc; a[2] += ll
         nb += 1
         if nb >= max_batches:
             break
     head.train()
     r = {f"val_{k}": agg[k] / max(nb, 1) for k in agg}
     r["val_batches"] = nb
+    r["pos"] = {c: _report(acc) for c, acc in merged.items()}    # curve -> {gen_idx: (acc, loss)}
     return r
 
 
@@ -292,9 +354,11 @@ def main():
                 break
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
-            loss, m = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
-                                      lm_head, rotary_emb, dt, device,
-                                      loss1_w=args.loss1_weight, loss2_w=args.loss2_weight)
+            collect = ((step + 1) % args.log_every == 0)             # position-wise buckets only on log steps
+            loss, m, accs = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
+                                            lm_head, rotary_emb, dt, device,
+                                            loss1_w=args.loss1_weight, loss2_w=args.loss2_weight,
+                                            collect_pos=collect)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
             if torch.isfinite(gn):                                    # bf16 grad-spike guard (skip the step)
@@ -316,6 +380,15 @@ def main():
                 print(f"[{step}/{args.max_steps}] loss1={rec['loss1']:.4f} acc1={rec['acc1']:.3f}{extra} "
                       f"lr={rec['lr']:.2e} gn={rec['grad_norm']:.2f} {rec['ex_s']:.1f}ex/s")
                 logf.write(json.dumps({**rec, "split": "train"}) + "\n"); logf.flush()
+                if accs.get("tap18"):                                 # position-wise acc @pos 1/4/8/16/32 (this batch)
+                    r18 = _report(accs["tap18"])
+                    print(f"        L18(=loss1) acc@pos1/4/8/16/32: {_fmt_pos(r18)}")
+                    pos_rec = {"step": step, "split": "train_pos", "tap18": r18}
+                    if accs.get("tap20"):
+                        r20 = _report(accs["tap20"])
+                        print(f"        L20(=loss2) acc@pos1/4/8/16/32: {_fmt_pos(r20)}")
+                        pos_rec["tap20"] = r20
+                    logf.write(json.dumps(pos_rec) + "\n"); logf.flush()
                 running = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0, "k": 0}
 
             if args.eval_every and step % args.eval_every == 0:
@@ -325,9 +398,16 @@ def main():
                 star = ""
                 if sel > best_acc:
                     best_acc = sel; save_ckpt(step, tag="best"); star = " *best*"
-                extra = f" | val_acc2={ev['val_acc2']:.3f} (base final ~0.5)" if do2 else ""
-                print(f"[{step}] VAL acc1={ev['val_acc1']:.3f} (tap; base ~0.35 ceil ~0.76){extra}{star}  "
-                      f"skips={nonfinite}")
+                pos = ev.get("pos", {})                              # 6-way position-wise table (acc)
+                print(f"[{step}] VAL acc @pos:    1     4     8    16    32       (no-tap=base logit-lens, "
+                      f"with-tap=DARC){star} skips={nonfinite}")
+                for c in ("base18", "tap18", "base19", "tap19", "base20", "tap20"):
+                    if c in pos:
+                        tag = {"base18": "no-tap L18", "tap18": "with   L18(=loss1)",
+                               "base19": "no-tap L19", "tap19": "with   L19",
+                               "base20": "no-tap L20", "tap20": "with   L20(=loss2)"}[c]
+                        print(f"        {tag:18s} {_fmt_pos(pos[c])}")
+                print(f"        [agg] val_acc1={ev['val_acc1']:.3f} val_acc2={ev['val_acc2']:.3f}")
                 logf.write(json.dumps({"step": step, "split": "val", "best_acc": best_acc, **ev}) + "\n"); logf.flush()
 
             if args.save_every and step % args.save_every == 0:

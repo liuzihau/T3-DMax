@@ -158,7 +158,7 @@ def main():
                 # and the fuse at init is identity (zero-init) -> Loss-2 output == base final output
                 with torch.no_grad():
                     soft = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
-                                              embed, final_norm, lm_head, return_soft_embeds=True)[2]
+                                              embed, final_norm, lm_head, return_gen=True)[4]  # soft_seq
                     fused = head.fuse(soft, h_rp[:, bs:be])
                     dfuse = (fused - h_rp[:, bs:be]).abs().max().item()
                 print(f"[smoke] (D) |replay(h) - out.logits|max = {dD:.4f}  (small => faithful top-layer replay); "

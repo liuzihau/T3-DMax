@@ -170,56 +170,66 @@ class DarcHead(nn.Module):
         return lm_head(final_norm(ar_out))                   # standard logit lens (frozen)
 
     def forward_train(self, h, noisy_input_ids, labels, cos, sin, frozen_embed, final_norm, lm_head,
-                      return_soft_embeds=False):
-        """h [B,n,D] tapped hidden; noisy_input_ids/labels [B,n]; cos/sin [B,n,rot]. Returns (loss, metrics)."""
-        B = self.config.block_size
+                      return_gen=False):
+        """h [B,n,D] tapped hidden for ONE block; noisy_input_ids/labels [B,n]; cos/sin [B,n,rot].
+        Returns (loss, metrics); if return_gen: also (gen_tap_logits [B,n_gen,V], gen_pos [local idxs],
+        soft_seq [B,n,D]) -- gen ordered by generated-index g_0,g_1,... for position-wise metrics + the fuse."""
         Bsz, n, D = h.shape
-        dev = h.device
         embed_weight = frozen_embed.weight
         MASK = int(getattr(self.config, "mask_token_id", 156895))  # revealed vs masked from the noisy stream
         revealed = noisy_input_ids != MASK                   # True = a real/committed token (hard embed)
 
-        # committed soft-embeds as a LIST (index == position), stacked per step -> a FRESH kv tensor each time,
-        # so kv_proj's saved-for-backward input is never invalidated by a later in-place write.
-        s_list = []                                          # each [B,D], detached
-        ar_list, pos_list = [], []
+        # Per-position embeds for the fuse (index == position): hard for revealed, soft for generated (detached).
+        # SEED = the FIRST GENERATED token g_0 (h->LM->soft, no attn+mlp, no trainable loss). g_1+ = AR attending
+        # ONLY the generated soft-embeds so far (block-local; revealed prompt tail reaches the head via h, and
+        # is fed to the fuse as a hard embed but NOT attended). g_0 is contiguous with g_1.. since the generated
+        # region [r, be) is contiguous after the (revealed) prompt tail.
+        s_list = []                                          # each [B,D], detached  (for the fuse)
+        g0 = None                                            # local index of the first generated token (seed)
+        ar_list, ar_pos = [], []                             # AR outputs (grad) + local positions, for g_1+
+        seed_logit = None
         for i in range(n):
-            bs = (i // B) * B
-            cos_i, sin_i = cos[:, i:i + 1], sin[:, i:i + 1]
             if bool(revealed[:, i].all()):                   # (B=1 training assumed; .all() is exact then)
-                s_list.append(frozen_embed(noisy_input_ids[:, i]).detach())
+                s_list.append(frozen_embed(noisy_input_ids[:, i]).detach())        # hard embed (fuse; not attended)
                 continue
-            if i == bs:                                       # masked SEED: direct logit-lens on h_i, no loss
+            if g0 is None:                                    # g_0 = SEED: direct logit-lens on h_i, NO loss
+                g0 = i
                 with torch.no_grad():
-                    logit = self.readout(h[:, i:i + 1], final_norm, lm_head)
-                    s_list.append(self.soft_embed_topk(logit, embed_weight).squeeze(1).detach())
+                    seed_logit = self.readout(h[:, i:i + 1], final_norm, lm_head)   # [B,1,V]
+                    s_list.append(self.soft_embed_topk(seed_logit, embed_weight).squeeze(1).detach())
                 continue
-            # masked NON-SEED: grad through the head; the in-block context is a detached, freshly-stacked tensor
-            kv = torch.stack(s_list[bs:i], dim=1)            # [B, i-bs, D]
-            ar = self._ar_block(h[:, i:i + 1], kv, cos_i, sin_i, cos[:, bs:i], sin[:, bs:i])  # [B,1,D]
-            ar_list.append(ar)
-            pos_list.append(i)
+            kv = torch.stack(s_list[g0:i], dim=1)             # generated soft-embeds g_0..g_{j-1}  [B,j,D]
+            ar = self._ar_block(h[:, i:i + 1], kv, cos[:, i:i + 1], sin[:, i:i + 1],
+                                cos[:, g0:i], sin[:, g0:i])   # [B,1,D] grad
+            ar_list.append(ar); ar_pos.append(i)
             with torch.no_grad():
-                logit = self.readout(ar, final_norm, lm_head)
-                s_list.append(self.soft_embed_topk(logit, embed_weight).squeeze(1).detach())
+                s_list.append(self.soft_embed_topk(self.readout(ar, final_norm, lm_head),
+                                                   embed_weight).squeeze(1).detach())
 
-        if not ar_list:
-            loss = h.sum() * 0.0
-            metrics = {"loss1": 0.0, "n_sup": 0, "acc1": 0.0}
-        else:
-            AR = torch.cat(ar_list, dim=1)                                   # [B,nq,D]
-            logits = self.readout(AR, final_norm, lm_head)                   # [B,nq,V]
-            gold = labels[:, pos_list]                                       # [B,nq]
-            V = logits.shape[-1]
-            loss = F.cross_entropy(logits.reshape(-1, V), gold.reshape(-1), ignore_index=-100)
+        if ar_list:                                          # trainable loss = CE over g_1+ (AR positions)
+            AR = torch.cat(ar_list, dim=1)                   # [B,n_ar,D]
+            logits_ar = self.readout(AR, final_norm, lm_head)   # [B,n_ar,V] grad
+            gold_ar = labels[:, ar_pos]                      # [B,n_ar]
+            V = logits_ar.shape[-1]
+            loss = F.cross_entropy(logits_ar.reshape(-1, V), gold_ar.reshape(-1), ignore_index=-100)
             with torch.no_grad():
-                valid = gold != -100
-                pred = logits.argmax(-1)
-                acc1 = float((pred[valid] == gold[valid]).float().mean()) if bool(valid.any()) else 0.0
-            metrics = {"loss1": float(loss.detach()), "n_sup": int((gold != -100).sum()), "acc1": acc1}
-        if return_soft_embeds:
-            return loss, metrics, torch.stack(s_list, dim=1)     # [B,n,D], detached
-        return loss, metrics
+                v = gold_ar != -100
+                acc1 = float((logits_ar.argmax(-1)[v] == gold_ar[v]).float().mean()) if bool(v.any()) else 0.0
+                nsup = int(v.sum())
+        else:
+            loss = h.sum() * 0.0                             # block with only a seed (<=1 generated token)
+            logits_ar, acc1, nsup = None, 0.0, 0
+        metrics = {"loss1": float(loss.detach()), "acc1": acc1, "n_sup": nsup}
+
+        if not return_gen:
+            return loss, metrics
+        # per-GENERATED-position tap logits (g_0 seed + g_1+ AR), ordered by generated-index -> position-wise metrics
+        gen_pos = ([g0] if g0 is not None else []) + ar_pos                    # local positions g_0..g_{k-1}
+        parts = ([seed_logit] if seed_logit is not None else []) + \
+                ([logits_ar.detach()] if logits_ar is not None else [])
+        gen_tap_logits = torch.cat(parts, dim=1) if parts else None           # [B,n_gen,V] detached
+        soft_seq = torch.stack(s_list, dim=1)                                 # [B,n,D] detached (for the fuse)
+        return loss, metrics, gen_tap_logits, gen_pos, soft_seq
 
 
 # ============================================================================================================
@@ -228,54 +238,50 @@ if __name__ == "__main__":
     cfg = DarcConfig(hidden_size=64, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
                      intermediate_size=128, vocab_size=200, rotary_dim=8, block_size=8, top_k=5)
     setattr(cfg, "mask_token_id", 199)
-    D, V, n = cfg.hidden_size, cfg.vocab_size, 24          # 3 blocks of 8
-    head = DarcHead(cfg).eval()
+    D, V = cfg.hidden_size, cfg.vocab_size
+    head = DarcHead(cfg).eval()                            # note: head processes ONE block per call
     frozen_embed = nn.Embedding(V, D)
     lm_head = nn.Linear(D, V, bias=False)
     final_norm = RMSNorm(D)
     for p in list(frozen_embed.parameters()) + list(lm_head.parameters()) + list(final_norm.parameters()):
         p.requires_grad_(False)
 
-    # rope cos/sin for positions 0..n-1
-    pos = torch.arange(n).float()
-    inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.rotary_dim, 2).float() / cfg.rotary_dim))
-    fr = torch.outer(pos, inv)
-    emb = torch.cat([fr, fr], dim=-1)
-    cos, sin = emb.cos()[None], emb.sin()[None]           # [1,n,rot]
+    def rope(positions):
+        inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.rotary_dim, 2).float() / cfg.rotary_dim))
+        emb = torch.cat([torch.outer(positions.float(), inv)] * 2, dim=-1)
+        return emb.cos()[None], emb.sin()[None]
 
-    h = torch.randn(1, n, D)
-    # first block: 4 revealed (prompt) + rest masked; blocks 2,3 fully masked
-    noisy = torch.full((1, n), 199)
-    noisy[0, :4] = torch.randint(0, 190, (4,))            # revealed prompt tokens
-    labels = torch.randint(0, 190, (1, n))
-    labels[0, :4] = -100                                  # prompt: no loss
+    def run(h, noisy, labels, base_pos):
+        cos, sin = rope(base_pos)
+        return head.forward_train(h, noisy, labels, cos, sin, frozen_embed, final_norm, lm_head, return_gen=True)
 
-    loss, m, s = head.forward_train(h, noisy, labels, cos, sin, frozen_embed, final_norm, lm_head,
-                                    return_soft_embeds=True)
-    print(f"loss={float(loss.detach()):.4f}  metrics={m}")
-    assert torch.isfinite(loss), "loss must be finite (no NaN from empty attention rows)"
+    # --- FULL block (8 masked): g0=0 seed, g1..g7 AR ---
+    B = 8
+    h = torch.randn(1, B, D)
+    noisy = torch.full((1, B), 199)
+    labels = torch.randint(0, 190, (1, B))
+    loss, m, gl, gp, s = run(h, noisy, labels, torch.arange(B))
+    print(f"[full] loss={float(loss.detach()):.4f} metrics={m}")
+    assert m["n_sup"] == B - 1 and gp == list(range(B)) and gl.shape == (1, B, V)   # seed g0 + 7 AR
+    assert torch.isfinite(loss)
 
-    # supervised count == non-seed masked positions (exclude seeds at 0,8,16 and the 4 revealed)
-    seeds = {0, 8, 16}
-    exp_sup = sum(1 for i in range(n) if i not in seeds and int(noisy[0, i]) == 199)
-    assert m["n_sup"] == exp_sup, (m["n_sup"], exp_sup)
-    print(f"[seed/mask] OK  supervised={m['n_sup']} (seeds & revealed excluded)")
+    # --- PARTIAL block (3 revealed prompt + 5 masked): g0=3 (first mask) seed, g4..g7 AR ---
+    hp = torch.randn(1, B, D)
+    noisyp = torch.full((1, B), 199); noisyp[0, :3] = torch.randint(0, 190, (3,))
+    labelsp = torch.randint(0, 190, (1, B)); labelsp[0, :3] = -100
+    lp, mp, glp, gpp, sp = run(hp, noisyp, labelsp, torch.arange(B))
+    assert gpp == [3, 4, 5, 6, 7], gpp                     # g0 = first MASK token (pos 3), not rel-0
+    assert mp["n_sup"] == 4 and glp.shape == (1, 5, V)     # seed g0(pos3) + 4 AR(pos4..7); loss over the 4
+    print(f"[partial] OK  seed g0=pos{gpp[0]}  gen_pos={gpp}  n_sup={mp['n_sup']}")
 
-    # causality: perturbing h in block 3 must NOT change soft-embeds of block 1
-    h2 = h.clone(); h2[0, 20] += 5.0
+    # causality: perturbing h at a LATER generated pos must not change an earlier soft-embed
+    h2 = h.clone(); h2[0, 6] += 5.0
     with torch.no_grad():
-        _, _, s2 = head.forward_train(h2, noisy, labels, cos, sin, frozen_embed, final_norm, lm_head,
-                                      return_soft_embeds=True)
-    assert torch.allclose(s[0, :8], s2[0, :8], atol=1e-5), "cross-block leakage: block1 changed by block3"
-    # within block: perturbing a LATER position must not change an earlier soft-embed
-    h3 = h.clone(); h3[0, 14] += 5.0
-    with torch.no_grad():
-        _, _, s3 = head.forward_train(h3, noisy, labels, cos, sin, frozen_embed, final_norm, lm_head,
-                                      return_soft_embeds=True)
-    assert torch.allclose(s[0, :10], s3[0, :10], atol=1e-5), "acausal: earlier pos changed by a later pos"
-    print("[causality] OK  no cross-block / no future leakage")
+        _, _, _, _, s2 = run(h2, noisy, labels, torch.arange(B))
+    assert torch.allclose(s[0, :5], s2[0, :5], atol=1e-5), "acausal: earlier soft-embed changed by a later pos"
+    print("[causality] OK  no future leakage")
 
-    # grad flows to head params, not to frozen backbone
+    # grad -> head params, not the frozen backbone
     loss.backward()
     assert head.attention.q_proj.weight.grad is not None and head.mlp.down_proj.weight.grad is not None
     assert lm_head.weight.grad is None and frozen_embed.weight.grad is None
