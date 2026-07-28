@@ -74,12 +74,24 @@ def batched(stream, n):
         yield buf
 
 
-def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device):
+def replay_top(model, h, tap_index, attn, pos, cos_sin, final_norm, lm_head):
+    """Run the FROZEN top layers (model.model.layers[tap_index:]) on hidden h -> norm -> lm_head -> logits.
+    Loss-2 path: layer WEIGHTS are frozen but grad flows through h (into the trainable fuse). At init (zero-init
+    fuse -> h unchanged) this reconstructs the model's real out.logits exactly."""
+    for layer in model.model.layers[tap_index:]:
+        h = layer(h, attention_mask=attn, position_ids=pos, position_embeddings=cos_sin, use_cache=False)[0]
+    return lm_head(final_norm(h))
+
+
+def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device,
+                    loss1_w=1.0, loss2_w=0.0):
     """Batched frozen heavy forward on the reveal-prior noisy stream -> tap -> per-instance head on the active
-    block. Returns (loss_tensor, metrics_dict)."""
+    block (Loss-1). If loss2_w>0: fuse the block's soft-embed sequence back in, replay the top layers to the
+    model's real output, and add Loss-2 (CE/acc of the FINAL tokens). Returns (loss_tensor, metrics_dict)."""
     noisy, labels, act = batch["noisy"], batch["labels"], batch["active_bs"]
     N, L = noisy.shape
     B = cfg.block_size
+    do2 = loss2_w > 0 and getattr(head, "fuse", None) is not None
     with torch.no_grad():                                              # frozen backbone
         attn = build_block_causal_mask(L, B, dtype=dt, device=device)  # [1,1,L,L]
         attn = attn.expand(N, *attn.shape[1:])                         # model needs a per-batch (N,1,L,L) mask
@@ -88,16 +100,42 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
                     use_cache=False, output_hidden_states=True, return_dict=True)
         h = out.hidden_states[tap_index]                              # [N,L,D]
         cos, sin = rotary_emb(h, pos)                                 # [N,L,rot]
-    loss = 0.0
-    agg = {"loss1": 0.0, "acc1": 0.0, "n_sup": 0}
+
+    loss1 = 0.0
+    agg = {"loss1": 0.0, "acc1": 0.0, "n_sup": 0, "loss2": 0.0, "acc2": 0.0}
+    h2 = h.clone() if do2 else None                                  # base hidden; active blocks get fused-refined
+    spans = []
     for n in range(N):
         bs = int(act[n]); be = bs + B
         with torch.autocast(device_type="cuda", dtype=dt):
-            l, m = head.forward_train(h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
-                                      cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head)
-        loss = loss + l
+            l, m, soft = head.forward_train(h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
+                                            cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head,
+                                            return_soft_embeds=True)
+            if do2:
+                h2[n, bs:be] = head.fuse(soft, h[n:n + 1, bs:be])[0]  # fuse soft-embed seq back into residual
+        loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
-    loss = loss / N
+        spans.append((n, bs, be))
+    loss1 = loss1 / N
+    loss = loss1_w * loss1
+
+    if do2:
+        with torch.autocast(device_type="cuda", dtype=dt):
+            logits2 = replay_top(model, h2, tap_index, attn, pos, (cos, sin), final_norm, lm_head)  # [N,L,V]
+        V = logits2.shape[-1]
+        loss2 = 0.0
+        for (n, bs, be) in spans:
+            gl = labels[n, bs:be].clone(); gl[0] = -100             # exclude the seed (rel-pos 0), like Loss-1
+            lg = logits2[n, bs:be]
+            loss2 = loss2 + F.cross_entropy(lg.float(), gl, ignore_index=-100)
+            with torch.no_grad():
+                v = gl != -100
+                agg["acc2"] += float((lg.argmax(-1)[v] == gl[v]).float().mean()) if bool(v.any()) else 0.0
+                agg["loss2"] += float(F.cross_entropy(lg.float(), gl, ignore_index=-100).detach())
+        loss2 = loss2 / N
+        loss = loss + loss2_w * loss2
+        agg["loss2"] /= N; agg["acc2"] /= N
+
     for k in ("loss1", "acc1"):
         agg[k] /= N
     return loss, agg
@@ -105,17 +143,22 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
 
 @torch.no_grad()
 def evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device,
-             micro_bsz, max_batches):
+             micro_bsz, max_batches, loss2_w=0.0):
     head.eval()
-    tl, ta, nb = 0.0, 0.0, 0
+    agg = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0}
+    nb = 0
     for batch in batched(instance_stream(val_records, tf, shuffle=False, seed=0), micro_bsz):
         _, m = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
-                               lm_head, rotary_emb, dt, device)
-        tl += m["loss1"]; ta += m["acc1"]; nb += 1
+                               lm_head, rotary_emb, dt, device, loss1_w=1.0, loss2_w=loss2_w)
+        for k in agg:
+            agg[k] += m[k]
+        nb += 1
         if nb >= max_batches:
             break
     head.train()
-    return {"val_loss": tl / max(nb, 1), "val_acc1": ta / max(nb, 1), "val_batches": nb}
+    r = {f"val_{k}": agg[k] / max(nb, 1) for k in agg}
+    r["val_batches"] = nb
+    return r
 
 
 def main():
@@ -131,6 +174,9 @@ def main():
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--micro_bsz", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--loss1_weight", type=float, default=1.0, help="AR tap-readout CE (trains attn+mlp)")
+    p.add_argument("--loss2_weight", type=float, default=1.0,
+                   help="fused->L{tap..}->final-output CE (trains the fuse); 0 = Loss-1 only (~50M head)")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=100)
@@ -171,7 +217,7 @@ def main():
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
                      tap_hidden_index=args.tap_hidden_index, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
-    cfg.use_fuse = False                                               # Loss-1 only -> ~50M trainable head
+    cfg.use_fuse = args.loss2_weight > 0                               # build the fuse only if Loss-2 is on
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
     n_params = sum(p.numel() for p in head.parameters())
@@ -235,9 +281,10 @@ def main():
         print(f"[train] resumed from {_ckpts()[-1]} at step {step} (best_acc={best_acc:.3f})")
 
     t0 = time.time()
-    running = {"loss1": 0.0, "acc1": 0.0, "k": 0}
+    running = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0, "k": 0}
     nonfinite = 0
     epoch = 0
+    do2 = args.loss2_weight > 0
     while step < args.max_steps:
         stream = instance_stream(train_records, tf, shuffle=True, seed=args.seed + epoch)
         for batch in batched(stream, args.micro_bsz):
@@ -246,7 +293,8 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
             loss, m = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
-                                      lm_head, rotary_emb, dt, device)
+                                      lm_head, rotary_emb, dt, device,
+                                      loss1_w=args.loss1_weight, loss2_w=args.loss2_weight)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
             if torch.isfinite(gn):                                    # bf16 grad-spike guard (skip the step)
@@ -255,26 +303,31 @@ def main():
                 nonfinite += 1
             opt.zero_grad(set_to_none=True)
             step += 1
-            running["loss1"] += m["loss1"]; running["acc1"] += m["acc1"]; running["k"] += 1
+            for kk in ("loss1", "acc1", "loss2", "acc2"):
+                running[kk] += m[kk]
+            running["k"] += 1
 
             if step % args.log_every == 0:
                 k = running["k"]
-                rec = {"step": step, "lr": lr_at(step), "loss": running["loss1"] / k,
-                       "acc1": running["acc1"] / k, "grad_norm": float(gn),
-                       "ex_s": (step * args.micro_bsz) / (time.time() - t0)}
-                print(f"[{step}/{args.max_steps}] loss={rec['loss']:.4f} acc1={rec['acc1']:.3f} "
+                rec = {"step": step, "lr": lr_at(step), "loss1": running["loss1"] / k,
+                       "acc1": running["acc1"] / k, "loss2": running["loss2"] / k, "acc2": running["acc2"] / k,
+                       "grad_norm": float(gn), "ex_s": (step * args.micro_bsz) / (time.time() - t0)}
+                extra = f" | loss2={rec['loss2']:.4f} acc2={rec['acc2']:.3f}" if do2 else ""
+                print(f"[{step}/{args.max_steps}] loss1={rec['loss1']:.4f} acc1={rec['acc1']:.3f}{extra} "
                       f"lr={rec['lr']:.2e} gn={rec['grad_norm']:.2f} {rec['ex_s']:.1f}ex/s")
                 logf.write(json.dumps({**rec, "split": "train"}) + "\n"); logf.flush()
-                running = {"loss1": 0.0, "acc1": 0.0, "k": 0}
+                running = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0, "k": 0}
 
             if args.eval_every and step % args.eval_every == 0:
                 ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
-                              rotary_emb, dt, device, args.micro_bsz, args.eval_batches)
+                              rotary_emb, dt, device, args.micro_bsz, args.eval_batches, loss2_w=args.loss2_weight)
+                sel = ev["val_acc2"] if do2 else ev["val_acc1"]      # best tracks the FINAL-output acc when Loss-2 on
                 star = ""
-                if ev["val_acc1"] > best_acc:
-                    best_acc = ev["val_acc1"]; save_ckpt(step, tag="best"); star = " *best*"
-                print(f"[{step}] VAL loss={ev['val_loss']:.4f} acc1={ev['val_acc1']:.3f}{star} "
-                      f"(base ~0.35, ceiling ~0.76)  skips={nonfinite}")
+                if sel > best_acc:
+                    best_acc = sel; save_ckpt(step, tag="best"); star = " *best*"
+                extra = f" | val_acc2={ev['val_acc2']:.3f} (base final ~0.5)" if do2 else ""
+                print(f"[{step}] VAL acc1={ev['val_acc1']:.3f} (tap; base ~0.35 ceil ~0.76){extra}{star}  "
+                      f"skips={nonfinite}")
                 logf.write(json.dumps({"step": step, "split": "val", "best_acc": best_acc, **ev}) + "\n"); logf.flush()
 
             if args.save_every and step % args.save_every == 0:
@@ -283,9 +336,10 @@ def main():
 
     # final eval + save
     ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
-                  rotary_emb, dt, device, args.micro_bsz, args.eval_batches)
-    if ev["val_acc1"] > best_acc:
-        best_acc = ev["val_acc1"]; save_ckpt(step, tag="best")
+                  rotary_emb, dt, device, args.micro_bsz, args.eval_batches, loss2_w=args.loss2_weight)
+    sel = ev["val_acc2"] if do2 else ev["val_acc1"]
+    if sel > best_acc:
+        best_acc = sel; save_ckpt(step, tag="best")
     save_ckpt(step, tag="final")
     logf.write(json.dumps({"step": step, "split": "val_final", "best_acc": best_acc, **ev}) + "\n"); logf.close()
     print(f"[done] {step} steps in {(time.time()-t0)/60:.1f}m  final VAL acc1={ev['val_acc1']:.3f} "

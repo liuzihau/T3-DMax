@@ -128,7 +128,7 @@ def main():
         for bs in range(first, ge, B):
             be = min(bs + B, ge)
             noisy_rp = gold.clone(); noisy_rp[bs:] = MASK_ID
-            h_rp, top1_rp, _ = tap_top1(noisy_rp[None], pos_ids, attn)
+            h_rp, top1_rp, out_rp = tap_top1(noisy_rp[None], pos_ids, attn)
             for p in range(bs, be):
                 t = int(rel[p]); hit_rp[t] += float(top1_rp[p] == gold[p]); cnt_rp[t] += 1
 
@@ -146,6 +146,23 @@ def main():
                       f"backbone_frozen={lm_head.weight.grad is None}")
                 head.zero_grad(set_to_none=True)
                 assert torch.isfinite(loss)
+
+                # (D) Loss-2 top-layer replay faithfulness: running layers[tap_index:] -> norm -> lm_head on the
+                # SAME tapped hidden must reconstruct the model's real out.logits (validates the replay path).
+                import sys as _sys
+                _sys.path.insert(0, os.path.join(_T3, "dFactory", "tasks"))
+                from train_darc import replay_top                       # noqa: E402
+                with torch.no_grad():
+                    lg = replay_top(model, h_rp, tap_index, attn, pos_ids, (cos, sin), final_norm, lm_head)
+                    dD = (lg.float() - out_rp.logits.float()).abs().max().item()
+                # and the fuse at init is identity (zero-init) -> Loss-2 output == base final output
+                with torch.no_grad():
+                    soft = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
+                                              embed, final_norm, lm_head, return_soft_embeds=True)[2]
+                    fused = head.fuse(soft, h_rp[:, bs:be])
+                    dfuse = (fused - h_rp[:, bs:be]).abs().max().item()
+                print(f"[smoke] (D) |replay(h) - out.logits|max = {dD:.4f}  (small => faithful top-layer replay); "
+                      f"|fuse(init) - h|max = {dfuse:.4f} (0 => zero-init fuse == identity)")
                 did_head = True
 
     def curve(hit, cnt):

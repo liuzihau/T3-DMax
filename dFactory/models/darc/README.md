@@ -111,5 +111,10 @@ dInfer/
       probe (avg 0.44, p0=0.95→p30=0.15) vs all-masked 0.12; head runs on real bf16, backbone frozen.
 - [x] Single-GPU first-trial trainer (`tasks/train_darc.py`): frozen backbone + Loss-1 head, reveal-prior
       data, deterministic rank-based train/val split, val acc1 vs probe baselines, head checkpoints.
-- [ ] First-trial run on 10k gold; watch val acc1 climb from ~0.23 (uncond) toward ~0.76 (clean-prefix).
-- [ ] Loss-2 (fuse->L19+) + block-parallel perf + (later) multi-GPU FSDP via the DBet harness.
+- [x] Loss-2 in the trainer: fuse the block's soft-embed sequence back into residual space (zero-init =
+      identity at init), replay the frozen top layers `model.layers[tap_hidden_index:]` -> norm -> lm_head,
+      CE/acc on the FINAL tokens (`--loss2_weight`, default 1; trains the fuse). Smoke check (D):
+      `replay(h) == out.logits` at init (faithful) and zero-init fuse == identity.
+- [ ] First-trial run on 10k gold; watch val acc1 (tap, base ~0.35 -> ~0.76) and val acc2 (final output,
+      base ~0.5 -> beat it).
+- [ ] Block-parallel head perf; dual-stream data feed (train all blocks in 1 forward); multi-GPU FSDP later.
