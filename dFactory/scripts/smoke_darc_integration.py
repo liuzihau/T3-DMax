@@ -155,14 +155,12 @@ def main():
                 with torch.no_grad():
                     lg = replay_top(model, h_rp, tap_index, attn, pos_ids, (cos, sin), final_norm, lm_head)
                     dD = (lg.float() - out_rp.logits.float()).abs().max().item()
-                # and the fuse at init is identity (zero-init) -> Loss-2 output == base final output
-                with torch.no_grad():
-                    soft = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
-                                              embed, final_norm, lm_head, return_gen=True)[4]  # soft_seq
-                    fused = head.fuse(soft, h_rp[:, bs:be])
-                    dfuse = (fused - h_rp[:, bs:be]).abs().max().item()
-                print(f"[smoke] (D) |replay(h) - out.logits|max = {dD:.4f}  (small => faithful top-layer replay); "
-                      f"|fuse(init) - h|max = {dfuse:.4f} (0 => zero-init fuse == identity)")
+                    # at init (zero-init AR block) ar_out == h -> Loss-2 injection is identity -> == base final
+                    _, _, _, gpos, ar_out = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
+                                                               embed, final_norm, lm_head, return_gen=True)
+                    d_ar = (ar_out[0] - h_rp[0, gpos]).abs().max().item() if gpos else 0.0
+                print(f"[smoke] (D) |replay(h) - out.logits|max = {dD:.4f}  (faithful replay); "
+                      f"|ar_out(init) - h|max = {d_ar:.4f}  (0 => zero-init AR == identity)")
                 did_head = True
 
     def curve(hit, cnt):

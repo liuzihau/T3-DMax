@@ -173,7 +173,8 @@ class DarcHead(nn.Module):
                       return_gen=False):
         """h [B,n,D] tapped hidden for ONE block; noisy_input_ids/labels [B,n]; cos/sin [B,n,rot].
         Returns (loss, metrics); if return_gen: also (gen_tap_logits [B,n_gen,V], gen_pos [local idxs],
-        soft_seq [B,n,D]) -- gen ordered by generated-index g_0,g_1,... for position-wise metrics + the fuse."""
+        ar_out_seq [B,n_gen,D]) -- gen ordered by generated-index g_0,g_1,... . ar_out_seq is the AR block's
+        refined hidden per generated position (g_0=h), injected as the new hs[tap] for Loss-2 (grad -> head)."""
         Bsz, n, D = h.shape
         embed_weight = frozen_embed.weight
         MASK = int(getattr(self.config, "mask_token_id", 156895))  # revealed vs masked from the noisy stream
@@ -228,8 +229,11 @@ class DarcHead(nn.Module):
         parts = ([seed_logit] if seed_logit is not None else []) + \
                 ([logits_ar.detach()] if logits_ar is not None else [])
         gen_tap_logits = torch.cat(parts, dim=1) if parts else None           # [B,n_gen,V] detached
-        soft_seq = torch.stack(s_list, dim=1)                                 # [B,n,D] detached (for the fuse)
-        return loss, metrics, gen_tap_logits, gen_pos, soft_seq
+        # ar_out sequence for the Loss-2 injection: g_0 -> h (base, seed unrefined); g_1+ -> AR block output
+        # (grad, NOT detached, so Loss-2 trains attn+mlp). At init (zero-init AR) ar_out == h -> identity.
+        ar_parts = ([h[:, g0:g0 + 1]] if g0 is not None else []) + ar_list
+        ar_out_seq = torch.cat(ar_parts, dim=1) if ar_parts else None         # [B,n_gen,D]
+        return loss, metrics, gen_tap_logits, gen_pos, ar_out_seq
 
 
 # ============================================================================================================
@@ -274,11 +278,11 @@ if __name__ == "__main__":
     assert mp["n_sup"] == 4 and glp.shape == (1, 5, V)     # seed g0(pos3) + 4 AR(pos4..7); loss over the 4
     print(f"[partial] OK  seed g0=pos{gpp[0]}  gen_pos={gpp}  n_sup={mp['n_sup']}")
 
-    # causality: perturbing h at a LATER generated pos must not change an earlier soft-embed
+    # causality: perturbing h at a LATER generated pos must not change an earlier ar_out
     h2 = h.clone(); h2[0, 6] += 5.0
     with torch.no_grad():
         _, _, _, _, s2 = run(h2, noisy, labels, torch.arange(B))
-    assert torch.allclose(s[0, :5], s2[0, :5], atol=1e-5), "acausal: earlier soft-embed changed by a later pos"
+    assert torch.allclose(s[0, :5], s2[0, :5], atol=1e-5), "acausal: earlier ar_out changed by a later pos"
     print("[causality] OK  no future leakage")
 
     # grad -> head params, not the frozen backbone

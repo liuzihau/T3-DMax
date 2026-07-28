@@ -129,7 +129,7 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     noisy, labels, act = batch["noisy"], batch["labels"], batch["active_bs"]
     N, L = noisy.shape
     B = cfg.block_size
-    do2 = loss2_w > 0 and getattr(head, "fuse", None) is not None
+    do2 = loss2_w > 0                                             # Loss-2 injects the AR block's ar_out (no fuse)
     L18, L19, L20 = tap_index, tap_index + 1, tap_index + 2
     with torch.no_grad():                                          # frozen backbone
         attn = build_block_causal_mask(L, B, dtype=dt, device=device).expand(N, 1, L, L)
@@ -150,14 +150,12 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     for n in range(N):
         bs = int(act[n]); be = bs + B
         with torch.autocast(device_type="cuda", dtype=dt):
-            l, m, gen_logits, gen_pos, soft = head.forward_train(
+            l, m, gen_logits, gen_pos, ar_out = head.forward_train(
                 h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
                 cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head, return_gen=True)
             if (do2 or val) and gen_pos:
-                fused = head.fuse(soft, h[n:n + 1, bs:be])[0]     # [blk,D]; refine only generated (contiguous)
-                lo, hi = gen_pos[0], gen_pos[-1] + 1
-                fvals.append(fused[lo:hi])                        # [n_gen,D] (grad through the fuse)
-                fni += [n] * (hi - lo); fpi += [bs + p for p in range(lo, hi)]
+                fvals.append(ar_out[0])                           # [n_gen,D]: inject the AR refined hidden
+                fni += [n] * len(gen_pos); fpi += [bs + p for p in gen_pos]  # (grad -> attn+mlp; g_0=h)
         loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
         full_pos = [bs + p for p in gen_pos]
@@ -288,7 +286,7 @@ def main():
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
                      tap_hidden_index=args.tap_hidden_index, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
-    cfg.use_fuse = args.loss2_weight > 0                               # build the fuse only if Loss-2 is on
+    cfg.use_fuse = False                                              # Loss-2 injects ar_out directly; no fuse (~50M)
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
     n_params = sum(p.numel() for p in head.parameters())
