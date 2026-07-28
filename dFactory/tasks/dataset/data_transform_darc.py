@@ -57,11 +57,12 @@ def process_darc_gold_example(
     labels, prompt_len, active_bs} (list matches the DMax MappingDataset flat-map convention).
 
     'reveal_prior' (VALIDATED first-trial setup, see dFactory/scripts/smoke_darc_integration.py): emit ONE
-    instance per generated block b -- reveal [0,bs) as committed gold (hard tokens), mask [bs, L) (block b +
-    everything after), loss on block b only. This matches the model's inference-time forward-1 (prior blocks
-    committed, current block masked); masking the WHOLE generated region instead collapses the tap signal
-    (recall avg 0.44 -> 0.12) and must not be used for training. The other modes emit ONE instance
-    (all-masked / left-to-right reveal / random) and are for reference/ablation only."""
+    instance per block that has generated tokens -- INCLUDING the partial first block (prompt tail + a few
+    generated), matching DMax (block_left_to_right_reveal masks only the maskable/generated tokens per block).
+    Reveal [0, r) as committed (r = max(bs, P), so the prompt tail stays clean), mask [r, L), loss on this
+    block's generated tokens [r, be). Matches inference forward-1 (prior committed, current block masked);
+    masking the WHOLE generated region instead collapses the tap signal (recall avg 0.44 -> 0.12). The other
+    modes emit ONE instance (all-masked / left-to-right reveal / random) and are for reference/ablation."""
     prompt_ids = list(example["prompt_ids"])
     gold_ids = list(example["gold_ids"])
     P = int(example.get("prompt_len", len(prompt_ids)))
@@ -84,14 +85,17 @@ def process_darc_gold_example(
 
     if mode == "reveal_prior":
         out = []
-        first = ((P + B - 1) // B) * B                     # first full-block boundary at/after the prompt
-        for bs in range(first, gen_end, B):                # one instance per generated block
+        first_bs = (P // B) * B                            # block CONTAINING the prompt tail (may be partial)
+        for bs in range(first_bs, gen_end, B):             # one instance per block that has generated tokens
             be = min(bs + B, gen_end)
+            r = max(bs, P)                                 # reveal boundary: prompt tail inside this block stays
+            if r >= be:                                    #   committed; skip blocks with no generated tokens
+                continue
             noisy = input_ids.clone()
-            noisy[bs:] = mask_token_id                     # reveal [0,bs) committed gold; mask block b + future
-            labels = torch.full_like(input_ids, -100)
-            labels[bs:be] = input_ids[bs:be]               # loss on block b (head skips the rel-pos-0 seed)
-            out.append(_inst(noisy, labels, active_bs=bs))
+            noisy[r:] = mask_token_id                      # reveal [0,r) committed (prompt+prior gold); mask block-b
+            labels = torch.full_like(input_ids, -100)      #   generated + future
+            labels[r:be] = input_ids[r:be]                 # loss on THIS block's generated tokens (prompt tail -100)
+            out.append(_inst(noisy, labels, active_bs=bs))  # active_bs = block start (head slices h[bs:be])
         return out
 
     # ---- single-instance reference/ablation modes ----
@@ -154,21 +158,26 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     L, BLK = 64, 16
 
-    # --- reveal_prior (first-trial default): prompt 8, gold 40 -> blocks at bs=16,32,48 ---
+    # --- reveal_prior (first-trial default): prompt 8, gold 40, block 16 ---
+    #   first_bs=(8//16)*16=0 -> blocks bs=0 (PARTIAL: prompt[0,8)+gen[8,16)), 16, 32, 48
     rec = {"prompt_ids": list(range(100, 108)), "gold_ids": list(range(200, 240)), "prompt_len": 8}
     P, gen_end = 8, 8 + 40 + 1                              # +1 appended EOS
     insts = process_darc_gold_example(rec, max_seq_len=L, block_size=BLK, mode="reveal_prior")
     bss = [int(x["active_bs"]) for x in insts]
-    assert bss == [16, 32, 48], bss                        # one instance per generated block
+    assert bss == [0, 16, 32, 48], bss                     # INCLUDES the partial first block (bs=0)
     for inst in insts:
         ii, ni, lab, bs = inst["input_ids"], inst["noisy_input_ids"], inst["labels"], int(inst["active_bs"])
-        be = min(bs + BLK, gen_end)
-        assert (ni[:bs] == ii[:bs]).all(), "reveal_prior: [0,bs) must be committed gold (revealed)"
-        assert (ni[bs:] == MASK_ID).all(), "reveal_prior: block b + future must be masked"
-        assert (lab[:bs] == -100).all() and (lab[be:] == -100).all()
-        assert (lab[bs:be] == ii[bs:be]).all(), "loss targets == gold on block b"
+        be = min(bs + BLK, gen_end); r = max(bs, P)         # reveal boundary (prompt tail stays committed)
+        assert (ni[:r] == ii[:r]).all(), "[0,r) must be committed (prompt tail clean)"
+        assert (ni[r:] == MASK_ID).all(), "this block's generated + future must be masked"
+        assert (lab[:r] == -100).all() and (lab[be:] == -100).all()
+        assert (lab[r:be] == ii[r:be]).all(), "loss on this block's generated tokens"
+    p0 = insts[0]                                           # the partial block: prompt [0,8) revealed, gen [8,16)
+    assert (p0["noisy_input_ids"][:8] == p0["input_ids"][:8]).all() and (p0["noisy_input_ids"][8:] == MASK_ID).all()
+    assert int((p0["labels"] != -100).sum()) == 8
     n_sup = sum(int((x["labels"] != -100).sum()) for x in insts)
-    print(f"[reveal_prior] OK  {len(insts)} block-instances bs={bss}  total_supervised={n_sup}")
+    assert n_sup == (gen_end - P)                           # every generated token is covered exactly once
+    print(f"[reveal_prior] OK  {len(insts)} block-instances bs={bss} (incl partial bs=0)  supervised={n_sup}")
 
     # --- all_masked (reference): whole generated region masked, single instance ---
     out = process_darc_gold_example(rec, max_seq_len=L, block_size=BLK, mode="all_masked")[0]
