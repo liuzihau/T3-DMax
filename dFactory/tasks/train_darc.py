@@ -345,9 +345,16 @@ def main():
     step = 0
     if args.resume and _ckpts():
         ck = torch.load(_ckpts()[-1], map_location=device)
-        head.load_state_dict(ck["state_dict"])
-        if "opt" in ck:
-            opt.load_state_dict(ck["opt"])
+        r = head.load_state_dict(ck["state_dict"], strict=False)   # partial: changed/new modules start fresh
+        if r.missing_keys or r.unexpected_keys:
+            print(f"[train] resume PARTIAL load: {len(r.missing_keys)} missing (start fresh, e.g. fuse), "
+                  f"{len(r.unexpected_keys)} unexpected. Optimizer state skipped.")
+        else:
+            try:
+                if "opt" in ck:
+                    opt.load_state_dict(ck["opt"])
+            except (ValueError, KeyError, RuntimeError) as e:
+                print(f"[train] resume: optimizer state not loaded ({e}); optimizer starts fresh")
         step = int(ck["step"]); best_acc = float(ck.get("best_acc", -1.0))
         print(f"[train] resumed from {_ckpts()[-1]} at step {step} (best_acc={best_acc:.3f})")
 
