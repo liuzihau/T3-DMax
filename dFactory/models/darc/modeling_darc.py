@@ -121,13 +121,15 @@ class DarcARAttention(nn.Module):
 
 
 class DarcFuse(nn.Module):
-    """[Loss-2, added later] Fuse the soft-embed sequence back into residual space, zero-init residual so the
-    L19 input == the base hidden at init (== base model). Not used by the Loss-1 forward below."""
+    """Loss-2 'soft' injection: fuse the (non-detached) top-k soft-embed + h back into residual space, zero-init
+    residual so at init the injection == the base hidden (== base model). Bigger MLP (2D -> mult*D -> D) so it
+    can map the embedding-space top-k prune into the residual manifold."""
 
     def __init__(self, config: DarcConfig):
         super().__init__()
         D = config.hidden_size
-        self.mlp = DarcGatedMLP(2 * D, config.intermediate_size, D, act=config.hidden_act,
+        inter = getattr(config, "fuse_hidden_mult", 6) * D
+        self.mlp = DarcGatedMLP(2 * D, inter, D, act=config.hidden_act,
                                 pre_norm=True, zero_init_out=True, eps=config.rms_norm_eps)
 
     def forward(self, soft_seq, h):
@@ -149,7 +151,7 @@ class DarcHead(nn.Module):
         # zero-init both block outputs -> at init ar_out == h, so readout == the base tap logit-lens and the
         # head starts AT the base model's recall and learns only the residual (DBet delta-head philosophy).
         nn.init.zeros_(self.attention.dense.weight)
-        self.fuse = DarcFuse(config) if getattr(config, "use_fuse", True) else None   # Loss-2 only
+        self.fuse = DarcFuse(config) if getattr(config, "loss2_inject", "ar_out") == "soft" else None
 
     # ---- soft-embed: top-k softmax-weighted FROZEN base embedding ----
     def soft_embed_topk(self, logits, embed_weight):

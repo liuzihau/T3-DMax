@@ -154,8 +154,14 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
                 h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
                 cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head, return_gen=True)
             if (do2 or val) and gen_pos:
-                fvals.append(ar_out[0])                           # [n_gen,D]: inject the AR refined hidden
-                fni += [n] * len(gen_pos); fpi += [bs + p for p in gen_pos]  # (grad -> attn+mlp; g_0=h)
+                if cfg.loss2_inject == "soft":                    # bigger fuse on the NON-detached top-k prune
+                    lg = head.readout(ar_out, final_norm, lm_head)          # [1,n_gen,V] grad
+                    soft_nd = head.soft_embed_topk(lg, embed.weight)        # [1,n_gen,D] grad (keeps the prune)
+                    h_gen = h[n:n + 1, [bs + p for p in gen_pos]]           # [1,n_gen,D] base hidden
+                    vals = head.fuse(soft_nd, h_gen)[0]                     # [n_gen,D] grad -> fuse AND head
+                else:                                             # "ar_out": inject the AR residual output directly
+                    vals = ar_out[0]                                        # [n_gen,D] grad -> attn+mlp (g_0=h)
+                fvals.append(vals); fni += [n] * len(gen_pos); fpi += [bs + p for p in gen_pos]
         loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
         full_pos = [bs + p for p in gen_pos]
@@ -245,7 +251,10 @@ def main():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--loss1_weight", type=float, default=1.0, help="AR tap-readout CE (trains attn+mlp)")
     p.add_argument("--loss2_weight", type=float, default=1.0,
-                   help="fused->L{tap..}->final-output CE (trains the fuse); 0 = Loss-1 only (~50M head)")
+                   help="inject->replay->final-output CE (trains the head/fuse); 0 = Loss-1 only")
+    p.add_argument("--loss2_inject", choices=["ar_out", "soft"], default="ar_out",
+                   help="ar_out = inject the AR residual output; soft = bigger fuse on non-detached top-k prune")
+    p.add_argument("--fuse_hidden_mult", type=int, default=6, help="'soft' fuse MLP: 2D -> mult*D -> D")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=100)
@@ -286,7 +295,8 @@ def main():
                      rotary_dim=getattr(model.config, "rotary_dim", 64), block_size=args.block_length,
                      tap_hidden_index=args.tap_hidden_index, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
-    cfg.use_fuse = False                                              # Loss-2 injects ar_out directly; no fuse (~50M)
+    cfg.loss2_inject = args.loss2_inject                              # "ar_out" (no fuse) | "soft" (bigger fuse)
+    cfg.fuse_hidden_mult = args.fuse_hidden_mult
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
     n_params = sum(p.numel() for p in head.parameters())
