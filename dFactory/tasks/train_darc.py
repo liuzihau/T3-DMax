@@ -261,6 +261,9 @@ def main():
     p.add_argument("--max_steps", type=int, default=4000, help="ignored if --epochs > 0")
     p.add_argument("--epochs", type=float, default=0.0, help="if >0, run this many passes over the data")
     p.add_argument("--resume", action="store_true", help="resume from the latest head_step*.pt in out_dir")
+    p.add_argument("--init_from", default=None,
+                   help="partial-load head weights from a checkpoint (fresh step/opt/schedule) -- for A/B from "
+                        "a shared Loss-1 head into different --loss2_inject / out_dir")
     p.add_argument("--keep_last", type=int, default=3, help="keep only the last N step checkpoints (+best)")
     p.add_argument("--val_frac", type=float, default=0.05)
     p.add_argument("--eval_every", type=int, default=200)
@@ -351,6 +354,11 @@ def main():
     logf = open(log_path, "a")
 
     step = 0
+    if args.init_from and not args.resume:                          # A/B: shared Loss-1 weights, fresh schedule
+        ck = torch.load(args.init_from, map_location=device)
+        r = head.load_state_dict(ck["state_dict"], strict=False)
+        print(f"[train] init_from {args.init_from}: partial load ({len(r.missing_keys)} fresh, "
+              f"{len(r.unexpected_keys)} dropped); fresh step/opt/schedule")
     if args.resume and _ckpts():
         ck = torch.load(_ckpts()[-1], map_location=device)
         r = head.load_state_dict(ck["state_dict"], strict=False)   # partial: changed/new modules start fresh
