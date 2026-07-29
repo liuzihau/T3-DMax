@@ -74,9 +74,11 @@ def run_eval(args):
     print(f"[eval] model={os.path.basename(mp)} head={ck_path} tap_index={tap} block={B} "
           f"loss2_inject={getattr(cfg,'loss2_inject','?')}")
 
+    import torch.nn.functional as Fnn
     count = np.zeros(B, dtype=np.float64)
     hit_abs = {c: np.zeros((len(K_ABS), B)) for c in CURVES}
     hit_pct = {c: np.zeros((len(K_PCT), B)) for c in CURVES}
+    cos_sum = {L: np.zeros(B) for L in ("18", "19", "20")}   # base-vs-tap post-norm hidden cosine, per position
 
     def accum(name, logits, gold, rel):                    # logits [n,V], gold [n], rel [n] block-rel positions
         gl = logits.float().gather(1, gold[:, None])
@@ -112,24 +114,35 @@ def run_eval(args):
             out = model(input_ids=noisy[None], attention_mask=attn, position_ids=pos,
                         use_cache=False, output_hidden_states=True, return_dict=True)
             hs = out.hidden_states
-            # base curves (readout at the scored generated positions)
-            accum("base18", lm_head(final_norm(hs[tap][0, r:gen_end])), gold_g, rel)
-            accum("base19", lm_head(final_norm(hs[tap + 1][0, r:gen_end])), gold_g, rel)
+            # base POST-NORM hiddens (input to lm_head) at the scored generated positions
+            bn18 = final_norm(hs[tap][0, r:gen_end])
+            bn19 = final_norm(hs[tap + 1][0, r:gen_end])
+            bn20 = hs[tap + 2][0, r:gen_end]                 # hs[20] is already post-norm
+            accum("base18", lm_head(bn18), gold_g, rel)
+            accum("base19", lm_head(bn19), gold_g, rel)
             accum("base20", out.logits[0, r:gen_end], gold_g, rel)
-            # tap curves: head on the block -> ar_out -> inject -> replay
+            # tap: head on the block -> ar_out -> inject -> replay
             cos, sin = rotary_emb(hs[tap], pos)
             with torch.autocast(device_type="cuda", dtype=dt):
                 _, _, gen_logits, gen_pos, ar_out = head.forward_train(
                     hs[tap][:, bs:be], noisy[bs:be][None], noisy[bs:be][None],
                     cos[:, bs:be], sin[:, bs:be], embed, final_norm, lm_head, return_gen=True)
-            accum("tap18", gen_logits[0, :n], gold_g, rel)  # gen_pos contiguous from (r-bs); first n are [r,gen_end)
             h2 = hs[tap].clone()
             for j, p in enumerate(gen_pos):
                 h2[0, bs + p] = ar_out[0, j]
             with torch.autocast(device_type="cuda", dtype=dt):
                 lv = replay_levels(model, h2, tap, attn, pos, (cos, sin))
-            accum("tap19", lm_head(final_norm(lv[tap + 1][0, r:gen_end])), gold_g, rel)
-            accum("tap20", lm_head(final_norm(lv[tap + 2][0, r:gen_end])), gold_g, rel)
+            tn18 = final_norm(ar_out[0, :n])                 # ar_out[:n] aligns with [r,gen_end)
+            tn19 = final_norm(lv[tap + 1][0, r:gen_end])
+            tn20 = final_norm(lv[tap + 2][0, r:gen_end])
+            accum("tap18", lm_head(tn18), gold_g, rel)
+            accum("tap19", lm_head(tn19), gold_g, rel)
+            accum("tap20", lm_head(tn20), gold_g, rel)
+            # cosine similarity: base vs tap POST-NORM hidden (pre-lm_head), per position
+            for lname, bvec, tvec in (("18", bn18, tn18), ("19", bn19, tn19), ("20", bn20, tn20)):
+                cs = Fnn.cosine_similarity(bvec.float(), tvec.float(), dim=-1).cpu().numpy()
+                for i, rr in enumerate(rel):
+                    cos_sum[lname][rr] += cs[i]
             for rr in rel:
                 count[rr] += 1
         if ridx < 3 or (ridx + 1) % 25 == 0:
@@ -137,7 +150,8 @@ def run_eval(args):
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     np.savez_compressed(args.out, count=count,
-                        **{f"abs_{c}": hit_abs[c] for c in CURVES}, **{f"pct_{c}": hit_pct[c] for c in CURVES})
+                        **{f"abs_{c}": hit_abs[c] for c in CURVES}, **{f"pct_{c}": hit_pct[c] for c in CURVES},
+                        **{f"cos_{L}": cos_sum[L] for L in ("18", "19", "20")})
     meta = dict(model=os.path.basename(mp), head_ckpt=ck_path, tap_index=tap, block_size=B, vocab=V,
                 n_examples=len(rows), K_ABS=K_ABS, K_PCT=K_PCT, task=args.task, gen_length=args.gen_length,
                 loss2_inject=getattr(cfg, "loss2_inject", "?"))
@@ -186,6 +200,23 @@ def plot(args):
     out = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_vs_base_decisionK.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out, dpi=130); print(f"[plot] -> {out}")
+
+    # cosine similarity of base-vs-tap POST-NORM hidden, by position (does the injection survive to L20?)
+    if "cos_20" in d:
+        fig2, ax2 = plt.subplots(figsize=(9, 5.5))
+        vpos = np.where(cnt > 0)[0]
+        vals = []
+        for L, c in (("18", "tab:blue"), ("19", "tab:orange"), ("20", "tab:green")):
+            cs = d[f"cos_{L}"][vpos] / cnt[vpos]
+            vals.append(cs)
+            ax2.plot(vpos + 1, cs, "-o", ms=3, color=c, label=f"L{L}")
+        mn = float(min(v.min() for v in vals)) if len(vpos) else 0.9
+        ax2.set_ylim(min(0.9, mn * 0.98), 1.001)
+        ax2.set_xlabel("in-block position (1-indexed)"); ax2.set_ylabel("cos(base hidden, tap hidden)")
+        ax2.set_title("base-vs-tap POST-NORM hidden cosine, by position\n(→1 = injection washed out; <1 = survives)")
+        ax2.grid(alpha=0.3); ax2.legend()
+        out2 = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_hidden_cossim.png")
+        fig2.tight_layout(); fig2.savefig(out2, dpi=130); print(f"[plot] -> {out2}")
 
 
 def main():
