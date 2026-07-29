@@ -21,8 +21,7 @@ import json
 import os
 import sys
 
-import numpy as np
-import torch
+import numpy as np                                             # torch imported lazily in run_eval (so --plot needs no torch)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _T3 = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -41,8 +40,9 @@ def _latest_ckpt(head_dir):
     return cks[-1] if cks else os.path.join(head_dir, "head_final.pt")
 
 
-@torch.no_grad()
 def run_eval(args):
+    import torch
+    torch.set_grad_enabled(False)                            # eval-only: no graphs (avoid OOM over many examples)
     from transformers import AutoTokenizer
     from probe_layer_readout import load_fused, decode_and_maybe_probe
     from dinfer.decoding.generate_t3d import build_block_causal_mask
@@ -150,39 +150,42 @@ def plot(args):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
     d = np.load(args.out); meta = json.load(open(os.path.splitext(args.out)[0] + "_meta.json"))
-    cnt = d["count"]; B = meta["block_size"]; Ka = meta["K_ABS"]; Kp = meta["K_PCT"]
-    pos = np.arange(B); valid = cnt > 0
+    cnt = d["count"]; Ka = meta["K_ABS"]
+    POS = [1, 2, 4, 8, 12, 16, 24, 32]                       # 1-indexed in-block positions (2 rows x 4 cols)
     colors = {"18": "tab:blue", "19": "tab:orange", "20": "tab:green"}
-
-    def rec_abs(c, ki):
-        return np.where(valid, d[f"abs_{c}"][ki] / np.maximum(cnt, 1), np.nan)
-
-    fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
-    # (1) recall@1 by in-block position: base (dashed) vs tap (solid), per layer
-    for lyr in ("18", "19", "20"):
-        ax[0].plot(pos, rec_abs("base" + lyr, 0), "--", color=colors[lyr], marker="o", ms=3, alpha=0.8,
-                   label=f"base L{lyr}")
-        ax[0].plot(pos, rec_abs("tap" + lyr, 0), "-", color=colors[lyr], marker="s", ms=3,
-                   label=f"tap L{lyr}")
-    ax[0].set_xlabel("in-block position"); ax[0].set_ylabel("recall@1"); ax[0].set_ylim(0, 1)
-    ax[0].set_title(f"recall@1 by position — base (dashed) vs DARC tap (solid)\n{meta['n_examples']} ex, "
-                    f"tap=hs[{meta['tap_index']}], inject={meta['loss2_inject']}")
-    ax[0].grid(alpha=0.3); ax[0].legend(fontsize=8, ncol=3)
-    # (2) recall@K vs K (log) at a few positions, base vs tap, L18 & L20
-    sel = [p for p in (1, 4, 8, 16) if p < B and valid[p]]
-    for p in sel:
-        ax[1].plot(Ka, [d["abs_base20"][ki, p] / max(cnt[p], 1) for ki in range(len(Ka))], "--",
-                   marker="o", ms=3, alpha=0.7, label=f"base L20 p{p}")
-        ax[1].plot(Ka, [d["abs_tap20"][ki, p] / max(cnt[p], 1) for ki in range(len(Ka))], "-",
-                   marker="s", ms=3, label=f"tap L20 p{p}")
-    ax[1].set_xscale("log"); ax[1].set_xticks(Ka); ax[1].set_xticklabels(Ka)
-    ax[1].set_xlabel("candidate-set size K (top-K)"); ax[1].set_ylabel("recall@K"); ax[1].set_ylim(0, 1.02)
-    ax[1].set_title("recall@K vs K at L20 (final): base vs tap"); ax[1].grid(alpha=0.3, which="both")
-    ax[1].legend(fontsize=7, ncol=2)
-    out = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_vs_base_recall.png")
+    fig, axes = plt.subplots(2, 4, figsize=(20, 9))
+    for idx, pp in enumerate(POS):
+        ax = axes[idx // 4][idx % 4]
+        pr = pp - 1                                          # block-relative index
+        if pr >= len(cnt) or cnt[pr] == 0:
+            ax.set_title(f"pos {pp} (no data)"); ax.axis("off"); continue
+        allv = []
+        for lyr in ("18", "19", "20"):                       # 6 lines: L{18,19,20} base (dashed) + tap (solid)
+            base = [d[f"abs_base{lyr}"][ki, pr] / cnt[pr] for ki in range(len(Ka))]
+            tapv = [d[f"abs_tap{lyr}"][ki, pr] / cnt[pr] for ki in range(len(Ka))]
+            ax.plot(Ka, base, "--o", ms=3, color=colors[lyr], alpha=0.75, label=f"L{lyr}")
+            ax.plot(Ka, tapv, "-s", ms=3, color=colors[lyr], label=f"L{lyr}+tap")
+            allv += base + tapv
+        ax.set_xscale("log"); ax.set_xticks(Ka); ax.set_xticklabels(Ka, fontsize=7)
+        mn = min([v for v in allv if v > 0] or [0.01])
+        if mn >= 0.6:                                        # crowded in 0.6-1.0 -> log-y, cut at 0.9*lowest
+            ax.set_yscale("log"); ax.set_ylim(0.9 * mn, 1.02); ax.minorticks_off()
+            ax.set_yticks([round(v, 3) for v in np.linspace(0.9 * mn, 1.0, 5)])
+            ax.yaxis.set_major_formatter(ScalarFormatter())
+        else:
+            ax.set_ylim(0, 1.02)
+        ax.set_title(f"pos {pp}", fontsize=11); ax.grid(alpha=0.3, which="both")
+        ax.set_xlabel("K (top-K)", fontsize=8); ax.set_ylabel("recall@K", fontsize=8)
+        if idx == 0:
+            ax.legend(fontsize=7, ncol=3, loc="lower right")
+    fig.suptitle(f"recall@K vs K by in-block position — base (dashed) vs +tap (solid) at L18/L19/L20   "
+                 f"[tap=hs[{meta['tap_index']}], inject={meta.get('loss2_inject')}, {meta['n_examples']} ex]",
+                 fontsize=12)
+    out = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_vs_base_decisionK.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    fig.tight_layout(); fig.savefig(out, dpi=130); print(f"[plot] -> {out}")
+    fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out, dpi=130); print(f"[plot] -> {out}")
 
 
 def main():
