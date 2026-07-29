@@ -26,9 +26,12 @@ class DarcConfig:
                                           # hs[i] = output of decoder layer (i-1); hs[0]=embeddings, hs[20]=final.
                                           # So tap_hidden_index=18 -> decoder layer 17 out (plot "L18").
     block_size: int = 32                  # diffusion block; AR chain resets at each block boundary
-    top_k: int = 5                        # soft-embed top-k (start k=5)
+    top_k: int = 5                        # soft-embed top-k (fixed k; used when dynamic_k is off / for passes >= 2)
     soft_tau: float = 1.0                 # soft-embed temperature
     hidden_act: str = "silu"
+    n_ar_passes: int = 1                  # stacked AR passes over the block (2 = pass1 -> h_ar1 -> pass2 -> h_ar2)
+    dynamic_k: bool = False               # PASS-1 only: position-dependent top-k (wider prune where uncertain)
+    k_schedule: tuple = ((4, 5), (8, 10), (16, 25), (24, 50), (32, 100))   # (pos < upper -> k); block-rel pos
 
     # --- training / freeze ---
     freeze_backbone: bool = True          # freeze everything but attn+mlp+fuse (+optional LoRA later)

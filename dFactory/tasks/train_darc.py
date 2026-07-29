@@ -246,6 +246,8 @@ def main():
     p.add_argument("--tap_hidden_index", type=int, default=18,
                    help="hidden_states index to tap == probe-plot 'L{i}'; hs[i]=decoder layer (i-1) out")
     p.add_argument("--top_k", type=int, default=5)
+    p.add_argument("--n_ar_passes", type=int, default=1, help="stacked AR passes (2 = pass1->h_ar1->pass2->h_ar2)")
+    p.add_argument("--dynamic_k", action="store_true", help="pass-1 position-dependent top-k (5/10/25/50/100)")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--micro_bsz", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -299,6 +301,7 @@ def main():
                      tap_hidden_index=args.tap_hidden_index, top_k=args.top_k)
     setattr(cfg, "mask_token_id", MASK_ID)
     cfg.loss2_inject = args.loss2_inject                              # "ar_out" (no fuse) | "soft" (bigger fuse)
+    cfg.n_ar_passes = args.n_ar_passes; cfg.dynamic_k = args.dynamic_k
     cfg.fuse_hidden_mult = args.fuse_hidden_mult
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
