@@ -140,7 +140,7 @@ def main():
                 loss, mtr = head.forward_train(h_rp, noisy_rp[None], labels[None], cos, sin,
                                                embed, final_norm, lm_head)
                 loss.backward()
-                g = head.attention.q_proj.weight.grad
+                g = head.ar_layers[0].attention.q_proj.weight.grad
                 print(f"[smoke] (C) HEAD loss={float(loss.detach()):.4f} n_sup={mtr['n_sup']} "
                       f"grad_ok={g is not None and torch.isfinite(g).all().item()} "
                       f"backbone_frozen={lm_head.weight.grad is None}")

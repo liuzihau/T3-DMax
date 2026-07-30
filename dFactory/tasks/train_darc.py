@@ -45,6 +45,8 @@ from dinfer.decoding.generate_t3d import build_block_causal_mask        # noqa: 
 from dinfer.decoding.generate_dbet import MASK_ID                       # noqa: E402
 from configuration_darc import DarcConfig                              # noqa: E402
 from modeling_darc import DarcHead                                     # noqa: E402
+from lora import (add_lora, set_lora_enabled, lora_parameters,         # noqa: E402
+                  lora_state_dict, load_lora_state)
 from data_transform_darc import process_darc_gold_example, iter_gold_records  # noqa: E402
 
 
@@ -120,7 +122,7 @@ def replay_top(model, h, tap_index, attn, pos, cos_sin, final_norm, lm_head):   
 
 
 def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device,
-                    loss1_w=1.0, loss2_w=0.0, val=False, collect_pos=False):
+                    loss1_w=1.0, loss2_w=0.0, val=False, collect_pos=False, lora_mods=None):
     """Heavy forward -> tap -> per-block head (Loss-1) [+ fuse->replay->final (Loss-2)]. Returns
     (loss, agg, accs). accs maps curve -> position accumulator; curves: train -> tap18(/tap20 if Loss-2);
     val -> the SIX {base18,base19,base20,tap18,tap19,tap20} (base = base logit-lens, no head; tap = with head:
@@ -131,6 +133,8 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
     B = cfg.block_size
     do2 = loss2_w > 0                                             # Loss-2 injects the AR block's ar_out (no fuse)
     L18, L19, L20 = tap_index, tap_index + 1, tap_index + 2
+    if lora_mods:
+        set_lora_enabled(lora_mods, False)                        # base forward = honest FROZEN baseline (no LoRA)
     with torch.no_grad():                                          # frozen backbone
         attn = build_block_causal_mask(L, B, dtype=dt, device=device).expand(N, 1, L, L)
         pos = torch.arange(L, device=device)[None].expand(N, L)
@@ -181,8 +185,12 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
                 torch.cat(fvals, dim=0))
         else:
             h2 = h.detach()
+        if lora_mods:
+            set_lora_enabled(lora_mods, True)                     # DARC replay: the LoRA-adapted layer consumes h_ar
         with torch.autocast(device_type="cuda", dtype=dt):
             lv = replay_levels(model, h2, tap_index, attn, pos, (cos, sin))   # {L19:h, L20:h}
+        if lora_mods:
+            set_lora_enabled(lora_mods, False)                    # restore OFF (default)
         loss2 = 0.0
         for (n, full_pos, gold_ng) in spans:
             if not full_pos:
@@ -212,14 +220,15 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
 
 @torch.no_grad()
 def evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head, rotary_emb, dt, device,
-             micro_bsz, max_batches, loss2_w=0.0):
+             micro_bsz, max_batches, loss2_w=0.0, lora_mods=None):
     head.eval()
     agg = {"loss1": 0.0, "acc1": 0.0, "loss2": 0.0, "acc2": 0.0}
     merged = {}
     nb = 0
     for batch in batched(instance_stream(val_records, tf, shuffle=False, seed=0), micro_bsz):
         _, m, accs = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
-                                     lm_head, rotary_emb, dt, device, loss1_w=1.0, loss2_w=loss2_w, val=True)
+                                     lm_head, rotary_emb, dt, device, loss1_w=1.0, loss2_w=loss2_w, val=True,
+                                     lora_mods=lora_mods)
         for k in agg:
             agg[k] += m[k]
         for c, acc in accs.items():
@@ -257,6 +266,12 @@ def main():
     p.add_argument("--loss2_inject", choices=["ar_out", "soft"], default="ar_out",
                    help="ar_out = inject the AR residual output; soft = bigger fuse on non-detached top-k prune")
     p.add_argument("--fuse_hidden_mult", type=int, default=6, help="'soft' fuse MLP: 2D -> mult*D -> D")
+    p.add_argument("--lora_layers", default="", help="decoder layers to LoRA-adapt for the DARC replay, e.g. "
+                   "'18' (2nd-last). '' = no LoRA (frozen replay). The last layer (19) is left frozen.")
+    p.add_argument("--lora_rank", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_lr", type=float, default=1e-5, help="separate LR for the LoRA delta (pre-trained "
+                   "layer -> smaller than the fresh head's --lr)")
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=100)
@@ -305,16 +320,32 @@ def main():
     cfg.fuse_hidden_mult = args.fuse_hidden_mult
     head = DarcHead(cfg).to(device=device, dtype=torch.float32)        # fp32 master params; forward autocasts bf16
     head.train()
+
+    # ---- optional LoRA on the DARC-replay decoder layer(s) (default: none) ----
+    # The head refines hs[tap]; the FROZEN decoder layers above it can't consume that off-distribution hidden
+    # (with-L18 > with-L19 -> the 2nd-last layer degrades it). LoRA-adapt those layer(s) so they learn to use
+    # h_ar. The base metrics forward runs LoRA-OFF (honest frozen baseline); the DARC replay runs LoRA-ON.
+    lora_mods = []
+    lora_layer_idxs = [int(x) for x in args.lora_layers.split(",") if x.strip() != ""]
+    if lora_layer_idxs:
+        lora_mods = add_lora(model, lora_layer_idxs, r=args.lora_rank, alpha=args.lora_alpha)
+        set_lora_enabled(lora_mods, False)                            # default OFF; run_micro_batch toggles it
     n_params = sum(p.numel() for p in head.parameters())
-    print(f"[train] head params={n_params/1e6:.1f}M  tap_index={tap_index} dt={dt} block={args.block_length}")
+    n_lora = sum(p.numel() for p in lora_parameters(lora_mods))
+    print(f"[train] head params={n_params/1e6:.1f}M  lora params={n_lora/1e6:.2f}M on layers={lora_layer_idxs} "
+          f"tap_index={tap_index} dt={dt} block={args.block_length}")
 
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    groups = [{"params": list(head.parameters()), "base_lr": args.lr}]
+    if lora_mods:
+        groups.append({"params": lora_parameters(lora_mods), "base_lr": args.lora_lr})
+    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    trainable = list(head.parameters()) + lora_parameters(lora_mods)  # for grad-clip
 
-    def lr_at(step):                                                  # linear warmup -> cosine to 0.1*lr
+    def lr_factor(step):                                             # linear warmup -> cosine to 0.1x (per group)
         if step < args.warmup_steps:
-            return args.lr * step / max(1, args.warmup_steps)
+            return step / max(1, args.warmup_steps)
         prog = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-        return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0))))
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
 
     # ---- data: read shards, deterministic rank-based train/val split ----
     records = list(iter_gold_records(args.gold_glob))
@@ -344,6 +375,7 @@ def main():
         name = f"head_{tag}.pt" if tag else f"head_step{step}.pt"
         path = os.path.join(args.out_dir, name)
         torch.save({"step": step, "config": vars(cfg), "state_dict": head.state_dict(),
+                    "lora": lora_state_dict(lora_mods), "lora_layers": lora_layer_idxs,
                     "opt": opt.state_dict(), "best_acc": best_acc}, path)
         if tag is None and args.keep_last > 0:                        # prune old step checkpoints
             for old in _ckpts()[:-args.keep_last]:
@@ -362,14 +394,22 @@ def main():
         head.load_state_dict(keep, strict=False)
         return len(keep), len(msd)
 
+    def _load_lora(ck):                                             # load LoRA deltas if both ckpt+run have them
+        if lora_mods and ck.get("lora"):
+            nl = load_lora_state(lora_mods, ck["lora"])
+            print(f"[train] loaded {nl} LoRA delta(s) for layers={lora_layer_idxs}")
+
     step = 0
     if args.init_from and not args.resume:                          # A/B: shared Loss-1 weights, fresh schedule
-        nk, nt = _load_head(torch.load(args.init_from, map_location=device)["state_dict"])
+        ck = torch.load(args.init_from, map_location=device)
+        nk, nt = _load_head(ck["state_dict"])
+        _load_lora(ck)
         print(f"[train] init_from {args.init_from}: loaded {nk}/{nt} tensors (rest fresh: e.g. resized/new fuse); "
               f"fresh step/opt/schedule")
     if args.resume and _ckpts():
         ck = torch.load(_ckpts()[-1], map_location=device)
         nk, nt = _load_head(ck["state_dict"])
+        _load_lora(ck)
         if nk == nt:
             try:
                 if "opt" in ck:
@@ -391,15 +431,16 @@ def main():
         for batch in batched(stream, args.micro_bsz):
             if step >= args.max_steps:
                 break
+            _f = lr_factor(step)
             for g in opt.param_groups:
-                g["lr"] = lr_at(step)
+                g["lr"] = g["base_lr"] * _f
             collect = ((step + 1) % args.log_every == 0)             # position-wise buckets only on log steps
             loss, m, accs = run_micro_batch(model, head, collate(batch, device), cfg, tap_index, embed, final_norm,
                                             lm_head, rotary_emb, dt, device,
                                             loss1_w=args.loss1_weight, loss2_w=args.loss2_weight,
-                                            collect_pos=collect)
+                                            collect_pos=collect, lora_mods=lora_mods)
             loss.backward()
-            gn = torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
+            gn = torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             if torch.isfinite(gn):                                    # bf16 grad-spike guard (skip the step)
                 opt.step()
             else:
@@ -412,7 +453,7 @@ def main():
 
             if step % args.log_every == 0:
                 k = running["k"]
-                rec = {"step": step, "lr": lr_at(step), "loss1": running["loss1"] / k,
+                rec = {"step": step, "lr": args.lr * lr_factor(step), "loss1": running["loss1"] / k,
                        "acc1": running["acc1"] / k, "loss2": running["loss2"] / k, "acc2": running["acc2"] / k,
                        "grad_norm": float(gn), "ex_s": (step * args.micro_bsz) / (time.time() - t0)}
                 extra = f" | loss2={rec['loss2']:.4f} acc2={rec['acc2']:.3f}" if do2 else ""
@@ -432,7 +473,8 @@ def main():
 
             if args.eval_every and step % args.eval_every == 0:
                 ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
-                              rotary_emb, dt, device, args.micro_bsz, args.eval_batches, loss2_w=args.loss2_weight)
+                              rotary_emb, dt, device, args.micro_bsz, args.eval_batches,
+                              loss2_w=args.loss2_weight, lora_mods=lora_mods)
                 sel = ev["val_acc2"] if do2 else ev["val_acc1"]      # best tracks the FINAL-output acc when Loss-2 on
                 star = ""
                 if sel > best_acc:
@@ -455,7 +497,8 @@ def main():
 
     # final eval + save
     ev = evaluate(model, head, val_records, tf, cfg, tap_index, embed, final_norm, lm_head,
-                  rotary_emb, dt, device, args.micro_bsz, args.eval_batches, loss2_w=args.loss2_weight)
+                  rotary_emb, dt, device, args.micro_bsz, args.eval_batches,
+                  loss2_w=args.loss2_weight, lora_mods=lora_mods)
     sel = ev["val_acc2"] if do2 else ev["val_acc1"]
     if sel > best_acc:
         best_acc = sel; save_ckpt(step, tag="best")
