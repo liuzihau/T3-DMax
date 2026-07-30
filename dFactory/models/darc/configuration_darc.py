@@ -36,9 +36,13 @@ class DarcConfig:
     # --- training / freeze ---
     freeze_backbone: bool = True          # freeze everything but attn+mlp+fuse (+optional LoRA later)
     loss2_inject: str = "ar_out"          # what to inject as the refined hs[tap] for Loss-2:
-                                          #   "ar_out" = the AR block's residual output directly (rich, no fuse)
-                                          #   "soft"   = bigger fuse on the NON-detached top-k soft-embed (keeps
-                                          #              the top-k prune; grad -> fuse AND head)
+                                          #   "ar_out"  = the AR block's residual output directly (rich, no fuse)
+                                          #   "ar_fuse" = fuse(concat[h_ar, original h_18]) -> D. Loss-1 pulls
+                                          #               h_ar toward a decode-optimized point (sheds hidden
+                                          #               info); concat w/ the untouched h_18 restores it. Fuse
+                                          #               zero-init -> == h_18 at init. Pairs with LoRA layer 18.
+                                          #   "soft"    = same fuse but on the NON-detached top-k soft-embed
+                                          #               (embedding-space, lossy; shelved -- washed out)
     fuse_hidden_mult: int = 6             # "soft" fuse MLP is 2*D -> fuse_hidden_mult*D -> D (user: 2h->6h->h)
     loss1_weight: float = 1.0             # per-position AR readout CE
     loss2_weight: float = 1.0             # fused -> L19+ CE (added later)

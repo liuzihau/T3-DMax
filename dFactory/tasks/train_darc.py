@@ -158,13 +158,15 @@ def run_micro_batch(model, head, batch, cfg, tap_index, embed, final_norm, lm_he
                 h[n:n + 1, bs:be], noisy[n:n + 1, bs:be], labels[n:n + 1, bs:be],
                 cos[n:n + 1, bs:be], sin[n:n + 1, bs:be], embed, final_norm, lm_head, return_gen=True)
             if (do2 or val) and gen_pos:
-                if cfg.loss2_inject == "soft":                    # bigger fuse on the NON-detached top-k prune
-                    lg = head.readout(ar_out, final_norm, lm_head)          # [1,n_gen,V] grad
-                    soft_nd = head.soft_embed_topk(lg, embed.weight)        # [1,n_gen,D] grad (keeps the prune)
-                    h_gen = h[n:n + 1, [bs + p for p in gen_pos]]           # [1,n_gen,D] base hidden
-                    vals = head.fuse(soft_nd, h_gen)[0]                     # [n_gen,D] grad -> fuse AND head
-                else:                                             # "ar_out": inject the AR residual output directly
+                if cfg.loss2_inject == "ar_out":                  # inject the AR residual output directly
                     vals = ar_out[0]                                        # [n_gen,D] grad -> attn+mlp (g_0=h)
+                else:                                             # fuse modes: concat [X, original h_18] -> D
+                    h_gen = h[n:n + 1, [bs + p for p in gen_pos]]          # [1,n_gen,D] the untouched tap (h_18)
+                    if cfg.loss2_inject == "ar_fuse":             # X = h_ar (hidden-space): keeps the Loss-1
+                        x = ar_out                                #   sharp decode AND, w/ h_18, restores hidden info
+                    else:                                         # "soft": X = top-k soft-embed (embedding-space)
+                        x = head.soft_embed_topk(head.readout(ar_out, final_norm, lm_head), embed.weight)
+                    vals = head.fuse(x, h_gen)[0]                          # [n_gen,D] grad -> fuse AND head
                 fvals.append(vals); fni += [n] * len(gen_pos); fpi += [bs + p for p in gen_pos]
         loss1 = loss1 + l
         agg["loss1"] += m["loss1"]; agg["acc1"] += m["acc1"]; agg["n_sup"] += m["n_sup"]
@@ -263,8 +265,9 @@ def main():
     p.add_argument("--loss1_weight", type=float, default=1.0, help="AR tap-readout CE (trains attn+mlp)")
     p.add_argument("--loss2_weight", type=float, default=1.0,
                    help="inject->replay->final-output CE (trains the head/fuse); 0 = Loss-1 only")
-    p.add_argument("--loss2_inject", choices=["ar_out", "soft"], default="ar_out",
-                   help="ar_out = inject the AR residual output; soft = bigger fuse on non-detached top-k prune")
+    p.add_argument("--loss2_inject", choices=["ar_out", "soft", "ar_fuse"], default="ar_out",
+                   help="ar_out = inject the AR residual output; ar_fuse = fuse(concat[h_ar, original h_18]) "
+                        "(hidden-space, keeps sharp decode + rich hidden); soft = fuse on non-detached top-k prune")
     p.add_argument("--fuse_hidden_mult", type=int, default=6, help="'soft' fuse MLP: 2D -> mult*D -> D")
     p.add_argument("--lora_layers", default="", help="decoder layers to LoRA-adapt for the DARC replay, e.g. "
                    "'18' (2nd-last). '' = no LoRA (frozen replay). The last layer (19) is left frozen.")

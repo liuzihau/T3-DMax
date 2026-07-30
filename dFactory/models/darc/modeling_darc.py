@@ -166,7 +166,7 @@ class DarcHead(nn.Module):
         self.config = config
         n = max(1, int(getattr(config, "n_ar_passes", 1)))
         self.ar_layers = nn.ModuleList([DarcARLayer(config) for _ in range(n)])   # stacked AR passes
-        self.fuse = DarcFuse(config) if getattr(config, "loss2_inject", "ar_out") == "soft" else None
+        self.fuse = DarcFuse(config) if getattr(config, "loss2_inject", "ar_out") in ("soft", "ar_fuse") else None
 
     def _k_at(self, pos, pass_idx):                          # PASS-1 dynamic-k by position; else fixed top_k
         if pass_idx == 0 and getattr(self.config, "dynamic_k", False):
