@@ -227,21 +227,25 @@ class DarcHead(nn.Module):
             if ar_list:                                      # next pass's queries: revealed+seed keep q_seq;
                 q_seq = torch.cat([q_seq[:, :g0 + 1], torch.cat(ar_list, dim=1)], dim=1)  # g_1+ = this pass output
 
-        if g0 is None or n - g0 <= 1:                        # no generated tokens, or only a seed -> no loss
+        if g0 is None:                                       # block fully revealed -> no generated token at all
             loss = h.sum() * 0.0
             metrics = {"loss1": 0.0, "acc1": 0.0, "n_sup": 0}
             return (loss, metrics, None, [], None) if return_gen else (loss, metrics)
 
-        gen_out = q_seq[:, g0:]                               # [B,n_gen,D] final refined (g_0 seed == h[g0])
+        gen_out = q_seq[:, g0:]                               # [B,n_gen,D] final refined (g_0 seed == h[g0]); >=1
         gen_logits = self.readout(gen_out, final_norm, lm_head)   # [B,n_gen,V]  ([:,0]=seed no-grad; [:,1:] grad)
         gold_g = labels[:, g0:]                              # [B,n_gen]
         V = gen_logits.shape[-1]
-        loss = F.cross_entropy(gen_logits[:, 1:].reshape(-1, V), gold_g[:, 1:].reshape(-1), ignore_index=-100)
-        with torch.no_grad():
-            gv = gold_g[:, 1:] != -100
-            acc1 = float((gen_logits[:, 1:].argmax(-1)[gv] == gold_g[:, 1:][gv]).float().mean()) \
-                if bool(gv.any()) else 0.0
-            nsup = int(gv.sum())
+        if gen_out.shape[1] > 1:                             # trainable CE over g_1+ (seed g_0 carries no loss)
+            loss = F.cross_entropy(gen_logits[:, 1:].reshape(-1, V), gold_g[:, 1:].reshape(-1), ignore_index=-100)
+            with torch.no_grad():
+                gv = gold_g[:, 1:] != -100
+                acc1 = float((gen_logits[:, 1:].argmax(-1)[gv] == gold_g[:, 1:][gv]).float().mean()) \
+                    if bool(gv.any()) else 0.0
+                nsup = int(gv.sum())
+        else:                                                # seed-only block (1 generated token): no g_1+ -> no
+            loss = h.sum() * 0.0                             #   trainable loss, but STILL return the seed so
+            acc1, nsup = 0.0, 0                              #   position-wise metrics / injection can score it
         metrics = {"loss1": float(loss.detach()), "acc1": acc1, "n_sup": nsup}
         if not return_gen:
             return loss, metrics
