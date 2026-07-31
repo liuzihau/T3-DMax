@@ -49,6 +49,7 @@ def run_eval(args):
     from dinfer.decoding.generate_dbet import MASK_ID
     from configuration_darc import DarcConfig
     from modeling_darc import DarcHead
+    from lora import add_lora, set_lora_enabled, load_lora_state
     from train_darc import replay_levels
     from eval_tasks import load_task
 
@@ -71,8 +72,20 @@ def run_eval(args):
     head = DarcHead(cfg).to(device=device, dtype=dt).eval()
     head.load_state_dict(ck["state_dict"], strict=False)
     B = cfg.block_size; tap = cfg.tap_hidden_index
+
+    # LoRA (if this checkpoint trained it): rebuild from the saved A/B (r, alpha inferred) and apply to the same
+    # decoder layer(s). Kept OFF by default -> the base forward is the honest FROZEN baseline; toggled ON only
+    # around the DARC replay so the tap L19/L20 curves reflect the LoRA-adapted layer (== how it was trained).
+    lora_mods = []
+    lst, llayers = ck.get("lora"), ck.get("lora_layers")
+    if lst and llayers:
+        r = int(lst[0]["A"].shape[0]); alpha = int(round(float(lst[0]["scale"]) * r))
+        lora_mods = add_lora(model, llayers, r=r, alpha=alpha)
+        load_lora_state(lora_mods, lst)
+        set_lora_enabled(lora_mods, False)
     print(f"[eval] model={os.path.basename(mp)} head={ck_path} tap_index={tap} block={B} "
-          f"loss2_inject={getattr(cfg,'loss2_inject','?')}")
+          f"n_ar_passes={getattr(cfg,'n_ar_passes',1)} dynamic_k={getattr(cfg,'dynamic_k',False)} "
+          f"loss2_inject={getattr(cfg,'loss2_inject','?')} lora_layers={llayers if lora_mods else None}")
 
     import torch.nn.functional as Fnn
     count = np.zeros(B, dtype=np.float64)
@@ -127,11 +140,24 @@ def run_eval(args):
                 _, _, gen_logits, gen_pos, ar_out = head.forward_train(
                     hs[tap][:, bs:be], noisy[bs:be][None], noisy[bs:be][None],
                     cos[:, bs:be], sin[:, bs:be], embed, final_norm, lm_head, return_gen=True)
+            # build what gets injected as the new hs[tap] -- MUST match how the head was trained (loss2_inject)
+            if cfg.loss2_inject == "ar_out":
+                inject = ar_out                                                 # [1,n_gen,D] the AR output
+            else:                                                              # fuse modes: concat [X, orig h_18]
+                h_gen = hs[tap][:, [bs + p for p in gen_pos]]
+                x = ar_out if cfg.loss2_inject == "ar_fuse" else \
+                    head.soft_embed_topk(head.readout(ar_out, final_norm, lm_head), embed.weight)
+                with torch.autocast(device_type="cuda", dtype=dt):
+                    inject = head.fuse(x, h_gen)
             h2 = hs[tap].clone()
             for j, p in enumerate(gen_pos):
-                h2[0, bs + p] = ar_out[0, j]
+                h2[0, bs + p] = inject[0, j]
+            if lora_mods:
+                set_lora_enabled(lora_mods, True)                             # replay through the LoRA-adapted layer
             with torch.autocast(device_type="cuda", dtype=dt):
                 lv = replay_levels(model, h2, tap, attn, pos, (cos, sin))
+            if lora_mods:
+                set_lora_enabled(lora_mods, False)
             tn18 = final_norm(ar_out[0, :n])                 # ar_out[:n] aligns with [r,gen_end)
             tn19 = final_norm(lv[tap + 1][0, r:gen_end])
             tn20 = final_norm(lv[tap + 2][0, r:gen_end])
@@ -154,7 +180,8 @@ def run_eval(args):
                         **{f"cos_{L}": cos_sum[L] for L in ("18", "19", "20")})
     meta = dict(model=os.path.basename(mp), head_ckpt=ck_path, tap_index=tap, block_size=B, vocab=V,
                 n_examples=len(rows), K_ABS=K_ABS, K_PCT=K_PCT, task=args.task, gen_length=args.gen_length,
-                loss2_inject=getattr(cfg, "loss2_inject", "?"))
+                loss2_inject=getattr(cfg, "loss2_inject", "?"), n_ar_passes=getattr(cfg, "n_ar_passes", 1),
+                dynamic_k=getattr(cfg, "dynamic_k", False), lora_layers=(llayers if lora_mods else None))
     with open(os.path.splitext(args.out)[0] + "_meta.json", "w") as fh:
         json.dump(meta, fh, indent=2)
     print(f"[eval] done {time.time()-t0:.0f}s -> {args.out}. Plot: python eval_tap_recall.py --plot --out {args.out}")
@@ -195,8 +222,9 @@ def plot(args):
         if idx == 0:
             ax.legend(fontsize=7, ncol=3, loc="lower right")
     fig.suptitle(f"recall@K vs K by in-block position — base (dashed) vs +tap (solid) at L18/L19/L20   "
-                 f"[tap=hs[{meta['tap_index']}], inject={meta.get('loss2_inject')}, {meta['n_examples']} ex]",
-                 fontsize=12)
+                 f"[tap=hs[{meta['tap_index']}], inject={meta.get('loss2_inject')}, "
+                 f"passes={meta.get('n_ar_passes', 1)}, lora={meta.get('lora_layers')}, {meta['n_examples']} ex]",
+                 fontsize=11)
     out = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_vs_base_decisionK.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out, dpi=130); print(f"[plot] -> {out}")
