@@ -194,6 +194,8 @@ def plot(args):
     from matplotlib.ticker import ScalarFormatter
     d = np.load(args.out); meta = json.load(open(os.path.splitext(args.out)[0] + "_meta.json"))
     cnt = d["count"]; Ka = meta["K_ABS"]
+    stem = os.path.splitext(os.path.basename(args.out))[0]      # per-npz plot names -> runs never clobber each other
+    pdir = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots")
     POS = [1, 2, 4, 8, 12, 16, 24, 32]                       # 1-indexed in-block positions (2 rows x 4 cols)
     colors = {"18": "tab:blue", "19": "tab:orange", "20": "tab:green"}
     fig, axes = plt.subplots(2, 4, figsize=(20, 9))
@@ -225,8 +227,8 @@ def plot(args):
                  f"[tap=hs[{meta['tap_index']}], inject={meta.get('loss2_inject')}, "
                  f"passes={meta.get('n_ar_passes', 1)}, lora={meta.get('lora_layers')}, {meta['n_examples']} ex]",
                  fontsize=11)
-    out = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_vs_base_decisionK.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    out = os.path.join(pdir, f"{stem}_decisionK.png")
+    os.makedirs(pdir, exist_ok=True)
     fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out, dpi=130); print(f"[plot] -> {out}")
 
     # cosine similarity of base-vs-tap POST-NORM hidden, by position (does the injection survive to L20?)
@@ -243,7 +245,7 @@ def plot(args):
         ax2.set_xlabel("in-block position (1-indexed)"); ax2.set_ylabel("cos(base hidden, tap hidden)")
         ax2.set_title("base-vs-tap POST-NORM hidden cosine, by position\n(→1 = injection washed out; <1 = survives)")
         ax2.grid(alpha=0.3); ax2.legend()
-        out2 = os.path.join(os.path.dirname(os.path.abspath(args.out)), "plots", "tap_hidden_cossim.png")
+        out2 = os.path.join(pdir, f"{stem}_cossim.png")
         fig2.tight_layout(); fig2.savefig(out2, dpi=130); print(f"[plot] -> {out2}")
 
 
