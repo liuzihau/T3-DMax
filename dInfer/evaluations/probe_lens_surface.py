@@ -191,32 +191,32 @@ def process_block(sample_idx, block_idx, bs, be, P, valid_hi, x_final, commit_st
     top_ids = np.empty((total, TOPK), dtype=TOP_IDS_DT)
     top_probs = np.empty((total, TOPK), dtype=TOP_PROBS_DT)
 
+    # hoist per-step logits to the device ONCE (otherwise they re-upload NL times each)
+    logits_dev = [lb.to(device) for lb in logits_buf]                # n_steps x [blk, V] bf16
+    logits_read_dev = logits_read.to(device) if have_read else None
     # per-step references f (final-layer log-probs), shared across layers -- precompute once
-    logf_steps = []
-    for d in range(n_steps):
-        lf = F.log_softmax(logits_buf[d].to(device).float(), dim=-1)
-        logf_steps.append(lf)                                        # [blk, V] fp32 on device
-    logf_read = F.log_softmax(logits_read.to(device).float(), dim=-1) if have_read else None
+    logf_steps = [F.log_softmax(ld.float(), dim=-1) for ld in logits_dev]   # [blk, V] fp32 each
+    logf_read = F.log_softmax(logits_read_dev.float(), dim=-1) if have_read else None
 
     r0 = 0
     for l in range(NL):
         # same-layer references: convergence step and (optional) reading forward
-        q_conv_logits = _readout(l, NL, hs_buf[d_conv][l], logits_buf[d_conv].to(device), lm_head, final_norm)
+        q_conv_logits = _readout(l, NL, hs_buf[d_conv][l], logits_dev[d_conv], lm_head, final_norm)
         logq_conv = F.log_softmax(q_conv_logits, dim=-1)             # [blk, V]
         p_conv = logq_conv.exp()
         if have_read:
-            q_read_logits = _readout(l, NL, hs_read[l], logits_read.to(device), lm_head, final_norm)
+            q_read_logits = _readout(l, NL, hs_read[l], logits_read_dev, lm_head, final_norm)
             logq_read = F.log_softmax(q_read_logits, dim=-1)
             p_read = logq_read.exp()
 
         for d in steps_iter:
             if d == D_READING:
-                logits_blk = logits_read.to(device)
+                logits_blk = logits_read_dev
                 hs_l = hs_read[l]
                 state_np = np.ones(blk, dtype=np.int8)               # clean t_c inputs by construction
                 logf = logf_read
             else:
-                logits_blk = logits_buf[d].to(device)
+                logits_blk = logits_dev[d]
                 hs_l = hs_buf[d][l]
                 state_np = (~mask_states[d]).astype(np.int8)         # 1 = clean/committed input
                 logf = logf_steps[d]
