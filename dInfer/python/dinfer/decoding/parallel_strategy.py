@@ -827,15 +827,11 @@ class FixedParallelDecoder(ParallelDecoder):
             steps,
             remasking='low_confidence',
             mask_id=126336,
-            eos_id=126081,
-            threshold=0.95,
     ):
         super().__init__(temperature, remasking, mask_id)
         self.steps = steps
         self.iter = 0
         self.mask_id = mask_id
-        self.eos_id = eos_id                # the generate wrappers read decoder.eos_id (TokenArray, early stop)
-        self.threshold = threshold          # LLaDA2.0-official overshoot: commit ALL masked slots above this
 
     def block_init(self, block_x, block_id):
         # TODO(zhengda) fix steps when distributed version changes gen length.
@@ -863,56 +859,6 @@ class FixedParallelDecoder(ParallelDecoder):
         self.iter += 1
         x[:, block_start:block_end][transfer_index] = x0[transfer_index]
         broadcast_if_needed(x.data)
-
-    def decode_uniform(self, logits, block_start, block_end, x, active_index, embedding_layer,
-                       prev_embeddings=None, iter_threshold=None, top_k=1):
-        """LLaDA2.0-OFFICIAL block decode (modeling_llada2_moe.generate) in the forward_uniform (cached/graph)
-        stack. Per step: quota = the official schedule over the FULL block_length (base+remainder-first, NOT
-        the block's mask count); commit ALL masked slots whose argmax-prob clears `threshold` if that count
-        >= quota, else the top-quota by confidence (capped at the mask count). Breakflag when the block has
-        no mask left, or on the official mid-block EOS early-exit (EOS committed with no mask before it).
-        temperature-0 greedy (argmax + its prob) — the mode of the official sampler. Always returns
-        embeddings=None so the next forward feeds HARD token ids (no soft-embed re-feed). Self-initializing:
-        the step counter resets when the block window moves or the previous block used up its `steps` (a
-        fresh block may span prompt tail, so all-mask can't be the trigger)."""
-        key = (int(block_start), int(block_end))
-        if getattr(self, "_uniform_key", None) != key or self._uniform_iter >= self.steps:
-            self._uniform_key = key
-            self._uniform_iter = 0
-        blk = x[:, block_start:block_end]
-        mask_index = (blk == self.mask_id)
-        assert mask_index.shape[1] == logits.shape[1]
-
-        L = block_end - block_start                                  # official: schedule over full block_length
-        base, rem = L // self.steps, L % self.steps
-        quota = base + (1 if self._uniform_iter < rem else 0)
-        self._uniform_iter += 1
-
-        probs = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p, x0 = probs.max(dim=-1)                                 # greedy token + its confidence
-        confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, dtype=x0_p.dtype, device=x0_p.device))
-
-        transfer_index = torch.zeros_like(mask_index)
-        high = confidence[0] > self.threshold
-        n_mask = int(mask_index.sum())
-        if int(high.sum()) >= quota:                                 # overshoot: everything above threshold
-            transfer_index[0] = high
-        else:
-            k = min(quota, n_mask)
-            if k > 0:
-                _, idx = torch.topk(confidence[0], k=k)
-                transfer_index[0, idx] = True
-        if bool(transfer_index.any()):
-            blk[transfer_index] = x0[transfer_index]
-        broadcast_if_needed(x.data)
-
-        still_mask = (blk == self.mask_id)
-        Breakflag = not bool(still_mask.any())
-        if not Breakflag:                                            # official mid-block EOS early-exit
-            eos_pos = (blk[0] == self.eos_id).nonzero(as_tuple=True)[0]
-            if eos_pos.numel() > 0 and not bool(still_mask[0, :int(eos_pos[0])].any()):
-                Breakflag = True
-        return Breakflag, None
 
 
 class HierarchyDecoder(ParallelDecoder):

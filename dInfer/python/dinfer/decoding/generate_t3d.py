@@ -372,5 +372,24 @@ def _smoke_test():
     print(f"[T3-D] answer: {text!r}")
 
 
+
+# Moved from generate_dbet.py during the DARC-branch legacy cleanup (2026-08-06):
+# the lens-surface probe needs the DMax soft-embedding without pulling the DBet stack.
+def _soft_embed(logits_sel, embed_layer, mask_id, tau, top_k):
+    """DMax soft-embedding for committed positions: softmax(logits/tau) -> top-k weighted token embeds +
+    residual*embed(MASK), renormalized to the expected norm. logits_sel [n,V] -> [n,D]. tau=1,k=1 == top-1
+    (top1_prob*embed(top1) + (1-p)*embed(MASK), renorm). Mirrors generate_t3d.build_inputs_embeds / DMax."""
+    device = logits_sel.device
+    probs = torch.softmax(logits_sel.float() / max(float(tau), 1e-6), dim=-1)
+    topk_probs, topk_idx = torch.topk(probs, top_k, dim=-1)                  # [n,k]
+    residual = (1.0 - topk_probs.sum(dim=-1, keepdim=True)).clamp(min=0.0)   # [n,1]
+    topk_emb = embed_layer(topk_idx).float()                                # [n,k,D]
+    mask_emb = embed_layer(torch.tensor([mask_id], device=device)).float()  # [1,D]
+    soft = (topk_emb * topk_probs.unsqueeze(-1)).sum(dim=1) + mask_emb * residual          # [n,D]
+    tgt = (topk_emb.norm(dim=-1) * topk_probs).sum(dim=-1, keepdim=True) + mask_emb.norm() * residual
+    soft = soft * (tgt / (soft.norm(dim=-1, keepdim=True) + 1e-6))
+    return soft.to(embed_layer.weight.dtype)
+
+
 if __name__ == "__main__":
     _smoke_test()
