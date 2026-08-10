@@ -42,23 +42,97 @@ CJK_FONTS = ["Noto Sans CJK JP", "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto S
              "Droid Sans Fallback", "Arial Unicode MS", "Microsoft YaHei", "SimHei", "PingFang SC"]
 
 
-def setup_font(user_font=None):
-    """Append a CJK-capable family to the font fallback chains (matplotlib >= 3.6 falls back per glyph,
-    so Latin text keeps its usual look and only missing glyphs come from the CJK font)."""
+FONT_URLS = [   # tried in order by --install_font (no sudo needed; lands in ~/.fonts)
+    "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+]
+_CJK_FILE_HINTS = ("cjk", "notosanssc", "notosansjp", "notosanstc", "sourcehan", "wqy", "zenhei",
+                   "microhei", "droidsansfallback", "msyh", "simhei", "pingfang", "unifont")
+
+
+def _scan_font_files():
+    """Font files on disk, including dirs matplotlib may not have indexed yet."""
+    dirs = [os.path.expanduser("~/.fonts"), os.path.expanduser("~/.local/share/fonts"),
+            "/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/Library/Fonts")]
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith((".otf", ".ttf")):     # .ttc needs an index -- skip
+                    out.append(os.path.join(root, f))
+    return out
+
+
+def install_cjk_font():
+    """Download a Noto CJK font into ~/.fonts (no sudo, no package manager). Returns the path or None."""
+    import urllib.request
+    dest_dir = os.path.expanduser("~/.fonts")
+    os.makedirs(dest_dir, exist_ok=True)
+    for url in FONT_URLS:
+        name = os.path.basename(url).replace("%5B", "[").replace("%5D", "]")
+        dest = os.path.join(dest_dir, name)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1_000_000:
+            print(f"[dash] font already present: {dest}")
+            return dest
+        try:
+            print(f"[dash] downloading {url} ...")
+            urllib.request.urlretrieve(url, dest)
+            if os.path.getsize(dest) > 1_000_000:
+                print(f"[dash] installed {dest}")
+                return dest
+            os.remove(dest)
+        except Exception as e:  # noqa: BLE001
+            print(f"[dash]   failed ({type(e).__name__}: {e})")
+    return None
+
+
+def setup_font(user_font=None, install=False):
+    """Make CJK glyphs renderable. Strategy, most reliable first:
+      1. --font NAME, if given;
+      2. a CJK font file found on disk -> registered in-process with addfont() (no font-cache dance)
+         and made the PRIMARY family (Noto CJK covers Latin too, so nothing else is lost);
+      3. a CJK family matplotlib already knows about;
+      4. optional download into ~/.fonts (--install_font).
+    Making it primary (not just a fallback) matters: per-glyph fallback needs matplotlib >= 3.6."""
     from matplotlib import font_manager
+    print(f"[dash] matplotlib {matplotlib.__version__}")
+    if install:
+        install_cjk_font()
+
+    # register any on-disk CJK files matplotlib may not have indexed
+    for path in _scan_font_files():
+        if any(h in os.path.basename(path).lower() for h in _CJK_FILE_HINTS):
+            try:
+                font_manager.fontManager.addfont(path)
+            except Exception:  # noqa: BLE001
+                pass
+
     avail = {f.name for f in font_manager.fontManager.ttflist}
-    picks = ([user_font] if user_font else []) + [f for f in CJK_FONTS if f in avail]
-    picks = [p for p in picks if p]
+    picks = [p for p in ([user_font] if user_font else []) + [f for f in CJK_FONTS if f in avail] if p]
+    if not picks:   # last resort: any registered family whose file name looked CJK
+        for f in font_manager.fontManager.ttflist:
+            if any(h in os.path.basename(getattr(f, "fname", "")).lower() for h in _CJK_FILE_HINTS):
+                picks.append(f.name)
+                break
     if picks:
         for key in ("font.sans-serif", "font.monospace"):
-            matplotlib.rcParams[key] = list(matplotlib.rcParams[key]) + picks[:2]
-        print(f"[dash] CJK fallback font: {picks[0]}")
+            rest = [x for x in matplotlib.rcParams[key] if x not in picks]
+            matplotlib.rcParams[key] = picks[:2] + rest        # PRIMARY, not just fallback
+        matplotlib.rcParams["font.family"] = "sans-serif"
+        matplotlib.rcParams["axes.unicode_minus"] = False
+        print(f"[dash] CJK font in use: {picks[0]}")
         return True
-    print("[dash] WARNING: no CJK-capable font installed -- Chinese tokens will render as boxes.\n"
-          "        fix (pick one, then re-run):\n"
-          "          pip install mplfonts && mplfonts init          # no sudo\n"
-          "          sudo apt-get install -y fonts-noto-cjk         # system-wide\n"
-          "        then clear the font cache:  rm -rf ~/.cache/matplotlib")
+    print("[dash] WARNING: no CJK-capable font found -- Chinese tokens will render as boxes.\n"
+          "        easiest fix (no sudo, downloads Noto Sans CJK into ~/.fonts):\n"
+          "          python probe_lens_dashboard.py --install_font ...   (same args as usual)\n"
+          "        alternatives:\n"
+          "          pip install mplfonts && mplfonts init\n"
+          "          sudo apt-get install -y fonts-noto-cjk\n"
+          "        then:  rm -rf ~/.cache/matplotlib\n"
+          "        to see what matplotlib can find:  --list_fonts")
     return False
 SCALARS = ["sample", "block", "d", "layer", "pos", "state", "commit_step", "delta",
            "d_conv", "t_c", "in_tok", "q_tc", "rank_tc", "entropy", "kl_f", "kl_conv", "kl_read"]
@@ -206,12 +280,22 @@ def main():
     ap.add_argument("--fontsize", type=float, default=12.5, help="cell font size")
     ap.add_argument("--header_fontsize", type=float, default=16.0, help="prompt/header font size")
     ap.add_argument("--font", default=None, help="force a font family (must cover CJK for this vocab)")
+    ap.add_argument("--install_font", action="store_true",
+                    help="download Noto Sans CJK into ~/.fonts if no CJK font is available (no sudo)")
+    ap.add_argument("--list_fonts", action="store_true", help="print the font families matplotlib sees, exit")
     ap.add_argument("--show_probs", action="store_true", help="append each token's probability")
     ap.add_argument("--dpi", type=int, default=110)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    setup_font(args.font)
+    setup_font(args.font, install=args.install_font)
+    if args.list_fonts:
+        from matplotlib import font_manager
+        names = sorted({f.name for f in font_manager.fontManager.ttflist})
+        print(f"[dash] {len(names)} families visible to matplotlib:")
+        for n in names:
+            print("   ", n)
+        return
     D = load_block(args.run_dir, args.sample, args.block)
     ctx = load_context(args.run_dir, args.sample)
     tokenizer = load_tokenizer(args.tokenizer_path)
