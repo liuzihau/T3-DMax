@@ -35,6 +35,31 @@ from matplotlib import gridspec  # noqa: E402
 
 D_READING = 999
 MASK_ID_DEFAULT = 156895
+# CJK-capable families, in preference order. This vocab contains Chinese tokens; without one of these
+# matplotlib draws tofu boxes and warns "Glyph ... missing from current font".
+CJK_FONTS = ["Noto Sans CJK JP", "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto Sans SC", "Noto Sans JP",
+             "Source Han Sans SC", "Source Han Sans", "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
+             "Droid Sans Fallback", "Arial Unicode MS", "Microsoft YaHei", "SimHei", "PingFang SC"]
+
+
+def setup_font(user_font=None):
+    """Append a CJK-capable family to the font fallback chains (matplotlib >= 3.6 falls back per glyph,
+    so Latin text keeps its usual look and only missing glyphs come from the CJK font)."""
+    from matplotlib import font_manager
+    avail = {f.name for f in font_manager.fontManager.ttflist}
+    picks = ([user_font] if user_font else []) + [f for f in CJK_FONTS if f in avail]
+    picks = [p for p in picks if p]
+    if picks:
+        for key in ("font.sans-serif", "font.monospace"):
+            matplotlib.rcParams[key] = list(matplotlib.rcParams[key]) + picks[:2]
+        print(f"[dash] CJK fallback font: {picks[0]}")
+        return True
+    print("[dash] WARNING: no CJK-capable font installed -- Chinese tokens will render as boxes.\n"
+          "        fix (pick one, then re-run):\n"
+          "          pip install mplfonts && mplfonts init          # no sudo\n"
+          "          sudo apt-get install -y fonts-noto-cjk         # system-wide\n"
+          "        then clear the font cache:  rm -rf ~/.cache/matplotlib")
+    return False
 SCALARS = ["sample", "block", "d", "layer", "pos", "state", "commit_step", "delta",
            "d_conv", "t_c", "in_tok", "q_tc", "rank_tc", "entropy", "kl_f", "kl_conv", "kl_read"]
 METRICS = {   # name -> (label, transform(df) -> value, vmax or None for auto)
@@ -176,14 +201,17 @@ def main():
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--tokenizer_path", default=None)
     ap.add_argument("--mask_id", type=int, default=MASK_ID_DEFAULT)
-    ap.add_argument("--cell_w", type=float, default=0.92)
-    ap.add_argument("--cell_h", type=float, default=0.80)
-    ap.add_argument("--fontsize", type=float, default=None, help="cell font size (default: auto-fit)")
+    ap.add_argument("--cell_w", type=float, default=None, help="inches; default: fit to the token text")
+    ap.add_argument("--cell_h", type=float, default=None, help="inches; default: fit topk lines of text")
+    ap.add_argument("--fontsize", type=float, default=12.5, help="cell font size")
+    ap.add_argument("--header_fontsize", type=float, default=16.0, help="prompt/header font size")
+    ap.add_argument("--font", default=None, help="force a font family (must cover CJK for this vocab)")
     ap.add_argument("--show_probs", action="store_true", help="append each token's probability")
     ap.add_argument("--dpi", type=int, default=110)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    setup_font(args.font)
     D = load_block(args.run_dir, args.sample, args.block)
     ctx = load_context(args.run_dir, args.sample)
     tokenizer = load_tokenizer(args.tokenizer_path)
@@ -260,13 +288,20 @@ def main():
     norm = matplotlib.colors.Normalize(vmin=0.0, vmax=max(vmax, 1e-6))
 
     # ---- figure ----
-    # auto-fit the cell font to the row budget (topk lines must fit in cell_h), then cap by cell width
-    fs_fit = 72.0 * args.cell_h / (max(args.topk, 1) * 1.28)
-    fs_width_cap = 72.0 * args.cell_w / (11.5 * 0.62)      # ~11 chars per line at monospace-ish width
-    fs_cell = args.fontsize or max(5.0, min(12.0, fs_fit, fs_width_cap))
-    fs_strip = min(fs_cell + 1.5, 12.0)
+    # ---- geometry driven by the font: cells are sized to fit their text ----
+    fs_cell = float(args.fontsize)
+    fs_strip = fs_cell + 1.0
+    n_lines_cell = max(args.topk, 1)
+    longest = 1
+    for pan in panels:
+        for cell in pan["top"].ravel():
+            if cell:
+                longest = max(longest, max(len(ln) for ln in cell.split("\n")))
+    longest = min(longest, 14)
+    cell_h = args.cell_h or (n_lines_cell * fs_cell * 1.32 / 72.0 + 0.10)
+    cell_w = args.cell_w or (max(longest + 1.5, 6.0) * fs_cell * 0.60 / 72.0)
 
-    # ---- header text (built first: its length sets the header row height) ----
+    # ---- header text (built after the width is known, so it wraps to the figure) ----
     head = (f"sample {args.sample}, block {args.block}  |  {d_conv + 1} decode forwards  |  "
             f"metric: {label}")
     if ctx is not None:
@@ -286,13 +321,16 @@ def main():
         body = ("(context json not found in this run -- re-run the probe to record the prompt; "
                 "the per-block grids below are unaffected)")
     body = body[:2000]
-    wrap_cols = 150
-    n_lines = sum(max(1, int(np.ceil(len(ln) / wrap_cols))) for ln in body.split("\n"))
-    head_h = min(6.0, 0.55 + 0.17 * n_lines)          # inches, adaptive
-
-    panel_w = nP * args.cell_w
+    panel_w = nP * cell_w
     fig_w = len(panels) * panel_w + 2.6
-    grid_h = (nL + 2) * args.cell_h
+    fs_head_body = float(args.header_fontsize)
+    fs_head_title = fs_head_body + 3.0
+    wrap_cols = max(40, int((fig_w - 0.8) * 72.0 / (fs_head_body * 0.60)))
+    n_lines = sum(max(1, int(np.ceil(len(ln) / wrap_cols))) for ln in body.split("\n"))
+    line_in = fs_head_body * 1.45 / 72.0
+    head_h = min(9.0, fs_head_title * 2.2 / 72.0 + line_in * (n_lines + 1))
+
+    grid_h = (nL + 2) * cell_h
     fig_h = head_h + grid_h + 0.9
     fig = plt.figure(figsize=(fig_w, fig_h))
     outer = gridspec.GridSpec(2, 1, height_ratios=[head_h, grid_h], hspace=0.05,
@@ -302,9 +340,10 @@ def main():
     axp.axis("off")
     wrapped = "\n".join("\n".join(ln[i:i + wrap_cols] for i in range(0, max(len(ln), 1), wrap_cols))
                         for ln in body.split("\n"))
-    axp.text(0, 1.0, head, fontsize=11, fontweight="bold", va="top", family="monospace")
-    axp.text(0, 1.0 - min(0.45, 1.2 / max(n_lines, 3)), wrapped, fontsize=8, va="top",
-             family="monospace", color="#333333")
+    title_frac = (fs_head_title * 2.0 / 72.0) / max(head_h, 1e-6)
+    axp.text(0, 1.0, head, fontsize=fs_head_title, fontweight="bold", va="top", family="monospace")
+    axp.text(0, max(0.0, 1.0 - title_frac), wrapped, fontsize=fs_head_body, va="top",
+             family="monospace", color="#333333", linespacing=1.45)
 
     inner = gridspec.GridSpecFromSubplotSpec(1, len(panels), subplot_spec=outer[1], wspace=0.035)
     for k, pan in enumerate(panels):
@@ -315,7 +354,7 @@ def main():
         ax_b = fig.add_subplot(sub[2])
 
         draw_strip(ax_t, pan["tc"], nP, "converged\nt_c" if k == 0 else "", "#e8f5e9", "#a5d6a7", fs_strip)
-        ax_t.set_title(pan["name"], fontsize=11, fontweight="bold", pad=6)
+        ax_t.set_title(pan["name"], fontsize=fs_strip + 2.0, fontweight="bold", pad=6)
 
         ax_m.imshow(pan["vals"], aspect="auto", origin="lower", cmap=cmap, norm=norm,
                     extent=[-0.5, nP - 0.5, -0.5, nL - 0.5])
@@ -323,7 +362,7 @@ def main():
         if k == 0:
             ax_m.set_yticks(range(nL))
             ax_m.set_yticklabels([str(l) for l in layers], fontsize=fs_strip)
-            ax_m.set_ylabel("layer", fontsize=10)
+            ax_m.set_ylabel("layer", fontsize=fs_strip + 1.0)
         else:
             ax_m.set_yticks([])
         for i in range(nL):
@@ -333,7 +372,7 @@ def main():
                 v = pan["vals"][i, j]
                 dark = np.isfinite(v) and norm(v) > 0.55
                 ax_m.text(j, i, pan["top"][i, j], ha="center", va="center",
-                          fontsize=fs_cell, linespacing=0.95,
+                          fontsize=fs_cell, linespacing=1.28,
                           color="#ffffff" if dark else "#1a1a1a")
         for j in range(nP + 1):
             ax_m.axvline(j - 0.5, color="#ffffff", lw=0.6)
@@ -343,13 +382,13 @@ def main():
         draw_strip(ax_b, pan["inp"], nP, "fed input" if k == 0 else "", "#e3f2fd", "#90caf9",
                    fs_strip, highlight=pan["in_masked"],
                    xticklabels=[str(p) for p in positions])
-        ax_b.set_xlabel("block position", fontsize=9)
+        ax_b.set_xlabel("block position", fontsize=fs_strip)
 
     sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
     cax = fig.add_axes([0.972, 0.06, 0.008, 0.5])
     cb = fig.colorbar(sm, cax=cax)
-    cb.set_label(label, fontsize=9)
-    cb.ax.tick_params(labelsize=8)
+    cb.set_label(label, fontsize=fs_strip)
+    cb.ax.tick_params(labelsize=fs_strip - 1.0)
 
     out = args.out or os.path.join(args.run_dir, "analysis",
                                    f"dashboard_s{args.sample}_b{args.block}_{args.metric}.png")
