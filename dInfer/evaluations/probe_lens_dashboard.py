@@ -9,8 +9,8 @@
 #   row 2 : one panel per selected denoise step (default 1, 3, 5, last). Each panel reads left to right:
 #             left strip  = the token actually FED at that position entering that step ([M] if masked)
 #             main grid   = block position (y, 0 at the top) x layer (x, first -> last); cell colour =
-#                           divergence to t_c, cell text = that layer's top-k readout tokens (the
-#                           converged token is [bracketed] when it appears)
+#                           divergence to t_c, cell text = that layer's top-k readout tokens, with the
+#                           converged token drawn in RED (dark red on pale cells, light red on dark ones)
 #             right strip = the CONVERGED token t_c for that position
 #
 # Everything comes from the npz shards written by probe_lens_surface.py; no GPU, no model.
@@ -50,6 +50,9 @@ FONT_URLS = [   # tried in order by --install_font (no sudo needed; lands in ~/.
 ]
 _CJK_FILE_HINTS = ("cjk", "notosanssc", "notosansjp", "notosanstc", "sourcehan", "wqy", "zenhei",
                    "microhei", "droidsansfallback", "msyh", "simhei", "pingfang", "unifont")
+# the converged token is drawn in red -- two steps so it stays legible on pale and on saturated cells
+TC_ON_LIGHT = "#c62828"     # dark red on a light cell
+TC_ON_DARK = "#ff8a80"      # light red on a dark cell
 
 
 def _scan_font_files():
@@ -359,13 +362,11 @@ def main():
             vals[i, j] = val_all[r]
             ids, probs = D["top_ids"][r][:args.topk], D["top_probs"][r][:args.topk]
             tc = int(D["t_c"][r])
-            lines = []
+            lines = []          # (text, is_converged_token) -- coloured per line at draw time
             for tid, pr in zip(ids, probs):
                 s = tok_str(tokenizer, tid, args.mask_id)
-                if int(tid) == tc:
-                    s = f"[{s}]"
-                lines.append(f"{s} {pr:.2f}" if args.show_probs else s)
-            top[i, j] = "\n".join(lines)
+                lines.append((f"{s} {pr:.2f}" if args.show_probs else s, int(tid) == tc))
+            top[i, j] = lines
         # strips
         tc_lab, in_lab, in_masked = [], [], []
         for p in positions:
@@ -404,7 +405,7 @@ def main():
     for pan in panels:
         for cell in pan["top"].ravel():
             if cell:
-                longest = max(longest, max(len(ln) for ln in cell.split("\n")))
+                longest = max(longest, max(len(t) for t, _ in cell))
     longest = min(longest, 14)
     cell_h = args.cell_h or (n_lines_cell * fs_cell * 1.32 / 72.0 + 0.10)
     cell_w = args.cell_w or (max(longest + 1.5, 6.0) * fs_cell * 0.60 / 72.0)
@@ -484,13 +485,19 @@ def main():
         ax_m.set_xlabel("layer  (first -> last)", fontsize=fs_strip + 1.0)
         for i in range(nL):
             for j in range(nP):
-                if pan["top"][i, j] is None:
+                cell = pan["top"][i, j]
+                if not cell:
                     continue
                 v = pan["vals"][i, j]
                 dark = np.isfinite(v) and norm(v) > 0.55
-                ax_m.text(i, j, pan["top"][i, j], ha="center", va="center",
-                          fontsize=fs_cell, linespacing=1.28,
-                          color="#ffffff" if dark else "#1a1a1a")
+                plain = "#ffffff" if dark else "#1a1a1a"
+                hit = TC_ON_DARK if dark else TC_ON_LIGHT      # the converged token, in red
+                k_lines = len(cell)
+                for idx, (txt, is_tc) in enumerate(cell):      # one text per line -> per-line colour
+                    ax_m.text(i, j - 0.5 + (idx + 0.5) / k_lines, txt,
+                              ha="center", va="center", fontsize=fs_cell,
+                              color=hit if is_tc else plain,
+                              fontweight="bold" if is_tc else "normal")
         for i in range(nL + 1):
             ax_m.axvline(i - 0.5, color="#ffffff", lw=0.6)
         for j in range(nP + 1):
