@@ -4,13 +4,14 @@
 # PER-BLOCK LENS DASHBOARD -- the zoom-in view of one (sample, block) from the lens-surface shards.
 #
 # Layout
-#   row 1 : the prompt + the generated prefix leading into this block (plain text)
-#   row 2 : one panel per selected denoise step (default 1, 3, 5, last). Each panel is
-#             top strip   = the CONVERGED token t_c per block position
-#             main grid   = layer (y) x block position (x); cell colour = divergence to t_c,
-#                           cell text = that layer's top-k readout tokens (the converged token
-#                           is [bracketed] when it appears)
-#             bottom strip= the token actually FED at that position entering that step ([MASK] if masked)
+#   row 1 : the prompt + the generated prefix into this block, REPEATED above every panel so it stays
+#           in view whichever panel you are reading
+#   row 2 : one panel per selected denoise step (default 1, 3, 5, last). Each panel reads left to right:
+#             left strip  = the token actually FED at that position entering that step ([M] if masked)
+#             main grid   = block position (y, 0 at the top) x layer (x, first -> last); cell colour =
+#                           divergence to t_c, cell text = that layer's top-k readout tokens (the
+#                           converged token is [bracketed] when it appears)
+#             right strip = the CONVERGED token t_c for that position
 #
 # Everything comes from the npz shards written by probe_lens_surface.py; no GPU, no model.
 # `in_tok` and the context json are newer fields -- older runs degrade gracefully (the bottom strip is
@@ -243,24 +244,24 @@ def load_tokenizer(path):
     return None
 
 
-def draw_strip(ax, labels, n_pos, title, face, edge, fontsize, highlight=None, xticklabels=None):
-    """A one-row label strip (converged tokens on top / fed tokens at the bottom)."""
-    ax.set_xlim(-0.5, n_pos - 0.5)
-    ax.set_ylim(-0.5, 0.5)
-    if xticklabels is None:
-        ax.set_xticks([])
+def draw_vstrip(ax, labels, n_pos, title, face, edge, fontsize, highlight=None, yticklabels=None):
+    """A one-COLUMN label strip beside the grid: one cell per block position, top to bottom."""
+    ax.set_xlim(-0.5, 0.5)
+    ax.set_ylim(n_pos - 0.5, -0.5)                       # position 0 at the top
+    ax.set_xticks([])
+    if yticklabels is None:
+        ax.set_yticks([])
     else:
-        ax.set_xticks(range(n_pos))
-        ax.set_xticklabels(xticklabels, fontsize=max(fontsize - 1.0, 5.0))
-        ax.tick_params(axis="x", length=0, pad=2)
-    ax.set_yticks([])
+        ax.set_yticks(range(n_pos))
+        ax.set_yticklabels(yticklabels, fontsize=max(fontsize - 1.0, 5.0))
+        ax.tick_params(axis="y", length=0, pad=2)
     for s in ax.spines.values():
         s.set_visible(False)
     for i, lab in enumerate(labels):
         fc = face if (highlight is None or not highlight[i]) else "#ffe0b2"
-        ax.add_patch(plt.Rectangle((i - 0.5, -0.5), 1, 1, facecolor=fc, edgecolor=edge, lw=0.4))
-        ax.text(i, 0, lab, ha="center", va="center", fontsize=fontsize, color="#212121")
-    ax.set_ylabel(title, rotation=0, ha="right", va="center", fontsize=fontsize + 1, labelpad=8)
+        ax.add_patch(plt.Rectangle((-0.5, i - 0.5), 1, 1, facecolor=fc, edgecolor=edge, lw=0.4))
+        ax.text(0, i, lab, ha="center", va="center", fontsize=fontsize, color="#212121")
+    ax.set_title(title, fontsize=fontsize, pad=5)
 
 
 def main():
@@ -278,7 +279,7 @@ def main():
     ap.add_argument("--cell_w", type=float, default=None, help="inches; default: fit to the token text")
     ap.add_argument("--cell_h", type=float, default=None, help="inches; default: fit topk lines of text")
     ap.add_argument("--fontsize", type=float, default=12.5, help="cell font size")
-    ap.add_argument("--header_fontsize", type=float, default=16.0, help="prompt/header font size")
+    ap.add_argument("--header_fontsize", type=float, default=20.0, help="prompt/header font size")
     ap.add_argument("--font", default=None, help="force a font family (must cover CJK for this vocab)")
     ap.add_argument("--install_font", action="store_true",
                     help="download Noto Sans CJK into ~/.fonts if no CJK font is available (no sudo)")
@@ -405,71 +406,75 @@ def main():
         body = ("(context json not found in this run -- re-run the probe to record the prompt; "
                 "the per-block grids below are unaffected)")
     body = body[:2000]
-    panel_w = nP * cell_w
-    fig_w = len(panels) * panel_w + 2.6
+    # TRANSPOSED layout: y = block position (0 at the top), x = layer (first -> last),
+    # with the fed input as the left-most column and the converged token as the right-most.
+    panel_w = (nL + 2) * cell_w                 # +2 for the input / converged strips
+    fig_w = len(panels) * panel_w + 1.9
     fs_head_body = float(args.header_fontsize)
     fs_head_title = fs_head_body + 3.0
-    wrap_cols = max(40, int((fig_w - 0.8) * 72.0 / (fs_head_body * 0.60)))
-    n_lines = sum(max(1, int(np.ceil(len(ln) / wrap_cols))) for ln in body.split("\n"))
-    line_in = fs_head_body * 1.45 / 72.0
-    head_h = min(9.0, fs_head_title * 2.2 / 72.0 + line_in * (n_lines + 1))
-
-    grid_h = (nL + 2) * cell_h
-    fig_h = head_h + grid_h + 0.9
-    fig = plt.figure(figsize=(fig_w, fig_h))
-    outer = gridspec.GridSpec(2, 1, height_ratios=[head_h, grid_h], hspace=0.05,
-                              left=0.055, right=0.965, top=0.975, bottom=0.03)
-
-    axp = fig.add_subplot(outer[0])
-    axp.axis("off")
+    # the prompt is repeated once per panel, so it wraps to ONE panel's width
+    wrap_cols = max(28, int((panel_w - 0.35) * 72.0 / (fs_head_body * 0.60)))
     wrapped = "\n".join("\n".join(ln[i:i + wrap_cols] for i in range(0, max(len(ln), 1), wrap_cols))
                         for ln in body.split("\n"))
-    title_frac = (fs_head_title * 2.0 / 72.0) / max(head_h, 1e-6)
-    axp.text(0, 1.0, head, fontsize=fs_head_title, fontweight="bold", va="top", family="monospace")
-    axp.text(0, max(0.0, 1.0 - title_frac), wrapped, fontsize=fs_head_body, va="top",
-             family="monospace", color="#333333", linespacing=1.45)
+    n_lines = wrapped.count("\n") + 1
+    line_in = fs_head_body * 1.45 / 72.0
+    head_h = min(11.0, fs_head_title * 2.4 / 72.0 + line_in * (n_lines + 1))
 
-    inner = gridspec.GridSpecFromSubplotSpec(1, len(panels), subplot_spec=outer[1], wspace=0.035)
+    grid_h = nP * cell_h
+    fig_h = head_h + grid_h + 1.5
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    outer = gridspec.GridSpec(2, len(panels), height_ratios=[head_h, grid_h], hspace=0.03,
+                              wspace=0.05, left=0.035, right=0.955, top=0.985, bottom=0.035)
+
+    # one figure-wide title (per-panel titles would overlap each other), auto-shrunk to fit the width
+    fs_title = min(fs_head_title, max(9.0, (fig_w - 0.8) * 72.0 / (len(head) * 0.60)))
+    fig.suptitle(head, fontsize=fs_title, fontweight="bold", family="monospace", y=0.995)
+
     for k, pan in enumerate(panels):
-        sub = gridspec.GridSpecFromSubplotSpec(3, 1, subplot_spec=inner[k],
-                                               height_ratios=[1, nL, 1], hspace=0.035)
-        ax_t = fig.add_subplot(sub[0])
+        # --- prompt, repeated above every panel so it is always in view ---
+        axp = fig.add_subplot(outer[0, k])
+        axp.axis("off")
+        axp.text(0, 0.88, wrapped, fontsize=fs_head_body, va="top",
+                 family="monospace", color="#333333", linespacing=1.45)
+
+        # --- panel: [fed input | layer grid | converged t_c] ---
+        sub = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer[1, k],
+                                               width_ratios=[1, nL, 1], wspace=0.02)
+        ax_in = fig.add_subplot(sub[0])
         ax_m = fig.add_subplot(sub[1])
-        ax_b = fig.add_subplot(sub[2])
+        ax_tc = fig.add_subplot(sub[2])
 
-        draw_strip(ax_t, pan["tc"], nP, "converged\nt_c" if k == 0 else "", "#e8f5e9", "#a5d6a7", fs_strip)
-        ax_t.set_title(pan["name"], fontsize=fs_strip + 2.0, fontweight="bold", pad=6)
-
-        ax_m.imshow(pan["vals"], aspect="auto", origin="lower", cmap=cmap, norm=norm,
-                    extent=[-0.5, nP - 0.5, -0.5, nL - 0.5])
-        ax_m.set_xticks([])                      # position numbers live under the input strip
+        draw_vstrip(ax_in, pan["inp"], nP, "fed\ninput", "#e3f2fd", "#90caf9", fs_strip,
+                    highlight=pan["in_masked"], yticklabels=[str(p) for p in positions])
         if k == 0:
-            ax_m.set_yticks(range(nL))
-            ax_m.set_yticklabels([str(l) for l in layers], fontsize=fs_strip)
-            ax_m.set_ylabel("layer", fontsize=fs_strip + 1.0)
-        else:
-            ax_m.set_yticks([])
+            ax_in.set_ylabel("block position", fontsize=fs_strip + 1.0)
+
+        ax_m.imshow(pan["vals"].T, aspect="auto", origin="upper", cmap=cmap, norm=norm,
+                    extent=[-0.5, nL - 0.5, nP - 0.5, -0.5])
+        ax_m.set_title(pan["name"], fontsize=fs_strip + 3.0, fontweight="bold", pad=8)
+        ax_m.set_yticks([])
+        ax_m.set_xticks(range(nL))
+        ax_m.set_xticklabels([str(l) for l in layers], fontsize=fs_strip)
+        ax_m.tick_params(axis="x", length=0, pad=3)
+        ax_m.set_xlabel("layer  (first -> last)", fontsize=fs_strip + 1.0)
         for i in range(nL):
             for j in range(nP):
                 if pan["top"][i, j] is None:
                     continue
                 v = pan["vals"][i, j]
                 dark = np.isfinite(v) and norm(v) > 0.55
-                ax_m.text(j, i, pan["top"][i, j], ha="center", va="center",
+                ax_m.text(i, j, pan["top"][i, j], ha="center", va="center",
                           fontsize=fs_cell, linespacing=1.28,
                           color="#ffffff" if dark else "#1a1a1a")
-        for j in range(nP + 1):
-            ax_m.axvline(j - 0.5, color="#ffffff", lw=0.6)
         for i in range(nL + 1):
-            ax_m.axhline(i - 0.5, color="#ffffff", lw=0.6)
+            ax_m.axvline(i - 0.5, color="#ffffff", lw=0.6)
+        for j in range(nP + 1):
+            ax_m.axhline(j - 0.5, color="#ffffff", lw=0.6)
 
-        draw_strip(ax_b, pan["inp"], nP, "fed input" if k == 0 else "", "#e3f2fd", "#90caf9",
-                   fs_strip, highlight=pan["in_masked"],
-                   xticklabels=[str(p) for p in positions])
-        ax_b.set_xlabel("block position", fontsize=fs_strip)
+        draw_vstrip(ax_tc, pan["tc"], nP, "converged\nt_c", "#e8f5e9", "#a5d6a7", fs_strip)
 
     sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
-    cax = fig.add_axes([0.972, 0.06, 0.008, 0.5])
+    cax = fig.add_axes([0.963, 0.06, 0.006, 0.4])
     cb = fig.colorbar(sm, cax=cax)
     cb.set_label(label, fontsize=fs_strip)
     cb.ax.tick_params(labelsize=fs_strip - 1.0)
