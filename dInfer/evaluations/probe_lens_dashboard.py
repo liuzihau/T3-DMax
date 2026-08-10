@@ -111,7 +111,7 @@ def parse_range(spec, lo_default, hi_default):
     return (int(a) if a else lo_default), (int(b) if b else hi_default)
 
 
-def tok_str(tokenizer, tid, mask_id, maxlen=7):
+def tok_str(tokenizer, tid, mask_id, maxlen=10):
     if tid is None or int(tid) < 0:
         return "?"
     tid = int(tid)
@@ -121,15 +121,39 @@ def tok_str(tokenizer, tid, mask_id, maxlen=7):
         return str(tid)
     s = tokenizer.decode([tid])
     s = s.replace("\n", "\\n").replace("\t", "\\t")
-    s = s.strip() or ("' '" if s else "''")
+    s = s.strip() or ("_" if s else "''")     # "_" = a bare space token
     return s[:maxlen]
 
 
-def draw_strip(ax, labels, n_pos, title, face, edge, fontsize, highlight=None):
+def load_tokenizer(path):
+    """Load a tokenizer from `path`; if that fails, try the un-merged sibling checkpoint (the moe
+    convertor does not always copy the tokenizer files into the merged dir)."""
+    if not path:
+        return None
+    from transformers import AutoTokenizer
+    cands = [path]
+    if path.rstrip("/").endswith("-moe-merge") or path.rstrip("/").endswith("-merged"):
+        cands.append(path.rstrip("/").rsplit("-moe-merge", 1)[0].rsplit("-merged", 1)[0])
+    for c in cands:
+        try:
+            return AutoTokenizer.from_pretrained(c, trust_remote_code=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[dash] tokenizer not loadable from {c}: {type(e).__name__}")
+    print("[dash] WARNING: no tokenizer -- cells will show raw token ids. Point --tokenizer_path at a "
+          "directory containing tokenizer.json / tokenizer_config.json (the ORIGINAL download works).")
+    return None
+
+
+def draw_strip(ax, labels, n_pos, title, face, edge, fontsize, highlight=None, xticklabels=None):
     """A one-row label strip (converged tokens on top / fed tokens at the bottom)."""
     ax.set_xlim(-0.5, n_pos - 0.5)
     ax.set_ylim(-0.5, 0.5)
-    ax.set_xticks([])
+    if xticklabels is None:
+        ax.set_xticks([])
+    else:
+        ax.set_xticks(range(n_pos))
+        ax.set_xticklabels(xticklabels, fontsize=max(fontsize - 1.0, 5.0))
+        ax.tick_params(axis="x", length=0, pad=2)
     ax.set_yticks([])
     for s in ax.spines.values():
         s.set_visible(False)
@@ -152,21 +176,17 @@ def main():
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--tokenizer_path", default=None)
     ap.add_argument("--mask_id", type=int, default=MASK_ID_DEFAULT)
-    ap.add_argument("--cell_w", type=float, default=0.66)
-    ap.add_argument("--cell_h", type=float, default=0.62)
+    ap.add_argument("--cell_w", type=float, default=0.92)
+    ap.add_argument("--cell_h", type=float, default=0.80)
+    ap.add_argument("--fontsize", type=float, default=None, help="cell font size (default: auto-fit)")
+    ap.add_argument("--show_probs", action="store_true", help="append each token's probability")
     ap.add_argument("--dpi", type=int, default=110)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     D = load_block(args.run_dir, args.sample, args.block)
     ctx = load_context(args.run_dir, args.sample)
-    tokenizer = None
-    if args.tokenizer_path:
-        try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[dash] tokenizer unavailable ({e}); showing raw ids")
+    tokenizer = load_tokenizer(args.tokenizer_path)
 
     d_conv = int(D["d_conv"][0])
     steps = parse_steps(args.steps, d_conv)
@@ -206,7 +226,9 @@ def main():
             lines = []
             for tid, pr in zip(ids, probs):
                 s = tok_str(tokenizer, tid, args.mask_id)
-                lines.append(f"[{s}]{pr:.2f}" if int(tid) == tc else f"{s} {pr:.2f}")
+                if int(tid) == tc:
+                    s = f"[{s}]"
+                lines.append(f"{s} {pr:.2f}" if args.show_probs else s)
             top[i, j] = "\n".join(lines)
         # strips
         tc_lab, in_lab, in_masked = [], [], []
@@ -238,8 +260,11 @@ def main():
     norm = matplotlib.colors.Normalize(vmin=0.0, vmax=max(vmax, 1e-6))
 
     # ---- figure ----
-    fs_cell = max(4.0, min(6.5, 40.0 * args.cell_w / max(args.topk, 1)))
-    fs_strip = fs_cell + 1.2
+    # auto-fit the cell font to the row budget (topk lines must fit in cell_h), then cap by cell width
+    fs_fit = 72.0 * args.cell_h / (max(args.topk, 1) * 1.28)
+    fs_width_cap = 72.0 * args.cell_w / (11.5 * 0.62)      # ~11 chars per line at monospace-ish width
+    fs_cell = args.fontsize or max(5.0, min(12.0, fs_fit, fs_width_cap))
+    fs_strip = min(fs_cell + 1.5, 12.0)
 
     # ---- header text (built first: its length sets the header row height) ----
     head = (f"sample {args.sample}, block {args.block}  |  {d_conv + 1} decode forwards  |  "
@@ -294,9 +319,7 @@ def main():
 
         ax_m.imshow(pan["vals"], aspect="auto", origin="lower", cmap=cmap, norm=norm,
                     extent=[-0.5, nP - 0.5, -0.5, nL - 0.5])
-        ax_m.set_xticks(range(nP))
-        ax_m.set_xticklabels([str(p) for p in positions], fontsize=fs_strip - 0.5)
-        ax_m.tick_params(axis="x", length=0, pad=1)
+        ax_m.set_xticks([])                      # position numbers live under the input strip
         if k == 0:
             ax_m.set_yticks(range(nL))
             ax_m.set_yticklabels([str(l) for l in layers], fontsize=fs_strip)
@@ -318,7 +341,8 @@ def main():
             ax_m.axhline(i - 0.5, color="#ffffff", lw=0.6)
 
         draw_strip(ax_b, pan["inp"], nP, "fed input" if k == 0 else "", "#e3f2fd", "#90caf9",
-                   fs_strip, highlight=pan["in_masked"])
+                   fs_strip, highlight=pan["in_masked"],
+                   xticklabels=[str(p) for p in positions])
         ax_b.set_xlabel("block position", fontsize=9)
 
     sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
