@@ -211,6 +211,29 @@ def parse_range(spec, lo_default, hi_default):
     return (int(a) if a else lo_default), (int(b) if b else hi_default)
 
 
+def _disable_mathtext():
+    """matplotlib treats a string with an EVEN number of '$' as inline mathtext, so GSM8K's dollar
+    amounts ("$18 ... $2") get sent to the TeX parser and raise ParseException at draw time.
+    rcParams['text.parse_math'] (matplotlib >= 3.5) turns that off globally -- the clean fix.
+    Returns True if it worked; otherwise callers fall back to escaping."""
+    try:
+        matplotlib.rcParams["text.parse_math"] = False
+        return True
+    except KeyError:
+        return False
+
+
+_MATH_OFF = _disable_mathtext()
+
+
+def mpl_escape(s):
+    """No-op when math parsing is disabled (otherwise the escapes would show up literally);
+    escapes '$' on old matplotlib where the rcParam does not exist."""
+    if _MATH_OFF:
+        return s
+    return s.replace("\\", "\\\\").replace("$", r"\$")
+
+
 def tok_str(tokenizer, tid, mask_id, maxlen=10):
     if tid is None or int(tid) < 0:
         return "?"
@@ -222,7 +245,7 @@ def tok_str(tokenizer, tid, mask_id, maxlen=10):
     s = tokenizer.decode([tid])
     s = s.replace("\n", "\\n").replace("\t", "\\t")
     s = s.strip() or ("_" if s else "''")     # "_" = a bare space token
-    return s[:maxlen]
+    return mpl_escape(s[:maxlen])
 
 
 def load_tokenizer(path):
@@ -414,8 +437,10 @@ def main():
     fs_head_title = fs_head_body + 3.0
     # the prompt is repeated once per panel, so it wraps to ONE panel's width
     wrap_cols = max(28, int((panel_w - 0.35) * 72.0 / (fs_head_body * 0.60)))
-    wrapped = "\n".join("\n".join(ln[i:i + wrap_cols] for i in range(0, max(len(ln), 1), wrap_cols))
-                        for ln in body.split("\n"))
+    # wrap FIRST, escape after (escaping before could split a "\$" pair across two lines)
+    wrapped = "\n".join(mpl_escape(ln[i:i + wrap_cols])
+                        for ln in body.split("\n")
+                        for i in range(0, max(len(ln), 1), wrap_cols))
     n_lines = wrapped.count("\n") + 1
     line_in = fs_head_body * 1.45 / 72.0
     head_h = min(11.0, fs_head_title * 2.4 / 72.0 + line_in * (n_lines + 1))
@@ -428,7 +453,7 @@ def main():
 
     # one figure-wide title (per-panel titles would overlap each other), auto-shrunk to fit the width
     fs_title = min(fs_head_title, max(9.0, (fig_w - 0.8) * 72.0 / (len(head) * 0.60)))
-    fig.suptitle(head, fontsize=fs_title, fontweight="bold", family="monospace", y=0.995)
+    fig.suptitle(mpl_escape(head), fontsize=fs_title, fontweight="bold", family="monospace", y=0.995)
 
     for k, pan in enumerate(panels):
         # --- prompt, repeated above every panel so it is always in view ---

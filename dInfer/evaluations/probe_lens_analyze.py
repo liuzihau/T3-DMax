@@ -21,6 +21,10 @@ import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
+try:   # decoded tokens/prompts contain '$'; without this matplotlib sends them to the TeX parser
+    matplotlib.rcParams["text.parse_math"] = False
+except KeyError:
+    pass
 import matplotlib.pyplot as plt  # noqa: E402
 
 D_READING = 999
