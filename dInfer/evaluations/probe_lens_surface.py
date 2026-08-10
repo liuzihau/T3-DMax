@@ -71,6 +71,8 @@ RAW_FIELDS = [
     ("delta", np.int16),          # d - commit_step (D_READING rows: 999)
     ("d_conv", np.int16),         # the block's last decode step index (same for all rows of a block)
     ("t_c", np.int32),            # converged token at this position
+    ("in_tok", np.int32),         # token id fed at this position ENTERING this step (MASK_ID if masked;
+                                  # t_c on the reading forward). Exact -- committed tokens can change.
     ("q_tc", np.float16),         # q(t_c) -- probability of the converged token under this readout
     ("rank_tc", np.int32),        # 0-indexed rank of t_c under this readout
     ("entropy", np.float16),      # entropy of q (nats)
@@ -105,6 +107,7 @@ class ShardWriter:
         self.shard_samples = shard_samples
         self.cols = {name: [] for name, _ in RAW_FIELDS}
         self.top_ids, self.top_probs = [], []
+        self.contexts = []
         self.samples_in_shard, self.shard_idx, self.total_rows = 0, 0, 0
         os.makedirs(out_dir, exist_ok=True)
 
@@ -113,6 +116,10 @@ class ShardWriter:
             self.cols[name].append(cols_np[name])
         self.top_ids.append(top_ids_np)
         self.top_probs.append(top_probs_np)
+
+    def add_context(self, ctx):
+        """Per-sample prompt/geometry, for the per-block dashboard (tiny; plain json)."""
+        self.contexts.append(ctx)
 
     def end_sample(self):
         self.samples_in_shard += 1
@@ -128,12 +135,17 @@ class ShardWriter:
         n = arrs["sample"].shape[0]
         path = os.path.join(self.out_dir, f"probe_lens_surface_shard{self.shard_idx:03d}.npz")
         np.savez_compressed(path, **arrs)
+        if self.contexts:
+            with open(os.path.join(self.out_dir,
+                                   f"probe_lens_context_shard{self.shard_idx:03d}.json"), "w") as fh:
+                json.dump(self.contexts, fh)
         self.total_rows += n
         print(f"[shard] wrote {path} rows={n} (total={self.total_rows})")
         self.shard_idx += 1
         self.samples_in_shard = 0
         self.cols = {name: [] for name, _ in RAW_FIELDS}
         self.top_ids, self.top_probs = [], []
+        self.contexts = []
 
 
 _NORM_CHECKED = False
@@ -164,7 +176,7 @@ def _readout(l, NL, hs_blk_l, logits_blk, lm_head, final_norm):
 
 
 @torch.no_grad()
-def process_block(sample_idx, block_idx, bs, be, P, valid_hi, x_final, commit_step, mask_states,
+def process_block(sample_idx, block_idx, bs, be, P, valid_hi, x_final, commit_step, mask_states, in_toks,
                   hs_buf, logits_buf, hs_read, logits_read, NL, lm_head, final_norm, writer, device):
     """Compute all per-cell records for one converged block and hand them to the shard writer.
     hs_buf: list over steps of [NL, blk, D] (cpu bf16). logits_buf: list of [blk, V] (cpu bf16).
@@ -214,11 +226,13 @@ def process_block(sample_idx, block_idx, bs, be, P, valid_hi, x_final, commit_st
                 logits_blk = logits_read_dev
                 hs_l = hs_read[l]
                 state_np = np.ones(blk, dtype=np.int8)               # clean t_c inputs by construction
+                in_np = t_c_np
                 logf = logf_read
             else:
                 logits_blk = logits_dev[d]
                 hs_l = hs_buf[d][l]
                 state_np = (~mask_states[d]).astype(np.int8)         # 1 = clean/committed input
+                in_np = in_toks[d]
                 logf = logf_steps[d]
 
             q_logits = _readout(l, NL, hs_l, logits_blk, lm_head, final_norm)   # [blk, V] fp32
@@ -249,6 +263,7 @@ def process_block(sample_idx, block_idx, bs, be, P, valid_hi, x_final, commit_st
                 cols["delta"][sl] = (d - commit_np[vpos].astype(np.int32)).astype(np.int16)
             cols["d_conv"][sl] = d_conv
             cols["t_c"][sl] = t_c_np[vpos]
+            cols["in_tok"][sl] = in_np[vpos]
             cols["q_tc"][sl] = q_tc[vpos].cpu().numpy()
             cols["rank_tc"][sl] = rank[vpos].cpu().numpy()
             cols["entropy"][sl] = ent[vpos].cpu().numpy()
@@ -288,13 +303,14 @@ def decode_and_probe(model, embed, lm_head, final_norm, prompt_ids, gen_length, 
         prefix_embeds = embed(x[:, :bs])
         block_embeds = embed(x[:, bs:be]).clone()
         block_logits = None
-        hs_buf, logits_buf, mask_states = [], [], []
+        hs_buf, logits_buf, mask_states, in_toks = [], [], [], []
         commit_step = np.full(blk, -1, dtype=np.int16)
 
         it = 0
         while it < MAX_ITERS:
             inputs_embeds = torch.cat([prefix_embeds, block_embeds], dim=1)
             mask_before = (x[0, bs:be] == MASK_ID).clone()
+            in_toks.append(x[0, bs:be].detach().cpu().numpy().copy())   # exact input ids for this forward
             out = model(inputs_embeds=inputs_embeds, attention_mask=attn, use_cache=False,
                         output_hidden_states=True, return_dict=True)
             block_logits = out.logits[:, bs:be]
@@ -353,7 +369,7 @@ def decode_and_probe(model, embed, lm_head, final_norm, prompt_ids, gen_length, 
             logits_read = out_r.logits[0, bs:be].to("cpu")
 
         process_block(sample_idx, b, bs, be, P, block_valid_hi, x[0].cpu(), commit_step,
-                      np.stack(mask_states), hs_buf, logits_buf, hs_read, logits_read,
+                      np.stack(mask_states), np.stack(in_toks), hs_buf, logits_buf, hs_read, logits_read,
                       NL_holder["NL"], lm_head, final_norm, writer, device)
         steps_hist.append(len(hs_buf))
         del hs_buf, logits_buf, hs_read, logits_read
@@ -398,9 +414,16 @@ def main():
         msgs = [{"role": "user", "content": row["prompt"]}]
         pid = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
                                       return_tensors="pt").to(device)
-        _, eos_cut, nb, steps_hist = decode_and_probe(
+        x_full, eos_cut, nb, steps_hist = decode_and_probe(
             model, embed, lm_head, final_norm, pid, args.gen_length, args.block_length,
             args.threshold, device, i, writer, reading_forward=not args.no_reading_forward)
+        P = int(pid.shape[1])
+        writer.add_context(dict(
+            sample=i, P=P, block_length=args.block_length, eos_cut=int(eos_cut),
+            first_block_start=(P // args.block_length) * args.block_length,
+            prompt_ids=pid[0].tolist(),
+            gen_ids=x_full[P:min(eos_cut + 1, x_full.shape[0])].tolist(),
+        ))
         writer.end_sample()
         all_steps += steps_hist
         if i < 3 or (i + 1) % 10 == 0:
